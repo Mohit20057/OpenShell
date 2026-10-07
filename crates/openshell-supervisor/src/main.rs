@@ -628,6 +628,7 @@ fn main() -> Result<()> {
                     proxy_tls: openshell_supervisor_network::run::ProxyTlsFiles::from_environment(),
                     takeover: None,
                     supervisor_recovery_timeout_secs: None,
+                    otlp_endpoint: args.otlp_endpoint.clone(),
                 };
                 // Log push already shares these credentials and the logging
                 // layers these OCSF JSON settings.

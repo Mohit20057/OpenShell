@@ -3,6 +3,12 @@
 
 use std::path::Path;
 
+use openshell_core::sandbox_env::{
+    OTEL_EXPORTER_OTLP_COMPRESSION, OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_EXPORTER_OTLP_PROTOCOL,
+    OTEL_EXPORTER_OTLP_TRACES_COMPRESSION, OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
+    OTEL_EXPORTER_OTLP_TRACES_PROTOCOL, OTLP_RELAY_ENDPOINT, OTLP_RELAY_TRACES_ENDPOINT,
+};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TlsEnvironmentMode {
     /// `OpenShell`'s generated trust files are authoritative for mediated traffic.
@@ -37,6 +43,31 @@ pub fn tls_env_vars_for_mode<S: std::hash::BuildHasher>(
             matches!(mode, TlsEnvironmentMode::Override) || !user_environment.contains_key(*key)
         })
         .collect()
+}
+
+/// OpenTelemetry exporter variables every workload process receives.
+///
+/// They point agent SDKs at the supervisor's OTLP relay and are applied after
+/// the environment from the sandbox creation request, so an endpoint named
+/// there never wins: it would either point into the fenced network and fail
+/// or bypass attribution. The signal-specific traces variables are set as
+/// well because SDKs give them precedence over the generic ones, and
+/// compression is disabled because the relay refuses compressed bodies. The
+/// values are the same whether or not a collector is configured; without one
+/// the relay address refuses connections immediately. A per-exec environment
+/// still overrides them for that exec only.
+pub fn otlp_relay_env_vars() -> [(&'static str, &'static str); 6] {
+    [
+        (OTEL_EXPORTER_OTLP_ENDPOINT, OTLP_RELAY_ENDPOINT),
+        (OTEL_EXPORTER_OTLP_PROTOCOL, "http/protobuf"),
+        (
+            OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
+            OTLP_RELAY_TRACES_ENDPOINT,
+        ),
+        (OTEL_EXPORTER_OTLP_TRACES_PROTOCOL, "http/protobuf"),
+        (OTEL_EXPORTER_OTLP_COMPRESSION, "none"),
+        (OTEL_EXPORTER_OTLP_TRACES_COMPRESSION, "none"),
+    ]
 }
 
 pub fn tls_env_vars(
@@ -94,6 +125,24 @@ mod tests {
         assert_ne!(
             ca_cert_path,
             Path::new(openshell_core::container_paths::TLS_CA_MOUNT_PATH)
+        );
+    }
+
+    #[test]
+    fn otlp_relay_env_points_sdks_at_the_reserved_endpoint() {
+        assert_eq!(
+            otlp_relay_env_vars(),
+            [
+                ("OTEL_EXPORTER_OTLP_ENDPOINT", "http://192.0.0.8:4318"),
+                ("OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf"),
+                (
+                    "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+                    "http://192.0.0.8:4318/v1/traces"
+                ),
+                ("OTEL_EXPORTER_OTLP_TRACES_PROTOCOL", "http/protobuf"),
+                ("OTEL_EXPORTER_OTLP_COMPRESSION", "none"),
+                ("OTEL_EXPORTER_OTLP_TRACES_COMPRESSION", "none"),
+            ]
         );
     }
 }

@@ -23,6 +23,7 @@ mod config_runtime;
 mod denial_aggregator;
 mod endpoint_status;
 mod mechanistic_mapper;
+mod otlp_relay;
 mod provider_readiness;
 pub mod sandbox_instance_host;
 pub mod shared_host;
@@ -743,6 +744,7 @@ pub async fn run_network_proxy(
         None,
         None,
         None,
+        None,
     )
     .await?;
 
@@ -917,6 +919,9 @@ pub struct SandboxInstanceConfig {
     /// attach: how long it keeps the workload frozen after losing this
     /// supervisor. `None` leaves the runtime default.
     pub supervisor_recovery_timeout_secs: Option<u32>,
+    /// OTLP/gRPC collector for relayed agent traces; `None` keeps the relay
+    /// inactive.
+    pub otlp_endpoint: Option<String>,
 }
 
 impl SandboxInstanceConfig {
@@ -1070,6 +1075,7 @@ pub async fn run_sandbox_instance(
         proxy_tls,
         takeover,
         supervisor_recovery_timeout_secs,
+        otlp_endpoint,
     } = config;
     // The owner binds the event context and log sink to the instance's
     // threads; the instance itself uses the rest.
@@ -1386,6 +1392,12 @@ pub async fn run_sandbox_instance(
     let takeover_attach = remote_boundary.0.is_takeover();
     let adopts_running_agent = remote_boundary.0.adopts_running_agent();
     let (bound, backend_name, ca_file_paths) = remote_boundary;
+
+    // The agent trace relay must exist before networking starts so the
+    // handler is installed when the first staged connection arrives.
+    let (mut otlp_relay, otlp_reserved_destination) =
+        otlp_relay::activate(otlp_endpoint, sandbox_id.clone());
+
     let confirm = Box::pin(async {
         let ready = bound
             .confirm()
@@ -1429,6 +1441,7 @@ pub async fn run_sandbox_instance(
             None,
             remote_network_source,
             proxy_listener,
+            otlp_reserved_destination,
         )
         .await
     });
@@ -1780,6 +1793,17 @@ pub async fn run_sandbox_instance(
         boundary_access
             .publish_main_exit(exit_code, await_main_process_attachment)
             .await;
+        // Flush relayed agent traces before the exit is reported so the last
+        // spans of a short run are not lost. Bounded; never fails. When the
+        // access plane is retained for exec sessions, the relay keeps serving
+        // them and shuts down at final teardown instead.
+        if retain_access {
+            if let Some(relay) = otlp_relay.as_ref() {
+                relay.flush(otlp_relay::FLUSH_TIMEOUT).await;
+            }
+        } else if let Some(relay) = otlp_relay.take() {
+            relay.shutdown(otlp_relay::FLUSH_TIMEOUT).await;
+        }
         // `shutdown_requested` has already completed when shutdown won the
         // lifecycle select above and must not be polled again.
         let mut completion_cancelled = !retain_access;
@@ -1823,6 +1847,11 @@ pub async fn run_sandbox_instance(
         if retain_access {
             info!(backend = %backend_name, "Canonical process exited; retaining control-mode access plane");
             retain_remote_access_plane(&mut proxy_exited, &mut shutdown_requested).await?;
+        }
+        // Exec sessions served after the main exit may have exported traces;
+        // flush those too before the relay goes away.
+        if let Some(relay) = otlp_relay.take() {
+            relay.shutdown(otlp_relay::FLUSH_TIMEOUT).await;
         }
         drop(instance_readiness);
         drop(running);
@@ -4609,6 +4638,7 @@ mod tests {
             proxy_tls: openshell_supervisor_network::run::ProxyTlsFiles::default(),
             takeover: None,
             supervisor_recovery_timeout_secs: None,
+            otlp_endpoint: None,
         };
         let bindings = SandboxInstanceBindings::dedicated(
             &config,

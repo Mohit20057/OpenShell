@@ -2,9 +2,10 @@
 
 OpenShell routes first-party security-sensitive cryptography through
 `openshell-crypto`. The workspace selects AWS-LC as the production backend.
-The interface supports a future system-OpenSSL backend; the current production
-implementation does not assert FIPS compliance, and strict posture requests fail
-closed.
+The opt-in `openssl` feature supplies a system-OpenSSL backend for explicit
+context selection. Neither backend asserts deployment FIPS compliance, and strict
+posture requests fail closed. Application startup, dependency-owned transports,
+and downstream packaging/qualification remain separate OpenSSL integration work.
 
 ## Backend boundary
 
@@ -37,7 +38,10 @@ Explicit context selection controls first-party TLS builders even when a
 dependency initialized Rustls first. Without explicit selection, those builders
 preserve an embedder's installed provider. JWT adapters retain jsonwebtoken's
 process-global provider constraints; that provider cannot be replaced safely.
-Neither behavior redirects dependency-owned cryptography automatically.
+Neither behavior redirects dependency-owned cryptography automatically. Enabling
+OpenSSL does not replace the AWS-LC default; an embedder must install its context
+explicitly. System libraries and provider configuration belong to the deployment;
+the backend does not modify provider policy.
 
 ## Contributor rules and coverage
 
@@ -77,6 +81,9 @@ establish deployment compliance. A production OpenSSL/FIPS profile requires:
 - Tests in the qualified target environment covering TLS/mTLS, JWT, persisted CA
   loading, credential encryption, and negative startup/algorithm cases.
 
-These are follow-up requirements, not guarantees of the current backend.
+These are follow-up requirements, not guarantees of the current backends. The
+OpenSSL protocol adapters also have infallible callbacks and provider-ownership
+limitations documented in the crate README; backend tests do not resolve those
+deployment requirements.
 Implementation details and extension APIs live in the
 [crypto crate README](README.md).

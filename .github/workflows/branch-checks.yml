@@ -196,6 +196,9 @@ jobs:
           prepare-shell: "true"
           shell-installable: .#devShells.x86_64-linux.default
 
+      - name: Verify crypto dependency guardrail
+        run: uv run --no-project python tasks/scripts/test-crypto-dependency-policy.py
+
       - name: Check dependencies
         run: cargo deny check licenses bans sources
 

@@ -168,11 +168,13 @@ scheduling randomness are not migrated. No SSH or PQC capability is asserted by
 the primitive capability report. Application-wide OpenSSL integration, strict
 policy, module version discovery, and deployment qualification remain follow-ups.
 
-Operator certificate fingerprints, runtime refresh replay hashes and derived token
+Migrated paths for operator certificate fingerprints, runtime refresh replay hashes and derived token
 IDs, bearer-cache fingerprints, Sandbox Protocol request digests and request-ID
 entropy, Kubernetes/VM runtime
 fence entropy, VM socket-directory entropy, and rootfs staging-token entropy use
-the selected backend.
+the selected backend. The [dependency exception inventory](CRYPTO.md#existing-direct-first-party-exceptions)
+records remaining direct implementations, including other bearer-cache and
+session-identity paths.
 These operations retain SHA-256, UUID v4 encoding where applicable, and existing
 hex encodings. Backend failures propagate; callers must not substitute another
 implementation or continue with a placeholder identity.
@@ -194,9 +196,11 @@ not a whole-application crypto coverage claim:
 | Debug token fingerprints | Diagnostic display only; direct hashing remains outside the contract even though the input is a credential. |
 | Schema compatibility tests, content-cache identities, retry jitter, test fixtures | Non-authentication uses remain unchanged. |
 
-Cargo feature selection does not prevent a crate from adding another crypto
-dependency. Review first-party security-sensitive operations against this scope;
-no source-scanning boundary lint is installed.
+The [cargo-deny dependency guardrail](CRYPTO.md#dependency-guardrail) rejects
+unapproved direct dependencies on the catalogued crypto implementations. It
+preserves explicitly classified exceptions, including security-sensitive uses
+awaiting migration. Review operations inside those crates against that scope;
+the dependency check does not inspect source-level usage.
 
 Durable proxy CA loading uses backend key import and `pki::issuer_from_der`.
 The helper uses `x509-parser` without verification features to read the subject,

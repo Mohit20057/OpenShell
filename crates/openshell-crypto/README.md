@@ -97,7 +97,8 @@ not runtime algorithm availability. `provider_version` stays unknown because the
 library version does not identify the module that performed an operation.
 
 Certificate keys support P-256, P-384, Ed25519 and RSA, with PEM/PKCS#8 import and
-PKCS#8 export. RSA generation uses 2048 bits. P-521 certificate keys are rejected:
+PKCS#8 export. Encrypted PEM keys, including those with an empty passphrase, are
+rejected without prompting for a password. RSA generation uses 2048 bits. P-521 certificate keys are rejected:
 rcgen 0.14 exposes that descriptor only with AWS-LC enabled. Existing P-521 users
 must retain AWS-LC until this limitation is resolved. This backend uses exportable
 software keys and does not add HSM or PKCS#11 loading.

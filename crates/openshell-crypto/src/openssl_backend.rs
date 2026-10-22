@@ -277,7 +277,18 @@ impl ProtocolBackend for OpenSsl {
         Key::wrap(Self::generate(algorithm)?, algorithm)
     }
     fn import_keypair_pem(&self, pem: &str) -> Result<pki::KeyPair, rcgen::Error> {
-        Key::import(PKey::private_key_from_pem(pem.as_bytes()).map_err(key_error)?)
+        // The default OpenSSL callback prompts on the controlling terminal.
+        // This API has no passphrase contract: reject encrypted input without
+        // terminal I/O, including input encrypted with an empty passphrase.
+        let mut password_requested = false;
+        let key = PKey::private_key_from_pem_callback(pem.as_bytes(), |_| {
+            password_requested = true;
+            Ok(0)
+        });
+        if password_requested {
+            return Err(rcgen::Error::CouldNotParseKeyPair);
+        }
+        Key::import(key.map_err(key_error)?)
     }
     fn import_keypair_der(&self, der: &[u8]) -> Result<pki::KeyPair, rcgen::Error> {
         Key::import(PKey::private_key_from_pkcs8(der).map_err(key_error)?)

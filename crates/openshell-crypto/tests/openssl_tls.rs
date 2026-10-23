@@ -9,6 +9,16 @@ use common::{handshake, init_openssl};
 use openshell_crypto::{OpenSsl, ProtocolBackend, pki, tls};
 use std::sync::Arc;
 
+#[test]
+fn native_tls_library_is_available_for_linkage_check() {
+    // The backend uses Rustls for TLS and libcrypto for primitives. Exercise
+    // libssl explicitly so Linux's --as-needed linker retains both native
+    // libraries for CI's dynamic-linkage assertion on this test executable.
+    let _context = openssl::ssl::SslContext::builder(openssl::ssl::SslMethod::tls())
+        .unwrap()
+        .build();
+}
+
 fn leaf(
     ca: &pki::Certificate,
     ca_key: &pki::KeyPair,

@@ -102,13 +102,30 @@ fn malformed_keys_are_rejected_by_both_backends() {
         reject_signing("undersized RSA key", algorithm, &encoding);
     }
 
-    for (curve, wrong_algorithm) in [
-        (&rcgen::PKCS_ECDSA_P256_SHA256, Algorithm::ES384),
-        (&rcgen::PKCS_ECDSA_P384_SHA384, Algorithm::ES256),
+    for (curve, algorithm, wrong_algorithm) in [
+        (
+            &rcgen::PKCS_ECDSA_P256_SHA256,
+            Algorithm::ES256,
+            Algorithm::ES384,
+        ),
+        (
+            &rcgen::PKCS_ECDSA_P384_SHA384,
+            Algorithm::ES384,
+            Algorithm::ES256,
+        ),
     ] {
         let key = OpenSsl.generate_keypair(curve).unwrap();
         let encoding = EncodingKey::from_ec_pem(key.serialize_pem().unwrap().as_bytes()).unwrap();
         reject_signing("mismatched EC curve", wrong_algorithm, &encoding);
+        let decoding = DecodingKey::from_ec_pem(key.public_key_pem().as_bytes()).unwrap();
+        let signer = (OpenSsl.jwt_provider().signer_factory)(&algorithm, &encoding).unwrap();
+        let signature = signer.try_sign(MESSAGE).unwrap();
+        reject_verification(
+            "mismatched EC curve",
+            wrong_algorithm,
+            &decoding,
+            &signature,
+        );
     }
 }
 

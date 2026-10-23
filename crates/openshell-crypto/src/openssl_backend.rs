@@ -112,6 +112,9 @@ impl CryptoBackend for OpenSsl {
         // failure path and return it only after finalization verifies the tag.
         let mut plaintext = Zeroizing::new(vec![0; output_size(data.len())?]);
         let written = update_data(&mut crypter, data, &mut plaintext)?;
+        // EVP finalization has no portable provider-independent classification
+        // for bad tags versus late provider failures. Treat all finalization
+        // failures as authentication failures; never release tentative plaintext.
         let final_len = crypter
             .finalize(&mut plaintext[written..])
             .map_err(|_| CryptoError::Authentication)?;

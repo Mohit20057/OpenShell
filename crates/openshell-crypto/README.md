@@ -114,6 +114,41 @@ OpenSSL key instead of parsing it again through the upstream adapter. Claim
 validation stays in jsonwebtoken. AEAD setup errors remain distinct from authentication errors;
 tentative plaintext is cleared on failure and returned only after authentication.
 
+At AEAD finalization, all OpenSSL errors map to `CryptoError::Authentication`.
+The [EVP AEAD interface](https://docs.openssl.org/3.0/man3/EVP_EncryptInit/#aead-interface)
+reports unsuccessful authentication through the finalization result; it does not
+provide a portable error-stack discriminator between a bad tag and a late provider
+failure across providers. A provider failure at this stage therefore shares that
+classification. Setup and update failures remain `CryptoError::Operation`.
+No failure releases tentative plaintext or triggers a backend fallback.
+
+The optional `tls-tonic`, `tls-kube`, and `tls-sqlx` features can each compile with
+`--no-default-features --features openssl,<feature>`; CI checks those combinations
+individually. These features expose integration dependencies, not OpenSSL transport
+adapters for them. Compilation does not establish that dependency-owned clients
+use OpenSSL at runtime or make an OpenSSL-only whole-application build supported.
+
+Linux CI checks that the OpenSSL-only TLS test executable dynamically resolves
+both `libssl` and `libcrypto`. The Nix devshell supplies those libraries; this is
+a linkage regression check, not validation against a distro's OpenSSL packages,
+provider configuration, or FIPS operating mode. Distro qualification remains
+downstream work.
+The test explicitly creates a native OpenSSL TLS context to retain `libssl` for
+this assertion; the backend itself uses Rustls for TLS protocol handling.
+
+Both protocol adapters are external community-maintained dependencies:
+[`rustls-openssl`](https://github.com/tofay/rustls-openssl) and
+[`jsonwebtoken-openssl`](https://github.com/arckoor/jsonwebtoken-providers).
+As of 2026-10-23, upstream rustls-openssl has released 0.4.2, while the JWT adapter's
+repository remains unarchived with recent activity. This is not a support or
+security-maintenance commitment from OpenShell or those projects. The exact
+`rustls-openssl =0.4.1` pin preserves the reviewed provider behavior until a
+deliberate upgrade is validated. `jsonwebtoken-openssl =1.0.0` matches our
+jsonwebtoken 10 provider API; version 2 targets jsonwebtoken 11. Dependency
+updates must rerun interoperability, rejection, provider-failure, and linkage
+checks. Distro packagers need both Rust adapter crates as well as system OpenSSL;
+packaging Rust sources does not permit vendoring the native OpenSSL library.
+
 Protocol limitations remain: Rustls hash/HKDF callbacks and JWT JWK thumbprint
 hashing cannot return backend errors; adapter helpers can panic on provider
 failure. The TLS adapter also uses direct OpenSSL SHA operations and low-level

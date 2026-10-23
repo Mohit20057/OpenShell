@@ -341,8 +341,29 @@ jobs:
           fi
           cargo clippy --locked -p openshell-crypto --no-default-features --features openssl --all-targets -- -D warnings
           cargo test --locked -p openshell-crypto --no-default-features --features openssl
+          for feature in tls-tonic tls-kube tls-sqlx; do
+            cargo check --locked -p openshell-crypto --no-default-features --features "openssl,$feature"
+          done
           cargo clippy --locked -p openshell-crypto --features openssl --all-targets -- -D warnings
           cargo test --locked -p openshell-crypto --features openssl
+
+      - name: Verify dynamic OpenSSL linkage on Linux
+        if: runner.os == 'Linux'
+        shell: nix develop -c bash -euo pipefail {0}
+        env:
+          OPENSSL_NO_VENDOR: "1"
+          OPENSSL_STATIC: "0"
+        run: |
+          cargo test --locked -p openshell-crypto --no-default-features --features openssl --test openssl_tls --no-run --message-format=json > "$RUNNER_TEMP/openssl-artifacts.jsonl"
+          executable=$(uv run --no-project python -c 'import json, sys; artifacts = [json.loads(line) for line in sys.stdin]; paths = [a["executable"] for a in artifacts if a.get("reason") == "compiler-artifact" and a.get("target", {}).get("name") == "openssl_tls" and a.get("executable")]; assert len(paths) == 1, paths; print(paths[0])' < "$RUNNER_TEMP/openssl-artifacts.jsonl")
+          ldd "$executable" > "$RUNNER_TEMP/openssl-linkage.txt"
+          cat "$RUNNER_TEMP/openssl-linkage.txt"
+          for library in libssl libcrypto; do
+            if ! grep -Eq "^[[:space:]]*$library\\.so[^[:space:]]* => /" "$RUNNER_TEMP/openssl-linkage.txt"; then
+              echo "ERROR: $library did not resolve to a dynamic library" >&2
+              exit 1
+            fi
+          done
 
       - name: Test
         shell: nix develop -c bash -euo pipefail {0}

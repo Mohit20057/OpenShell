@@ -46,6 +46,11 @@ jobs:
             family: conformance
             package: sandbox
             runner: ubuntu-24.04
+          - environment: ubuntu-docker-rootful-keycloak
+            installer: deb
+            family: features
+            package: keycloak
+            runner: ubuntu-24.04
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     steps:
@@ -76,7 +81,7 @@ jobs:
           # would rebuild the changed layers on every run. Key on the playbooks
           # with no restore-keys fallback: restoring an older entry would carry
           # its stale disks into the new one, which then only grows.
-          key: tmachine-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tests/tmachine/ansible/**', 'tests/tmachine/images.nix') }}
+          key: tmachine-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tests/tmachine/ansible/**', 'tests/tmachine/images.nix', 'scripts/keycloak-realm.json') }}
 
       - name: Download integration inputs
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1

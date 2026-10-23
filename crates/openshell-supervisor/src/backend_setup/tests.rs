@@ -850,7 +850,7 @@ async fn shared_startup_uses_selected_backend_through_readiness_and_shutdown() {
             proxy_tls: openshell_supervisor_network::run::ProxyTlsFiles::from_environment(),
             takeover: None,
             supervisor_recovery_timeout_secs: None,
-            otlp_endpoint: None,
+            agent_otlp_endpoint: None,
         };
         let bindings = crate::SandboxInstanceBindings::dedicated(
             &config,
@@ -1054,7 +1054,7 @@ async fn suspend_signal_exits_without_terminating_boundary() {
             proxy_tls: openshell_supervisor_network::run::ProxyTlsFiles::from_environment(),
             takeover: None,
             supervisor_recovery_timeout_secs: None,
-            otlp_endpoint: None,
+            agent_otlp_endpoint: None,
         };
         let bindings = crate::SandboxInstanceBindings::dedicated(
             &config,

@@ -43,6 +43,12 @@ OpenSSL does not replace the AWS-LC default; an embedder must install its contex
 explicitly. System libraries and provider configuration belong to the deployment;
 the backend does not modify provider policy.
 
+Runtime TLS configuration uses the facade's `try_client_builder` and
+`try_server_builder` APIs (including explicit protocol-version variants). A
+provider with no usable cipher suites or compatible key-exchange groups produces
+a configuration error without panic or fallback. The older infallible builders
+are compatibility helpers, not the runtime error-handling contract.
+
 ## Contributor rules and coverage
 
 Route new first-party security-sensitive hashing, randomness, encryption,

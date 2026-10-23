@@ -3,7 +3,7 @@
 
 #![cfg(feature = "openssl")]
 
-use openshell_crypto::{CryptoBackend, CryptoContext, CryptoError, OpenSsl, ProtocolBackend};
+use openshell_crypto::{CryptoBackend, CryptoContext, CryptoError, OpenSsl, ProtocolBackend, tls};
 
 #[test]
 fn unavailable_provider_fails_without_fallback() {
@@ -74,13 +74,18 @@ fn unavailable_provider_child() {
         )
         .is_err()
     );
-    // The adapter filters unavailable ciphers; use the fallible Rustls builder
-    // rather than the facade convenience builder, which asserts compatibility.
-    let provider = OpenSsl.tls_provider();
-    assert!(provider.cipher_suites.is_empty());
-    assert!(
-        rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(provider))
-            .with_safe_default_protocol_versions()
-            .is_err()
-    );
+    // Exercise the same facade builders as production callers: a provider with
+    // no usable ciphers must return an error, not panic or fall back to AWS-LC.
+    assert!(OpenSsl.tls_provider().cipher_suites.is_empty());
+    let errors = [
+        tls::try_client_builder().unwrap_err(),
+        tls::try_server_builder().unwrap_err(),
+        tls::try_client_builder_with_protocol_versions(&[&rustls::version::TLS13]).unwrap_err(),
+        tls::try_server_builder_with_protocol_versions(&[&rustls::version::TLS13]).unwrap_err(),
+    ];
+    for error in errors {
+        assert!(
+            matches!(error, rustls::Error::General(ref message) if message == "no usable cipher suites configured")
+        );
+    }
 }

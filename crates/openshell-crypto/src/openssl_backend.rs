@@ -166,6 +166,10 @@ impl Key {
             Id::ED25519 => inner.raw_public_key().map_err(key_error)?,
             Id::EC => {
                 let ec = inner.ec_key().map_err(key_error)?;
+                // Decoding a key does not validate its scalar, public point, or
+                // their consistency. Reject invalid material before exposing it
+                // to certificate construction or signing.
+                ec.check_key().map_err(key_error)?;
                 let mut ctx = BigNumContext::new().map_err(key_error)?;
                 ec.public_key()
                     .to_bytes(ec.group(), PointConversionForm::UNCOMPRESSED, &mut ctx)

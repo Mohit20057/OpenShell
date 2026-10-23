@@ -57,6 +57,9 @@ fn leaf(
 #[test]
 fn tls12_and_tls13_enforce_server_and_client_authentication() {
     init();
+    // An explicit empty protocol policy must not be replaced with defaults.
+    assert!(tls::try_client_builder_with_protocol_versions(&[]).is_err());
+    assert!(tls::try_server_builder_with_protocol_versions(&[]).is_err());
     assert!(std::ptr::eq(
         tls::configuration_provider().secure_random,
         OpenSsl.tls_provider().secure_random
@@ -77,7 +80,8 @@ fn tls12_and_tls13_enforce_server_and_client_authentication() {
         )
         .build()
         .unwrap();
-        let server = tls::server_builder_with_protocol_versions(&[version])
+        let server = tls::try_server_builder_with_protocol_versions(&[version])
+            .unwrap()
             .with_client_cert_verifier(verifier)
             .with_single_cert(
                 vec![server_key.cert.der().clone()],
@@ -87,7 +91,8 @@ fn tls12_and_tls13_enforce_server_and_client_authentication() {
                 .into(),
             )
             .unwrap();
-        let client = tls::client_builder_with_protocol_versions(&[version])
+        let client = tls::try_client_builder_with_protocol_versions(&[version])
+            .unwrap()
             .with_root_certificates(roots.clone())
             .with_client_auth_cert(
                 vec![client_key.cert.der().clone()],
@@ -102,14 +107,16 @@ fn tls12_and_tls13_enforce_server_and_client_authentication() {
             handshake(client, server.clone(), "wrong.example"),
             Err(rustls::Error::InvalidCertificate(_))
         ));
-        let anonymous = tls::client_builder_with_protocol_versions(&[version])
+        let anonymous = tls::try_client_builder_with_protocol_versions(&[version])
+            .unwrap()
             .with_root_certificates(roots.clone())
             .with_no_client_auth();
         assert!(matches!(
             handshake(anonymous, server.clone(), "localhost"),
             Err(rustls::Error::NoCertificatesPresented)
         ));
-        let untrusted = tls::client_builder_with_protocol_versions(&[version])
+        let untrusted = tls::try_client_builder_with_protocol_versions(&[version])
+            .unwrap()
             .with_root_certificates(rustls::RootCertStore::empty())
             .with_no_client_auth();
         assert!(matches!(
@@ -117,7 +124,8 @@ fn tls12_and_tls13_enforce_server_and_client_authentication() {
             Err(rustls::Error::InvalidCertificate(_))
         ));
         let stranger = pki::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
-        let unauthorized = tls::client_builder_with_protocol_versions(&[version])
+        let unauthorized = tls::try_client_builder_with_protocol_versions(&[version])
+            .unwrap()
             .with_root_certificates(roots.clone())
             .with_client_auth_cert(
                 vec![stranger.cert.der().clone()],

@@ -43,6 +43,7 @@ fn check_ec_key(algorithm: Algorithm, der: &[u8]) -> Result<()> {
     if ec.group().curve_name() != Some(expected) {
         return Err(ErrorKind::InvalidEcdsaKey.into());
     }
+    ec.check_key().map_err(|_| ErrorKind::InvalidEcdsaKey)?;
     Ok(())
 }
 
@@ -61,7 +62,7 @@ fn signer(algorithm: &Algorithm, key: &EncodingKey) -> Result<Box<dyn JwtSigner>
         }
         let rsa =
             PKey::private_key_from_der(key.inner()).map_err(|_| ErrorKind::InvalidKeyFormat)?;
-        check_rsa_size(&rsa)?;
+        check_rsa_key(&rsa)?;
     }
     if let Some(digest) = pss_digest(*algorithm) {
         if key.family() != AlgorithmFamily::Rsa {
@@ -69,7 +70,7 @@ fn signer(algorithm: &Algorithm, key: &EncodingKey) -> Result<Box<dyn JwtSigner>
         }
         let key =
             PKey::private_key_from_der(key.inner()).map_err(|_| ErrorKind::InvalidKeyFormat)?;
-        check_rsa_size(&key)?;
+        check_rsa_key(&key)?;
         return Ok(Box::new(PssSigner {
             key,
             algorithm: *algorithm,
@@ -85,11 +86,11 @@ fn verifier(algorithm: &Algorithm, key: &DecodingKey) -> Result<Box<dyn JwtVerif
         algorithm,
         Algorithm::RS256 | Algorithm::RS384 | Algorithm::RS512
     ) {
-        check_rsa_size(&rsa_public_key(key)?)?;
+        check_rsa_key(&rsa_public_key(key)?)?;
     }
     if let Some(digest) = pss_digest(*algorithm) {
         let key = rsa_public_key(key)?;
-        check_rsa_size(&key)?;
+        check_rsa_key(&key)?;
         return Ok(Box::new(PssVerifier {
             key,
             algorithm: *algorithm,
@@ -152,8 +153,20 @@ fn pss_digest(algorithm: Algorithm) -> Option<MessageDigest> {
     }
 }
 
-fn check_rsa_size<T: openssl::pkey::HasPublic>(key: &PKey<T>) -> Result<()> {
+fn check_rsa_key<T: openssl::pkey::HasPublic>(key: &PKey<T>) -> Result<()> {
     if key.id() != openssl::pkey::Id::RSA || !(2048..=8192).contains(&key.bits()) {
+        return Err(ErrorKind::InvalidKeyFormat.into());
+    }
+    let rsa = key.rsa().map_err(|_| ErrorKind::InvalidKeyFormat)?;
+    // Match AWS-LC's signature-key bounds: a positive odd modulus and an odd
+    // public exponent greater than one, at most 33 bits. OpenSSL's component
+    // constructors only assemble a key; they do not enforce these constraints.
+    if rsa.n().is_negative()
+        || !rsa.n().is_odd()
+        || rsa.e().is_negative()
+        || !rsa.e().is_odd()
+        || !(2..=33).contains(&rsa.e().num_bits())
+    {
         return Err(ErrorKind::InvalidKeyFormat.into());
     }
     Ok(())

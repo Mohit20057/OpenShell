@@ -105,17 +105,23 @@ software keys and does not add HSM or PKCS#11 loading.
 
 TLS uses `rustls-openssl` 0.4.1 with TLS 1.2/1.3, without its `fips`, vendored or
 prefer-post-quantum features. The jsonwebtoken 10 adapter includes compatibility
-guards for malformed HMAC signatures, EC algorithm/curve binding, JOSE RSA-PSS
-salt lengths and fixed-width EC JWK coordinates. Claim validation stays in
+guards for malformed HMAC signatures, EC key consistency and algorithm/curve
+binding, RSA public-component bounds, JOSE RSA-PSS salt lengths and fixed-width
+EC JWK coordinates. Certificate key import also checks EC key consistency.
+Claim validation stays in
 jsonwebtoken. AEAD setup errors remain distinct from authentication errors;
 tentative plaintext is cleared on failure and returned only after authentication.
 
 Protocol limitations remain: Rustls hash/HKDF callbacks and JWT JWK thumbprint
 hashing cannot return backend errors; adapter helpers can panic on provider
-failure. The TLS adapter also uses direct OpenSSL SHA operations that do not
-establish provider-module ownership. For fallible TLS setup, use Rustls's
-`builder_with_provider` with `OpenSsl.tls_provider()` and handle protocol-version
-errors; facade convenience builders assert compatibility. This backend does not
+failure. The TLS adapter also uses direct OpenSSL SHA operations and low-level
+EC key generation that do not establish provider-module ownership. First-party
+TLS setup uses `tls::try_client_builder()` / `tls::try_server_builder()` and their
+`_with_protocol_versions` variants. These return configuration errors when the
+selected provider has no usable ciphers or compatible key-exchange groups, without
+switching providers or relaxing the requested protocol versions. The older
+infallible builders remain for API compatibility and panic on configuration errors;
+runtime consumers should use the fallible variants. This backend does not
 promise panic-free protocol operation or a provider-qualified TLS path. These
 limitations require disposition during downstream integration and qualification.
 

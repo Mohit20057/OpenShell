@@ -17,6 +17,7 @@ use crate::execute::Run;
 
 mod bundle;
 mod execute;
+mod test_env;
 
 /// Build a test family for the guest, boot a tmachine environment with
 /// OpenShell installed, run the tests in it, and check the results.

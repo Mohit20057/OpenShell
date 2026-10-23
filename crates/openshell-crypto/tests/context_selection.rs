@@ -3,6 +3,8 @@
 
 #![cfg(feature = "aws-lc")]
 
+mod common;
+
 use openshell_crypto::{
     Capabilities, CryptoBackend, CryptoContext, CryptoError, Digest, ProtocolBackend, aead::Sealed,
 };
@@ -186,24 +188,7 @@ fn selected_context_controls_application_adapters_and_cannot_be_replaced() {
     assert_eq!(client.crypto_provider().cipher_suites.len(), 1);
     assert_eq!(server.crypto_provider().cipher_suites.len(), 1);
     let suite = client.crypto_provider().cipher_suites[0].suite();
-    let mut client =
-        rustls::ClientConnection::new(std::sync::Arc::new(client), "localhost".try_into().unwrap())
-            .unwrap();
-    let mut server = rustls::ServerConnection::new(std::sync::Arc::new(server)).unwrap();
-    for _ in 0..10 {
-        let mut wire = Vec::new();
-        client.write_tls(&mut wire).unwrap();
-        server.read_tls(&mut wire.as_slice()).unwrap();
-        server.process_new_packets().unwrap();
-        wire.clear();
-        server.write_tls(&mut wire).unwrap();
-        client.read_tls(&mut wire.as_slice()).unwrap();
-        client.process_new_packets().unwrap();
-        if !client.is_handshaking() && !server.is_handshaking() {
-            break;
-        }
-    }
-    assert!(!client.is_handshaking() && !server.is_handshaking());
+    let (client, _) = common::handshake(client, server, "localhost").unwrap();
     assert_eq!(client.negotiated_cipher_suite().unwrap().suite(), suite);
     assert_eq!(
         openshell_crypto::default_context()

@@ -13,7 +13,8 @@ use jsonwebtoken::{
     signature::{Error, Signer, Verifier},
 };
 use openssl::{
-    bn::BigNum,
+    bn::{BigNum, BigNumContext},
+    ecdsa::EcdsaSig,
     hash::MessageDigest,
     nid::Nid,
     pkey::{PKey, Private, Public},
@@ -32,7 +33,7 @@ pub(super) fn provider() -> &'static CryptoProvider {
     })
 }
 
-fn check_ec_key(algorithm: Algorithm, der: &[u8]) -> Result<()> {
+fn parse_ec_key(algorithm: Algorithm, der: &[u8]) -> Result<PKey<Private>> {
     let expected = match algorithm {
         Algorithm::ES256 => Nid::X9_62_PRIME256V1,
         Algorithm::ES384 => Nid::SECP384R1,
@@ -44,37 +45,41 @@ fn check_ec_key(algorithm: Algorithm, der: &[u8]) -> Result<()> {
         return Err(ErrorKind::InvalidEcdsaKey.into());
     }
     ec.check_key().map_err(|_| ErrorKind::InvalidEcdsaKey)?;
-    Ok(())
+    Ok(key)
 }
 
 // Signature required by jsonwebtoken's provider factory.
 #[allow(clippy::trivially_copy_pass_by_ref)]
 fn signer(algorithm: &Algorithm, key: &EncodingKey) -> Result<Box<dyn JwtSigner>> {
     if matches!(algorithm, Algorithm::ES256 | Algorithm::ES384) {
-        check_ec_key(*algorithm, key.inner())?;
-    }
-    if matches!(
-        algorithm,
-        Algorithm::RS256 | Algorithm::RS384 | Algorithm::RS512
-    ) {
-        if key.family() != AlgorithmFamily::Rsa {
+        if key.family() != AlgorithmFamily::Ec {
             return Err(ErrorKind::InvalidKeyFormat.into());
         }
-        let rsa =
-            PKey::private_key_from_der(key.inner()).map_err(|_| ErrorKind::InvalidKeyFormat)?;
-        check_rsa_key(&rsa)?;
+        let key = parse_ec_key(*algorithm, key.inner())?;
+        let (digest, width) = match algorithm {
+            Algorithm::ES256 => (MessageDigest::sha256(), 32),
+            Algorithm::ES384 => (MessageDigest::sha384(), 48),
+            _ => return Err(ErrorKind::InvalidAlgorithm.into()),
+        };
+        return Ok(Box::new(EcSigner {
+            key,
+            algorithm: *algorithm,
+            digest,
+            width,
+        }));
     }
-    if let Some(digest) = pss_digest(*algorithm) {
+    if let Some((digest, padding)) = rsa_parameters(*algorithm) {
         if key.family() != AlgorithmFamily::Rsa {
             return Err(ErrorKind::InvalidKeyFormat.into());
         }
         let key =
             PKey::private_key_from_der(key.inner()).map_err(|_| ErrorKind::InvalidKeyFormat)?;
         check_rsa_key(&key)?;
-        return Ok(Box::new(PssSigner {
+        return Ok(Box::new(RsaSigner {
             key,
             algorithm: *algorithm,
             digest,
+            padding,
         }));
     }
     (jsonwebtoken_openssl::DEFAULT_PROVIDER.signer_factory)(algorithm, key)
@@ -82,19 +87,14 @@ fn signer(algorithm: &Algorithm, key: &EncodingKey) -> Result<Box<dyn JwtSigner>
 
 #[allow(clippy::trivially_copy_pass_by_ref)]
 fn verifier(algorithm: &Algorithm, key: &DecodingKey) -> Result<Box<dyn JwtVerifier>> {
-    if matches!(
-        algorithm,
-        Algorithm::RS256 | Algorithm::RS384 | Algorithm::RS512
-    ) {
-        check_rsa_key(&rsa_public_key(key)?)?;
-    }
-    if let Some(digest) = pss_digest(*algorithm) {
+    if let Some((digest, padding)) = rsa_parameters(*algorithm) {
         let key = rsa_public_key(key)?;
         check_rsa_key(&key)?;
-        return Ok(Box::new(PssVerifier {
+        return Ok(Box::new(RsaVerifier {
             key,
             algorithm: *algorithm,
             digest,
+            padding,
         }));
     }
     let inner = (jsonwebtoken_openssl::DEFAULT_PROVIDER.verifier_factory)(algorithm, key)?;
@@ -144,11 +144,14 @@ impl JwtVerifier for HmacVerifier {
     }
 }
 
-fn pss_digest(algorithm: Algorithm) -> Option<MessageDigest> {
+fn rsa_parameters(algorithm: Algorithm) -> Option<(MessageDigest, Padding)> {
     match algorithm {
-        Algorithm::PS256 => Some(MessageDigest::sha256()),
-        Algorithm::PS384 => Some(MessageDigest::sha384()),
-        Algorithm::PS512 => Some(MessageDigest::sha512()),
+        Algorithm::RS256 => Some((MessageDigest::sha256(), Padding::PKCS1)),
+        Algorithm::RS384 => Some((MessageDigest::sha384(), Padding::PKCS1)),
+        Algorithm::RS512 => Some((MessageDigest::sha512(), Padding::PKCS1)),
+        Algorithm::PS256 => Some((MessageDigest::sha256(), Padding::PKCS1_PSS)),
+        Algorithm::PS384 => Some((MessageDigest::sha384(), Padding::PKCS1_PSS)),
+        Algorithm::PS512 => Some((MessageDigest::sha512(), Padding::PKCS1_PSS)),
         _ => None,
     }
 }
@@ -172,57 +175,62 @@ fn check_rsa_key<T: openssl::pkey::HasPublic>(key: &PKey<T>) -> Result<()> {
     Ok(())
 }
 
-struct PssSigner {
+struct RsaSigner {
     key: PKey<Private>,
     algorithm: Algorithm,
     digest: MessageDigest,
+    padding: Padding,
 }
 
-impl Signer<Vec<u8>> for PssSigner {
+impl Signer<Vec<u8>> for RsaSigner {
     fn try_sign(&self, message: &[u8]) -> std::result::Result<Vec<u8>, Error> {
         let mut signer = OpenSslSigner::new(self.digest, &self.key).map_err(Error::from_source)?;
         signer
-            .set_rsa_padding(Padding::PKCS1_PSS)
+            .set_rsa_padding(self.padding)
             .map_err(Error::from_source)?;
-        signer
-            .set_rsa_mgf1_md(self.digest)
-            .map_err(Error::from_source)?;
-        // JOSE requires salt length equal to the digest length, not OpenSSL's
-        // default maximum salt length (RFC 7518 section 3.5).
-        signer
-            .set_rsa_pss_saltlen(RsaPssSaltlen::DIGEST_LENGTH)
-            .map_err(Error::from_source)?;
+        if self.padding == Padding::PKCS1_PSS {
+            signer
+                .set_rsa_mgf1_md(self.digest)
+                .map_err(Error::from_source)?;
+            // JOSE requires salt length equal to the digest length (RFC 7518 3.5).
+            signer
+                .set_rsa_pss_saltlen(RsaPssSaltlen::DIGEST_LENGTH)
+                .map_err(Error::from_source)?;
+        }
         signer
             .sign_oneshot_to_vec(message)
             .map_err(Error::from_source)
     }
 }
 
-impl JwtSigner for PssSigner {
+impl JwtSigner for RsaSigner {
     fn algorithm(&self) -> Algorithm {
         self.algorithm
     }
 }
 
-struct PssVerifier {
+struct RsaVerifier {
     key: PKey<Public>,
     algorithm: Algorithm,
     digest: MessageDigest,
+    padding: Padding,
 }
 
-impl Verifier<Vec<u8>> for PssVerifier {
+impl Verifier<Vec<u8>> for RsaVerifier {
     fn verify(&self, message: &[u8], signature: &Vec<u8>) -> std::result::Result<(), Error> {
         let mut verifier =
             OpenSslVerifier::new(self.digest, &self.key).map_err(Error::from_source)?;
         verifier
-            .set_rsa_padding(Padding::PKCS1_PSS)
+            .set_rsa_padding(self.padding)
             .map_err(Error::from_source)?;
-        verifier
-            .set_rsa_mgf1_md(self.digest)
-            .map_err(Error::from_source)?;
-        verifier
-            .set_rsa_pss_saltlen(RsaPssSaltlen::DIGEST_LENGTH)
-            .map_err(Error::from_source)?;
+        if self.padding == Padding::PKCS1_PSS {
+            verifier
+                .set_rsa_mgf1_md(self.digest)
+                .map_err(Error::from_source)?;
+            verifier
+                .set_rsa_pss_saltlen(RsaPssSaltlen::DIGEST_LENGTH)
+                .map_err(Error::from_source)?;
+        }
         if verifier
             .verify_oneshot(signature, message)
             .map_err(Error::from_source)?
@@ -234,30 +242,66 @@ impl Verifier<Vec<u8>> for PssVerifier {
     }
 }
 
-impl JwtVerifier for PssVerifier {
+impl JwtVerifier for RsaVerifier {
+    fn algorithm(&self) -> Algorithm {
+        self.algorithm
+    }
+}
+
+// Keep the validated key rather than asking the upstream factory to parse it again.
+struct EcSigner {
+    key: PKey<Private>,
+    algorithm: Algorithm,
+    digest: MessageDigest,
+    width: i32,
+}
+
+impl Signer<Vec<u8>> for EcSigner {
+    fn try_sign(&self, message: &[u8]) -> std::result::Result<Vec<u8>, Error> {
+        let mut signer = OpenSslSigner::new(self.digest, &self.key).map_err(Error::from_source)?;
+        let der = signer
+            .sign_oneshot_to_vec(message)
+            .map_err(Error::from_source)?;
+        // JOSE uses fixed-width r || s, whereas OpenSSL returns an ASN.1 sequence.
+        let signature = EcdsaSig::from_der(&der).map_err(Error::from_source)?;
+        let mut raw = signature
+            .r()
+            .to_vec_padded(self.width)
+            .map_err(Error::from_source)?;
+        raw.extend(
+            signature
+                .s()
+                .to_vec_padded(self.width)
+                .map_err(Error::from_source)?,
+        );
+        Ok(raw)
+    }
+}
+
+impl JwtSigner for EcSigner {
     fn algorithm(&self) -> Algorithm {
         self.algorithm
     }
 }
 
 fn ec_coordinates(der: &[u8], algorithm: Algorithm) -> Result<(EllipticCurve, Vec<u8>, Vec<u8>)> {
-    check_ec_key(algorithm, der)?;
-    let (curve, x, y) = (jsonwebtoken_openssl::DEFAULT_PROVIDER
-        .jwk_utils
-        .extract_ec_public_key_coordinates)(der, algorithm)?;
-    let width: usize = if algorithm == Algorithm::ES256 {
-        32
-    } else {
-        48
+    let key = parse_ec_key(algorithm, der)?;
+    let ec = key.ec_key().map_err(|_| ErrorKind::InvalidEcdsaKey)?;
+    let (curve, width) = match algorithm {
+        Algorithm::ES256 => (EllipticCurve::P256, 32),
+        Algorithm::ES384 => (EllipticCurve::P384, 48),
+        _ => return Err(ErrorKind::InvalidAlgorithm.into()),
     };
+    let mut x = BigNum::new().map_err(Error::from_source)?;
+    let mut y = BigNum::new().map_err(Error::from_source)?;
+    let mut context = BigNumContext::new().map_err(Error::from_source)?;
+    ec.public_key()
+        .affine_coordinates_gfp(ec.group(), &mut x, &mut y, &mut context)
+        .map_err(|_| ErrorKind::InvalidEcdsaKey)?;
     // JWK coordinates have fixed width, including leading zeros (RFC 7518 6.2.1).
-    let pad = |coordinate: Vec<u8>| -> Result<Vec<u8>> {
-        let padding = width
-            .checked_sub(coordinate.len())
-            .ok_or(ErrorKind::InvalidEcdsaKey)?;
-        let mut result = vec![0; padding];
-        result.extend_from_slice(&coordinate);
-        Ok(result)
-    };
-    Ok((curve, pad(x)?, pad(y)?))
+    Ok((
+        curve,
+        x.to_vec_padded(width).map_err(Error::from_source)?,
+        y.to_vec_padded(width).map_err(Error::from_source)?,
+    ))
 }

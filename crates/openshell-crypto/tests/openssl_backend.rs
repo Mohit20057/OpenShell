@@ -3,31 +3,18 @@
 
 #![cfg(feature = "openssl")]
 
-use openshell_crypto::OpenSsl;
-use openshell_crypto::{
-    CryptoBackend, CryptoContext, CryptoError, ProtocolBackend, aead, jwt, pki, tls,
-};
-use std::{
-    io::{Read, Write},
-    sync::{Arc, Once},
-};
+mod common;
 
-fn init() {
-    static INIT: Once = Once::new();
-    INIT.call_once(|| {
-        // Explicit facade selection must win even when an embedder installed
-        // AWS-LC as Rustls's process default first.
-        #[cfg(feature = "aws-lc")]
-        rustls::crypto::aws_lc_rs::default_provider()
-            .install_default()
-            .unwrap();
-        openshell_crypto::install_default_context(CryptoContext::new(Box::new(OpenSsl))).unwrap();
-    });
-}
+use common::{handshake, init_openssl};
+#[cfg(feature = "aws-lc")]
+use openshell_crypto::CryptoContext;
+use openshell_crypto::OpenSsl;
+use openshell_crypto::{CryptoBackend, CryptoError, ProtocolBackend, aead, jwt, pki, tls};
+use std::io::{Read, Write};
 
 #[test]
 fn primitives_and_posture() {
-    init();
+    init_openssl();
     assert_eq!(
         openshell_crypto::sha256(b"abc").unwrap(),
         [
@@ -60,7 +47,7 @@ fn primitives_and_posture() {
 
 #[test]
 fn aead_compatibility_and_rejection() {
-    init();
+    init_openssl();
     // NIST AES-256-GCM empty-message vector: ciphertext consists only of the tag.
     let tag = [
         0x53, 0x0f, 0x8a, 0xfb, 0xc7, 0x45, 0x36, 0xb9, 0xa9, 0x63, 0xb4, 0xf1, 0xc4, 0xcb, 0x73,
@@ -130,7 +117,7 @@ fn aead_handles_multiple_update_chunks() {
 
 #[test]
 fn jwt_rejects_mismatched_curve_and_pss_salt() {
-    init();
+    init_openssl();
     let key = OpenSsl
         .generate_keypair(&rcgen::PKCS_ECDSA_P256_SHA256)
         .unwrap();
@@ -249,18 +236,20 @@ fn jwk_coordinates_preserve_leading_zeros() {
 
 #[test]
 fn backend_owned_keys_and_certificates() {
-    init();
+    init_openssl();
     for alg in [
         &rcgen::PKCS_ECDSA_P256_SHA256,
         &rcgen::PKCS_ECDSA_P384_SHA384,
         &rcgen::PKCS_ED25519,
         &rcgen::PKCS_RSA_SHA256,
+        &rcgen::PKCS_RSA_SHA384,
+        &rcgen::PKCS_RSA_SHA512,
     ] {
         let key = pki::generate_keypair_for(alg).unwrap();
         let der = key.serialize_der().unwrap();
         let from_der = pki::KeyPair::from_pkcs8_der(&der).unwrap();
         let from_pem = pki::KeyPair::from_pem(&key.serialize_pem().unwrap()).unwrap();
-        for imported in [&from_der, &from_pem] {
+        for imported in [&key, &from_der, &from_pem] {
             assert_eq!(key.public_key_der(), imported.public_key_der());
             let cert = pki::self_signed(
                 rcgen::CertificateParams::new(vec!["localhost".into()]).unwrap(),
@@ -280,7 +269,7 @@ fn jwt_algorithms_and_claims_validation() {
     use jsonwebtoken::{
         Algorithm, DecodingKey, EncodingKey, Header, Validation, errors::ErrorKind,
     };
-    init();
+    init_openssl();
     let claims = serde_json::json!({"sub":"sandbox", "iss":"gateway", "aud":"sandbox", "exp":4_000_000_000_u64});
     let mut keys = vec![(
         Algorithm::HS256,
@@ -365,7 +354,7 @@ fn jwt_algorithms_and_claims_validation() {
 
 #[test]
 fn tls13_handshake_and_application_data() {
-    init();
+    init_openssl();
     let pki::CertifiedKey { cert, key_pair } =
         pki::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     let mut roots = rustls::RootCertStore::empty();
@@ -380,23 +369,7 @@ fn tls13_handshake_and_application_data() {
             rustls::pki_types::PrivatePkcs8KeyDer::from(key_pair.serialize_der().unwrap()).into(),
         )
         .unwrap();
-    let mut client =
-        rustls::ClientConnection::new(Arc::new(client), "localhost".try_into().unwrap()).unwrap();
-    let mut server = rustls::ServerConnection::new(Arc::new(server)).unwrap();
-    for _ in 0..10 {
-        let mut wire = Vec::new();
-        client.write_tls(&mut wire).unwrap();
-        server.read_tls(&mut wire.as_slice()).unwrap();
-        server.process_new_packets().unwrap();
-        wire.clear();
-        server.write_tls(&mut wire).unwrap();
-        client.read_tls(&mut wire.as_slice()).unwrap();
-        client.process_new_packets().unwrap();
-        if !client.is_handshaking() && !server.is_handshaking() {
-            break;
-        }
-    }
-    assert!(!client.is_handshaking() && !server.is_handshaking());
+    let (mut client, mut server) = handshake(client, server, "localhost").unwrap();
     assert_eq!(
         client.protocol_version(),
         Some(rustls::ProtocolVersion::TLSv1_3)
@@ -417,7 +390,7 @@ fn tls13_handshake_and_application_data() {
 
 #[test]
 fn imported_ca_signs_with_openssl() {
-    init();
+    init_openssl();
     let key = pki::generate_keypair().unwrap();
     let mut params = rcgen::CertificateParams::default();
     params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
@@ -443,7 +416,7 @@ fn imported_ca_signs_with_openssl() {
 
 #[test]
 fn malformed_hmac_signatures_are_rejected() {
-    init();
+    init_openssl();
     for algorithm in [
         jsonwebtoken::Algorithm::HS256,
         jsonwebtoken::Algorithm::HS384,
@@ -475,7 +448,7 @@ fn malformed_hmac_signatures_are_rejected() {
 #[cfg(feature = "aws-lc")]
 fn backends_preserve_ciphertext_keys_and_jwt_signatures() {
     use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey};
-    init();
+    init_openssl();
     let aws = CryptoContext::default();
     assert_eq!(aws.backend().capabilities().backend, "aws-lc");
     let openssl: &dyn ProtocolBackend = &OpenSsl;

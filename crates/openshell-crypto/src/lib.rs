@@ -49,6 +49,10 @@ pub enum FipsState {
 }
 
 /// Operations implemented by a backend. Protocol coverage is documented separately.
+///
+/// These lists describe each backend individually, not a common set required of
+/// every backend. Host provider policy can still reject a listed operation;
+/// capabilities do not guarantee runtime availability or FIPS compliance.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Capabilities {
     /// Stable backend identifier.
@@ -59,7 +63,8 @@ pub struct Capabilities {
     pub fips: FipsState,
     /// Primitive operations supported by this implementation.
     pub primitives: &'static [&'static str],
-    /// Key generation algorithms available through the PKI adapter.
+    /// Key algorithms implemented by this backend's PKI and JWT adapters.
+    /// Listing an algorithm does not imply support for every operation or variant.
     pub key_algorithms: &'static [&'static str],
 }
 

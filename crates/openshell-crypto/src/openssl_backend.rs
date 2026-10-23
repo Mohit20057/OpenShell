@@ -76,7 +76,11 @@ impl CryptoBackend for OpenSsl {
         let mut crypter = Crypter::new(Cipher::aes_256_gcm(), Mode::Encrypt, key, Some(&nonce))
             .map_err(|_| CryptoError::Operation)?;
         update_aad(&mut crypter, aad)?;
-        let mut ciphertext = vec![0; output_size(plaintext.len())?];
+        // Retain room for the tag after truncating the encryption output.
+        let capacity = output_size(plaintext.len())?
+            .checked_add(tag.len())
+            .ok_or(CryptoError::Operation)?;
+        let mut ciphertext = vec![0; capacity];
         let written = update_data(&mut crypter, plaintext, &mut ciphertext)?;
         let final_len = crypter
             .finalize(&mut ciphertext[written..])
@@ -175,11 +179,18 @@ impl Key {
                     .to_bytes(ec.group(), PointConversionForm::UNCOMPRESSED, &mut ctx)
                     .map_err(key_error)?
             }
-            Id::RSA => inner
-                .rsa()
-                .map_err(key_error)?
-                .public_key_to_der_pkcs1()
-                .map_err(key_error)?,
+            Id::RSA => {
+                // Preserve AWS-LC's 2048–8192-bit range for certificate keys on PEM
+                // and PKCS#8 DER imports, before exposing a signing key.
+                if !(2048..=8192).contains(&inner.bits()) {
+                    return Err(rcgen::Error::CouldNotParseKeyPair);
+                }
+                inner
+                    .rsa()
+                    .map_err(key_error)?
+                    .public_key_to_der_pkcs1()
+                    .map_err(key_error)?
+            }
             _ => return Err(rcgen::Error::UnsupportedSignatureAlgorithm),
         };
         pki::KeyPair::new(Box::new(Self {
@@ -211,7 +222,7 @@ impl pki::SigningKey for Key {
         &self.public
     }
     fn sign(&self, message: &[u8]) -> Result<Vec<u8>, rcgen::Error> {
-        let mut signer = if self.inner.id() == Id::ED25519 {
+        let mut signer = if self.algorithm == &rcgen::PKCS_ED25519 {
             Signer::new_without_digest(&self.inner)
         } else {
             let digest = if self.algorithm == &rcgen::PKCS_ECDSA_P384_SHA384
@@ -220,8 +231,12 @@ impl pki::SigningKey for Key {
                 MessageDigest::sha384()
             } else if self.algorithm == &rcgen::PKCS_RSA_SHA512 {
                 MessageDigest::sha512()
-            } else {
+            } else if self.algorithm == &rcgen::PKCS_ECDSA_P256_SHA256
+                || self.algorithm == &rcgen::PKCS_RSA_SHA256
+            {
                 MessageDigest::sha256()
+            } else {
+                return Err(rcgen::Error::UnsupportedSignatureAlgorithm);
             };
             Signer::new(digest, &self.inner)
         }
@@ -299,5 +314,29 @@ impl ProtocolBackend for OpenSsl {
     }
     fn jwt_provider(&self) -> &'static jsonwebtoken::crypto::CryptoProvider {
         jwt::provider()
+    }
+}
+
+#[cfg(all(test, feature = "aws-lc"))]
+mod tests {
+    use super::*;
+    use crate::pki::SigningKey;
+
+    #[test]
+    fn signing_rejects_an_unmapped_algorithm() {
+        // Exercise signing directly: generation/import currently reject P-521,
+        // but extending those paths must not silently select SHA-256 here.
+        let mut context = PkeyCtx::new_id(Id::EC).unwrap();
+        context.keygen_init().unwrap();
+        context.set_ec_paramgen_curve_nid(Nid::SECP521R1).unwrap();
+        let key = Key {
+            inner: context.keygen().unwrap(),
+            algorithm: &rcgen::PKCS_ECDSA_P521_SHA512,
+            public: Vec::new(),
+        };
+        assert!(matches!(
+            key.sign(b"certificate contents"),
+            Err(rcgen::Error::UnsupportedSignatureAlgorithm)
+        ));
     }
 }

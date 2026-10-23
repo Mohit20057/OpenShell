@@ -124,3 +124,81 @@ fn pki_and_jwt_reject_inconsistent_ec_private_keys() {
         assert!((provider.signer_factory)(&algorithm, &EncodingKey::from_ec_der(&sec1)).is_ok());
     }
 }
+
+#[test]
+fn pki_enforces_rsa_minimum_size_for_pem_and_pkcs8() {
+    // Certificate construction uses the facade for its random serial number.
+    openshell_crypto::install_default_context(openshell_crypto::CryptoContext::new(Box::new(
+        OpenSsl,
+    )))
+    .unwrap();
+    #[cfg(feature = "aws-lc")]
+    let aws = openshell_crypto::CryptoContext::default();
+    let backends: &[&dyn ProtocolBackend] = &[
+        &OpenSsl,
+        #[cfg(feature = "aws-lc")]
+        aws.backend(),
+    ];
+    for bits in [1024, 2048] {
+        let rsa = Rsa::generate(bits).unwrap();
+        let traditional_pem = String::from_utf8(rsa.private_key_to_pem().unwrap()).unwrap();
+        let native = PKey::from_rsa(rsa).unwrap();
+        let der = native.private_key_to_pkcs8().unwrap();
+        let pem = String::from_utf8(native.private_key_to_pem_pkcs8().unwrap()).unwrap();
+        for backend in backends {
+            for (format, imported) in [
+                ("PKCS#8 DER", backend.import_keypair_der(&der)),
+                ("PKCS#8 PEM", backend.import_keypair_pem(&pem)),
+                ("PKCS#1 PEM", backend.import_keypair_pem(&traditional_pem)),
+            ] {
+                if bits < 2048 {
+                    assert!(
+                        imported.is_err(),
+                        "{} accepted a {bits}-bit RSA key from {format}",
+                        backend.capabilities().backend
+                    );
+                } else {
+                    let key = imported.unwrap();
+                    assert_eq!(key.public_key_der(), native.public_key_to_der().unwrap());
+                    let certificate = openshell_crypto::pki::self_signed(
+                        rcgen::CertificateParams::new(vec!["localhost".into()]).unwrap(),
+                        &key,
+                    )
+                    .unwrap();
+                    let x509 = openssl::x509::X509::from_der(certificate.der()).unwrap();
+                    assert!(x509.verify(&native).unwrap());
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn pki_rejects_oversized_rsa_imports() {
+    // A parseable oversized modulus isolates the size gate without expensive
+    // 8193-bit prime generation. This synthetic key is not a consistent RSA pair.
+    let seed = Rsa::generate(2048).unwrap();
+    let mut modulus = seed.n().to_owned().unwrap();
+    modulus.set_bit(8192).unwrap();
+    let oversized = Rsa::from_private_components(
+        modulus,
+        seed.e().to_owned().unwrap(),
+        seed.d().to_owned().unwrap(),
+        seed.p().unwrap().to_owned().unwrap(),
+        seed.q().unwrap().to_owned().unwrap(),
+        seed.dmp1().unwrap().to_owned().unwrap(),
+        seed.dmq1().unwrap().to_owned().unwrap(),
+        seed.iqmp().unwrap().to_owned().unwrap(),
+    )
+    .unwrap();
+    let traditional_pem = String::from_utf8(oversized.private_key_to_pem().unwrap()).unwrap();
+    let native = PKey::from_rsa(oversized).unwrap();
+    assert_eq!(native.bits(), 8193);
+    let der = native.private_key_to_pkcs8().unwrap();
+    let pem = String::from_utf8(native.private_key_to_pem_pkcs8().unwrap()).unwrap();
+    assert!(PKey::private_key_from_pkcs8(&der).is_ok());
+    assert!(PKey::private_key_from_pem(pem.as_bytes()).is_ok());
+    assert!(OpenSsl.import_keypair_der(&der).is_err());
+    assert!(OpenSsl.import_keypair_pem(&pem).is_err());
+    assert!(OpenSsl.import_keypair_pem(&traditional_pem).is_err());
+}

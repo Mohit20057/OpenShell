@@ -36,6 +36,7 @@ impl CryptoBackend for AwsLc {
                 "ECDSA-P384-SHA384",
                 "ECDSA-P521-SHA512",
                 "Ed25519",
+                "RSA",
             ],
         }
     }

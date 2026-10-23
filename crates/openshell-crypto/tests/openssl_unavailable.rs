@@ -4,12 +4,16 @@
 #![cfg(feature = "openssl")]
 
 use openshell_crypto::{CryptoBackend, CryptoContext, CryptoError, OpenSsl, ProtocolBackend, tls};
+use std::{
+    process::{Command, Stdio},
+    time::{Duration, Instant},
+};
 
 #[test]
 fn unavailable_provider_fails_without_fallback() {
     // OpenSSL reads configuration once. Exercise failure in a fresh process,
     // without changing the test runner's environment or process-global state.
-    let result = std::process::Command::new(std::env::current_exe().unwrap())
+    let mut child = Command::new(std::env::current_exe().unwrap())
         .args([
             "--ignored",
             "--exact",
@@ -24,8 +28,26 @@ fn unavailable_provider_fails_without_fallback() {
                 "/tests/fixtures/openssl-unavailable.cnf"
             ),
         )
-        .output()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() >= deadline {
+            // The child may have exited since try_wait; still reap it below.
+            let _ = child.kill();
+            let result = child.wait_with_output().unwrap();
+            panic!(
+                "unavailable-provider child exceeded the 10-second deadline\n{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let result = child.wait_with_output().unwrap();
     assert!(
         result.status.success(),
         "{}\n{}",

@@ -3,43 +3,11 @@
 
 #![cfg(feature = "openssl")]
 
-use openshell_crypto::{CryptoContext, OpenSsl, ProtocolBackend, pki, tls};
-use std::sync::{Arc, Once};
+mod common;
 
-fn init() {
-    static INIT: Once = Once::new();
-    INIT.call_once(|| {
-        #[cfg(feature = "aws-lc")]
-        rustls::crypto::aws_lc_rs::default_provider()
-            .install_default()
-            .unwrap();
-        openshell_crypto::install_default_context(CryptoContext::new(Box::new(OpenSsl))).unwrap();
-    });
-}
-
-fn handshake(
-    client: rustls::ClientConfig,
-    server: rustls::ServerConfig,
-    host: &'static str,
-) -> Result<(), rustls::Error> {
-    let mut client =
-        rustls::ClientConnection::new(Arc::new(client), host.try_into().unwrap()).unwrap();
-    let mut server = rustls::ServerConnection::new(Arc::new(server)).unwrap();
-    for _ in 0..10 {
-        let mut wire = Vec::new();
-        client.write_tls(&mut wire).unwrap();
-        server.read_tls(&mut wire.as_slice()).unwrap();
-        server.process_new_packets()?;
-        wire.clear();
-        server.write_tls(&mut wire).unwrap();
-        client.read_tls(&mut wire.as_slice()).unwrap();
-        client.process_new_packets()?;
-        if !client.is_handshaking() && !server.is_handshaking() {
-            return Ok(());
-        }
-    }
-    Err(rustls::Error::General("handshake did not finish".into()))
-}
+use common::{handshake, init_openssl};
+use openshell_crypto::{OpenSsl, ProtocolBackend, pki, tls};
+use std::sync::Arc;
 
 fn leaf(
     ca: &pki::Certificate,
@@ -56,7 +24,7 @@ fn leaf(
 
 #[test]
 fn tls12_and_tls13_enforce_server_and_client_authentication() {
-    init();
+    init_openssl();
     // An explicit empty protocol policy must not be replaced with defaults.
     assert!(tls::try_client_builder_with_protocol_versions(&[]).is_err());
     assert!(tls::try_server_builder_with_protocol_versions(&[]).is_err());

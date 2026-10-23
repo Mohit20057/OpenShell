@@ -100,6 +100,10 @@ wrappers = [
 [[bans.deny]]
 name = "aws-lc-fips-sys"
 # Keep this boundary even when the FIPS build feature is disabled.
+# The aws-lc-rs wrapper is intentionally unused in the current resolved graph;
+# cargo-deny's unused-wrapper warning for this entry is expected. Revisit this
+# acknowledgement if the FIPS dependency is enabled; other unused wrappers
+# still require review.
 reason = "Native crypto bindings belong behind their provider libraries, not application crates."
 wrappers = [
     "aws-lc-rs",
@@ -113,6 +117,10 @@ wrappers = [
     "openshell-crypto",
     "rustls-openssl",
 ]
+
+[[bans.deny]]
+name = "openssl-src"
+reason = "Use system-provided OpenSSL; vendored OpenSSL is not permitted."
 
 [[bans.deny]]
 name = "openssl-sys"

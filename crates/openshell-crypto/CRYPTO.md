@@ -73,6 +73,8 @@ unapproved direct dependencies on named crypto implementations. AWS-LC and OpenS
 are accessible through `openshell-crypto` and the explicitly listed libraries
 that own their own crypto operations. Native `*-sys` crates and the OpenSSL
 protocol adapters have separate rules to prevent bypassing the provider boundary.
+`openssl-src` is banned without wrapper exceptions: OpenSSL must come from the
+system, including when enabled transitively through another dependency.
 The catalog also covers RustCrypto hashes, MACs, ciphers, and signature libraries.
 Protocol/parsing types remain usable in application crates.
 
@@ -87,6 +89,8 @@ mise run rust:deny:policy
 ```
 
 Run just the regression fixtures with `mise run rust:deny:crypto-test`. They use
+the cargo-deny version pinned in `mise.toml`, as does the Branch Checks job; the
+fixtures reject a mismatched tool version before checking dependency graphs. They use
 local stub packages to exercise cargo-deny without compiling cryptography or
 downloading dependencies. They test allowed provider paths, shared-dependency
 bypasses, aliases, build/dev/target dependencies, and unapproved intermediary

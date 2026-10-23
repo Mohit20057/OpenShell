@@ -107,9 +107,11 @@ TLS uses `rustls-openssl` 0.4.1 with TLS 1.2/1.3, without its `fips`, vendored o
 prefer-post-quantum features. The jsonwebtoken 10 adapter includes compatibility
 guards for malformed HMAC signatures, EC key consistency and algorithm/curve
 binding, RSA public-component bounds, JOSE RSA-PSS salt lengths and fixed-width
-EC JWK coordinates. Certificate key import also checks EC key consistency.
-Claim validation stays in
-jsonwebtoken. AEAD setup errors remain distinct from authentication errors;
+EC JWK coordinates. Certificate key import also checks EC key consistency and
+requires RSA keys in the 2048–8192-bit range, matching AWS-LC.
+RSA signing/verification, EC signing, and EC JWK extraction reuse the validated
+OpenSSL key instead of parsing it again through the upstream adapter. Claim
+validation stays in jsonwebtoken. AEAD setup errors remain distinct from authentication errors;
 tentative plaintext is cleared on failure and returned only after authentication.
 
 Protocol limitations remain: Rustls hash/HKDF callbacks and JWT JWK thumbprint
@@ -124,6 +126,16 @@ infallible builders remain for API compatibility and panic on configuration erro
 runtime consumers should use the fallible variants. This backend does not
 promise panic-free protocol operation or a provider-qualified TLS path. These
 limitations require disposition during downstream integration and qualification.
+
+The pinned `rustls-openssl` 0.4.1 verifier prints OpenSSL error stacks directly to
+stderr through `std::dbg!`, including in release builds, when verification returns
+an OpenSSL error. Peer-controlled malformed signatures can trigger this path;
+the output bypasses application logging controls and can create repeated
+diagnostic noise. Verification still fails. Upstream
+[0.4.2 removes this output](https://github.com/tofay/rustls-openssl/blob/0.4.2/src/verify.rs#L347).
+Upgrade and validate the dependency before deploying this TLS path; that release
+also changes provider routing and FIPS reporting, so the upgrade requires more
+than removing the diagnostic call.
 
 ## Lifecycle and posture
 

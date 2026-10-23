@@ -188,11 +188,14 @@ impl Key {
                 if !(2048..=8192).contains(&inner.bits()) {
                     return Err(rcgen::Error::CouldNotParseKeyPair);
                 }
-                inner
-                    .rsa()
-                    .map_err(key_error)?
-                    .public_key_to_der_pkcs1()
-                    .map_err(key_error)?
+                let rsa = inner.rsa().map_err(key_error)?;
+                // Decoding and size checks do not establish consistency of the
+                // private exponent, primes, and CRT parameters. Signing may
+                // still succeed through CRT even when the private exponent is wrong.
+                if !matches!(rsa.check_key(), Ok(true)) {
+                    return Err(rcgen::Error::CouldNotParseKeyPair);
+                }
+                rsa.public_key_to_der_pkcs1().map_err(key_error)?
             }
             _ => return Err(rcgen::Error::UnsupportedSignatureAlgorithm),
         };

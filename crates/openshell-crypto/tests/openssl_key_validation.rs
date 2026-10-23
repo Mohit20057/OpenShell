@@ -202,3 +202,91 @@ fn pki_rejects_oversized_rsa_imports() {
     assert!(OpenSsl.import_keypair_pem(&pem).is_err());
     assert!(OpenSsl.import_keypair_pem(&traditional_pem).is_err());
 }
+
+#[test]
+fn pki_and_jwt_reject_inconsistent_rsa_private_keys() {
+    let valid = Rsa::generate(2048).unwrap();
+    #[cfg(feature = "aws-lc")]
+    let aws = openshell_crypto::CryptoContext::default();
+    let backends: &[&dyn ProtocolBackend] = &[
+        &OpenSsl,
+        #[cfg(feature = "aws-lc")]
+        aws.backend(),
+    ];
+    for component in 0..4 {
+        let mut private = [
+            valid.d().to_owned().unwrap(),
+            valid.dmp1().unwrap().to_owned().unwrap(),
+            valid.dmq1().unwrap().to_owned().unwrap(),
+            valid.iqmp().unwrap().to_owned().unwrap(),
+        ];
+        private[component].add_word(2).unwrap();
+        let [
+            private_exponent,
+            first_exponent,
+            second_exponent,
+            coefficient,
+        ] = private;
+        let malformed = Rsa::from_private_components(
+            valid.n().to_owned().unwrap(),
+            valid.e().to_owned().unwrap(),
+            private_exponent,
+            valid.p().unwrap().to_owned().unwrap(),
+            valid.q().unwrap().to_owned().unwrap(),
+            first_exponent,
+            second_exponent,
+            coefficient,
+        )
+        .unwrap();
+        assert!(!matches!(malformed.check_key(), Ok(true)));
+        let pkcs1 = malformed.private_key_to_der().unwrap();
+        let traditional_pem = String::from_utf8(malformed.private_key_to_pem().unwrap()).unwrap();
+        let native = PKey::from_rsa(malformed).unwrap();
+        let der = native.private_key_to_pkcs8().unwrap();
+        let pem = String::from_utf8(native.private_key_to_pem_pkcs8().unwrap()).unwrap();
+        // Parsing succeeds; consistency validation must reject these keys.
+        assert!(PKey::private_key_from_pkcs8(&der).is_ok());
+        assert!(PKey::private_key_from_pem(pem.as_bytes()).is_ok());
+        for backend in backends {
+            for imported in [
+                backend.import_keypair_der(&der),
+                backend.import_keypair_pem(&pem),
+                backend.import_keypair_pem(&traditional_pem),
+            ] {
+                assert!(
+                    imported.is_err(),
+                    "{} accepted corrupted RSA component {component}",
+                    backend.capabilities().backend
+                );
+            }
+            for encoding in [
+                EncodingKey::from_rsa_der(&pkcs1),
+                EncodingKey::from_rsa_pem(pem.as_bytes()).unwrap(),
+            ] {
+                for algorithm in [
+                    Algorithm::RS256,
+                    Algorithm::RS384,
+                    Algorithm::RS512,
+                    Algorithm::PS256,
+                    Algorithm::PS384,
+                    Algorithm::PS512,
+                ] {
+                    let signer = (backend.jwt_provider().signer_factory)(&algorithm, &encoding);
+                    // OpenSSL validates at construction; AWS-LC may defer it
+                    // until signing. Neither may successfully use the key.
+                    if backend.capabilities().backend == "openssl" {
+                        assert!(
+                            signer.is_err(),
+                            "OpenSSL accepted corrupted RSA component {component} for {algorithm:?}"
+                        );
+                    } else {
+                        assert!(
+                            !signer.is_ok_and(|signer| signer.try_sign(b"header.claims").is_ok()),
+                            "AWS-LC signed with corrupted RSA component {component} for {algorithm:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}

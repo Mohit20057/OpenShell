@@ -109,6 +109,8 @@ guards for malformed HMAC signatures, EC key consistency and algorithm/curve
 binding, RSA public-component bounds, JOSE RSA-PSS salt lengths and fixed-width
 EC JWK coordinates. Certificate key import also checks EC key consistency and
 requires RSA keys in the 2048–8192-bit range, matching AWS-LC.
+RSA certificate imports and JWT signing also validate private-key consistency,
+including the private exponent, primes, and CRT parameters, before using the key.
 RSA signing/verification, EC signing, and EC JWK extraction reuse the validated
 OpenSSL key instead of parsing it again through the upstream adapter. Claim
 validation stays in jsonwebtoken. AEAD setup errors remain distinct from authentication errors;

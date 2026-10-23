@@ -75,6 +75,11 @@ fn signer(algorithm: &Algorithm, key: &EncodingKey) -> Result<Box<dyn JwtSigner>
         let key =
             PKey::private_key_from_der(key.inner()).map_err(|_| ErrorKind::InvalidKeyFormat)?;
         check_rsa_key(&key)?;
+        // Public-component checks are insufficient for signing keys. Keep this
+        // private-key validation out of the public verifier path.
+        if !matches!(key.rsa().and_then(|rsa| rsa.check_key()), Ok(true)) {
+            return Err(ErrorKind::InvalidKeyFormat.into());
+        }
         return Ok(Box::new(RsaSigner {
             key,
             algorithm: *algorithm,

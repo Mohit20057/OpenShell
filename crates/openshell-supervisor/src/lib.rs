@@ -5726,7 +5726,7 @@ network_policies:
         .await;
     }
 
-    // This scenario requires the Unix filesystem paths used by proxy baselines.
+    // Baseline enrichment adds host paths that only exist on Unix.
     #[cfg(unix)]
     #[tokio::test(start_paused = true)]
     async fn startup_policy_write_refusal_baseline_write_back_waits_for_repair() {
@@ -5857,7 +5857,7 @@ network_policies:
         .await;
     }
 
-    // This scenario requires the Unix filesystem paths used by proxy baselines.
+    // Baseline enrichment adds host paths that only exist on Unix.
     #[cfg(unix)]
     #[tokio::test(start_paused = true)]
     async fn startup_policy_write_refusal_baseline_repair_before_report_refetches() {
@@ -6002,7 +6002,7 @@ network_policies:
         .await;
     }
 
-    // This scenario requires the Unix filesystem paths used by proxy baselines.
+    // Baseline enrichment adds host paths that only exist on Unix.
     #[cfg(unix)]
     #[tokio::test(start_paused = true)]
     async fn startup_policy_write_refusal_write_back_outlasts_the_attempt_limit() {
@@ -6091,7 +6091,7 @@ network_policies:
         );
     }
 
-    // This scenario requires the Unix filesystem paths used by proxy baselines.
+    // Baseline enrichment adds host paths that only exist on Unix.
     #[cfg(unix)]
     #[tokio::test(start_paused = true)]
     async fn startup_policy_write_refusal_global_policy_skips_baseline_write_back() {
@@ -6175,29 +6175,24 @@ network_policies:
 
     #[tokio::test(start_paused = true)]
     async fn startup_policy_write_refusal_permanent_codes_still_exit() {
-        use openshell_core::proto::ConfigurationAdmissionState;
+        use openshell_core::proto::{ConfigurationAdmissionState, PolicySource};
         // No policy or provider change repairs these refusals, so startup
         // keeps exiting instead of holding the sandbox in its repair window.
-        // Check image policy uploads to a gateway with no policy. On Unix,
-        // also check write-back of a stored policy missing proxy baseline paths.
-        let writes = [
-            (
-                "image policy upload",
-                unset_policy_snapshot(),
-                ImagePolicyDiscovery::Policy(Box::new(proto_tcp_policy_fixture())),
-            ),
-            // Baseline enrichment requires existing Unix filesystem paths.
-            #[cfg(unix)]
-            (
-                "baseline write-back",
-                settings_poll_result(
-                    Some(proto_tcp_policy_fixture()),
-                    1,
-                    openshell_core::proto::PolicySource::Sandbox,
-                ),
-                ImagePolicyDiscovery::Missing,
-            ),
-        ];
+        // Both writes are checked: the image policy upload to a gateway with
+        // no policy, and the write-back of a stored policy that lacks the
+        // proxy baseline paths.
+        let image_upload = (
+            "image policy upload",
+            unset_policy_snapshot(),
+            ImagePolicyDiscovery::Policy(Box::new(proto_tcp_policy_fixture())),
+        );
+        let baseline_write_back = (
+            "baseline write-back",
+            settings_poll_result(Some(proto_tcp_policy_fixture()), 1, PolicySource::Sandbox),
+            ImagePolicyDiscovery::Missing,
+        );
+        // Baseline enrichment adds host paths that only exist on Unix.
+        let writes = std::iter::once(image_upload).chain(cfg!(unix).then_some(baseline_write_back));
         for (write, initial, discovery) in writes {
             for code in [
                 tonic::Code::PermissionDenied,

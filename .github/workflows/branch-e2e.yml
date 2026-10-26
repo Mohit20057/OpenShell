@@ -247,19 +247,11 @@ jobs:
       actions: read
       contents: read
       packages: read
-    uses: ./.github/workflows/integration-runner.yml
+    uses: ./.github/workflows/e2e-suites.yml
     with:
-      category: conformance
+      family: conformance
       source-sha: ${{ needs.prepare-integration.outputs.source_sha }}
       integration-inputs-artifact-id: ${{ needs.prepare-integration.outputs.integration_inputs_artifact_id }}
-      test-matrix: >-
-        [
-          {"environment":"ubuntu-docker-rootful","installer":"deb","testsuite":"conformance"},
-          {"environment":"ubuntu-k3s","installer":"k3s","testsuite":"conformance"},
-          {"environment":"ubuntu-k3s","installer":"k3s-ha","testsuite":"conformance"},
-          {"environment":"fedora-podman-rootful","installer":"rpm","testsuite":"conformance"},
-          {"environment":"fedora-podman-rootless","installer":"rpm","testsuite":"conformance"}
-        ]
 
   # Run feature-specific integration tests:
   feature-specific-integration:
@@ -303,9 +295,9 @@ jobs:
           {"environment":"fedora-podman-rootless","installer":"binaries","testsuite":"driver-podman"}
         ]
 
-  # Run the testkit suites in tests/suites/ on tmachine. The environments and
-  # suites are listed in e2e-suites.yml. Advisory: not part of
-  # core-e2e-result.needs.
+  # Run the testkit feature suites in tests/suites/ on tmachine. The
+  # environments and suites are listed in e2e-suites.yml; the conformance rows
+  # run in conformance-integration. Advisory: not part of core-e2e-result.needs.
   e2e-suites:
     needs: [pr_metadata, prepare-integration]
     if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
@@ -315,6 +307,7 @@ jobs:
       packages: read
     uses: ./.github/workflows/e2e-suites.yml
     with:
+      family: features
       source-sha: ${{ needs.prepare-integration.outputs.source_sha }}
       integration-inputs-artifact-id: ${{ needs.prepare-integration.outputs.integration_inputs_artifact_id }}
 

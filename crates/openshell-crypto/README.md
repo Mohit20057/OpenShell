@@ -302,6 +302,13 @@ OPENSSL_NO_VENDOR=1 OPENSSL_STATIC=0 cargo clippy --locked -p openshell-crypto -
 cargo tree --locked -p openshell-crypto --no-default-features --features openssl --edges normal,build,dev
 ```
 
+For Nix, run these commands from `nix develop .#crypto`, entered outside the
+default development shell. CI uses this native toolchain for both OpenSSL-only
+and dual-backend checks. The default shell's release toolchains supply an
+unprefixed system AWS-LC whose `libcrypto`/`libssl` names and symbols collide with
+OpenSSL. The crypto shell selects Nix OpenSSL explicitly and lets Cargo build
+symbol-prefixed AWS-LC for the dual-backend tests.
+
 Tests cover known answers, tampering, chunked AEAD, PKI/CA import, JWT algorithms
 and claims, TLS 1.2/1.3 mutual authentication and rejected peers, and AWS-LC/OpenSSL
 interoperability. A subprocess uses an unsatisfiable property query to test

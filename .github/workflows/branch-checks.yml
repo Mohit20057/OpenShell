@@ -200,11 +200,13 @@ jobs:
         run: mise install --locked github:EmbarkStudios/cargo-deny
 
       # Enter mise inside the Nix shell so Nix's cargo-deny cannot shadow the pin.
+      # mise sets RUSTC_WRAPPER=sccache, but this metadata-only job does not
+      # install sccache. Clear wrappers after mise applies its environment.
       - name: Verify crypto dependency guardrail
-        run: mise exec github:EmbarkStudios/cargo-deny -- uv run --no-project python tasks/scripts/test-crypto-dependency-policy.py
+        run: mise exec github:EmbarkStudios/cargo-deny -- env RUSTC_WRAPPER= RUSTC_WORKSPACE_WRAPPER= uv run --no-project python tasks/scripts/test-crypto-dependency-policy.py
 
       - name: Check dependencies
-        run: mise exec github:EmbarkStudios/cargo-deny -- cargo deny check licenses bans sources
+        run: mise exec github:EmbarkStudios/cargo-deny -- env RUSTC_WRAPPER= RUSTC_WORKSPACE_WRAPPER= cargo deny check licenses bans sources
 
   rust-format:
     name: Rust format
@@ -328,7 +330,7 @@ jobs:
           cargo test --locked -p openshell-crypto --no-default-features --test independent_backend
 
       - name: Verify OpenSSL backend
-        shell: nix develop -c bash -euo pipefail {0}
+        shell: nix develop .#crypto -c bash -euo pipefail {0}
         env:
           OPENSSL_NO_VENDOR: "1"
           OPENSSL_STATIC: "0"
@@ -349,7 +351,7 @@ jobs:
 
       - name: Verify dynamic OpenSSL linkage on Linux
         if: runner.os == 'Linux'
-        shell: nix develop -c bash -euo pipefail {0}
+        shell: nix develop .#crypto -c bash -euo pipefail {0}
         env:
           OPENSSL_NO_VENDOR: "1"
           OPENSSL_STATIC: "0"

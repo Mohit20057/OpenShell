@@ -157,3 +157,4 @@ freeqaz-openai
 HarryMoss
 sunilteja93
 sruggier
+vassilnk

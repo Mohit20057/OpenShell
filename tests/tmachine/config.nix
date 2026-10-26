@@ -217,6 +217,17 @@ let
     ];
   };
 
+  # Nix's OpenSSL on Darwin only trusts the CA bundle in the default Nix
+  # profile, which some Nix installers don't create. Fall back to a pinned
+  # bundle so host-side tools such as ansible-galaxy can verify TLS, but keep
+  # any bundle the user configured. NIX_SSL_CERT_FILE takes precedence over
+  # SSL_CERT_FILE in Nix's OpenSSL.
+  hostCaBundleSetup = pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isDarwin ''
+    if [ -z "''${NIX_SSL_CERT_FILE:-}" ] && [ -z "''${SSL_CERT_FILE:-}" ]; then
+      export SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt
+    fi
+  '';
+
   runner = pkgs.writeShellApplication {
     name = "tmachine";
     runtimeInputs = [
@@ -226,6 +237,7 @@ let
       pkgs.sshpass
     ];
     text = ''
+      ${hostCaBundleSetup}
       root=$(git rev-parse --show-toplevel)
       cd "$root/tests/tmachine"
       export ANSIBLE_CONFIG="$PWD/ansible/ansible.cfg"

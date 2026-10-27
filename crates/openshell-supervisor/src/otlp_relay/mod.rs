@@ -235,9 +235,10 @@ pub enum StartError {
     InvalidEndpoint(openshell_otel::SetupError),
     /// The collector endpoint is a URI tonic does not accept.
     Transport(tonic::transport::Error),
-    /// The collector endpoint uses a scheme the relay does not speak. TLS to
-    /// the collector is a tracked follow-up; the supervisor's own exporter
-    /// rejects `https` the same way.
+    /// The collector endpoint uses a scheme the relay does not speak. The
+    /// relay forwards over plaintext gRPC only, so an `https` endpoint keeps
+    /// it inactive rather than downgrading; the supervisor's own exporter
+    /// does speak TLS. TLS on the relayed hop is a tracked follow-up.
     UnsupportedScheme(String),
 }
 

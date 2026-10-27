@@ -8591,7 +8591,7 @@ process:
     /// mentions the relay address, so a served relay stream proves the
     /// reserved path bypassed policy.
     fn reserved_test_engine() -> OpaEngine {
-        OpaEngine::from_strings(
+        native_identity_engine(
             include_str!("../data/sandbox-policy.rego"),
             r#"
 network_policies:
@@ -8632,7 +8632,7 @@ process:
             stream: Box::new(stream),
             binary_identity: Ok(ContractBinaryIdentity {
                 executable: ContractExecutableIdentity {
-                    path: PathBuf::from("/usr/bin/curl"),
+                    path: executable_path("/usr/bin/curl"),
                     digest: Some("00".repeat(32).parse().unwrap()),
                 },
                 ancestors: Vec::new(),

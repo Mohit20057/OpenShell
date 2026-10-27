@@ -340,7 +340,7 @@ pub struct OtlpConfig {
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
-        serialize_with = "serialize_enabled_ocsf"
+        serialize_with = "serialize_enabled"
     )]
     pub ocsf: Option<OcsfOtlpConfig>,
 
@@ -372,13 +372,6 @@ fn serialize_enabled<T: Serialize, S: serde::Serializer>(
             table,
         })
         .serialize(serializer)
-}
-
-fn serialize_enabled_ocsf<S: serde::Serializer>(
-    ocsf: &Option<OcsfOtlpConfig>,
-    serializer: S,
-) -> Result<S::Ok, S::Error> {
-    serialize_enabled(ocsf, serializer)
 }
 
 impl OtlpConfig {

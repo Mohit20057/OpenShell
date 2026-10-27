@@ -921,7 +921,7 @@ pub struct SandboxInstanceConfig {
     pub supervisor_recovery_timeout_secs: Option<u32>,
     /// OTLP/gRPC collector for relayed agent traces; `None` keeps the relay
     /// inactive.
-    pub agent_otlp_endpoint: Option<String>,
+    pub otlp_agent_endpoint: Option<String>,
 }
 
 impl SandboxInstanceConfig {
@@ -1075,7 +1075,7 @@ pub async fn run_sandbox_instance(
         proxy_tls,
         takeover,
         supervisor_recovery_timeout_secs,
-        agent_otlp_endpoint,
+        otlp_agent_endpoint,
     } = config;
     // The owner binds the event context and log sink to the instance's
     // threads; the instance itself uses the rest.
@@ -1296,7 +1296,7 @@ pub async fn run_sandbox_instance(
     // before attach so the agent spec can tell the boundary whether to point
     // workload SDKs at it.
     let (mut otlp_relay, otlp_reserved_destination) =
-        otlp_relay::activate(agent_otlp_endpoint, sandbox_id.clone());
+        otlp_relay::activate(otlp_agent_endpoint, sandbox_id.clone());
 
     // Construct the selected client only after shared policy and credential
     // setup has completed. Keep live credentials and later CA publication in
@@ -1400,7 +1400,6 @@ pub async fn run_sandbox_instance(
     let takeover_attach = remote_boundary.0.is_takeover();
     let adopts_running_agent = remote_boundary.0.adopts_running_agent();
     let (bound, backend_name, ca_file_paths) = remote_boundary;
-
     let confirm = Box::pin(async {
         let ready = bound
             .confirm()
@@ -1786,6 +1785,12 @@ pub async fn run_sandbox_instance(
             instance_readiness.release();
             drop(running);
             drop(boundary_access);
+            // The workload is frozen, so no new spans arrive. Export what the
+            // relay already acknowledged; the agent will not resend it after
+            // resume. Bounded; never fails.
+            if let Some(relay) = otlp_relay.take() {
+                relay.shutdown(otlp_relay::FLUSH_TIMEOUT).await;
+            }
             drop(networking);
             info!(backend = %backend_name, "Isolation boundary suspended; supervisor instance exiting");
             return Ok(0);
@@ -4641,7 +4646,7 @@ mod tests {
             proxy_tls: openshell_supervisor_network::run::ProxyTlsFiles::default(),
             takeover: None,
             supervisor_recovery_timeout_secs: None,
-            agent_otlp_endpoint: None,
+            otlp_agent_endpoint: None,
         };
         let bindings = SandboxInstanceBindings::dedicated(
             &config,

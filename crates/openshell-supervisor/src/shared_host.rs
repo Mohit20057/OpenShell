@@ -815,7 +815,7 @@ impl SharedHost {
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
             // The shared host has no per-instance collector endpoint yet, so
             // hosted instances do not relay agent traces.
-            agent_otlp_endpoint: None,
+            otlp_agent_endpoint: None,
         };
         crate::sandbox_instance_host::sandbox_instance_launch(
             Box::new(crate::backend_setup::RoutedBackendSetup::new(

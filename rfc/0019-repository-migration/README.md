@@ -30,27 +30,30 @@ with their own expertise, test infrastructure, and release responsibilities.
 ## Proposal
 
 Organize OpenShell around a core repository and focused ecosystem repositories.
-The `openshell` core owns the runtime, CLI, Rust SDK, and shared interfaces that
-hold the system together. Go, Python, and TypeScript each get an SDK repository.
-Packages and Homebrew own installation and distribution; Windows, desktop, and
-Kubernetes repositories own their platform integrations. Each provider gets a
-repository for its integration and tests.
+The `openshell` core owns the runtime, CLI, Rust SDK, shared interfaces, and
+Kubernetes integration. Go, Python, and TypeScript each get an SDK repository.
+Packages and Homebrew own installation and distribution; Windows and desktop
+repositories own their platform integrations. Each provider gets a repository
+for its integration and tests. A `console` repository holds the frontend.
+
+The core repository keeps the name `openshell`. All other repository names omit
+the `openshell-` prefix.
 
 The proposed repository structure is:
 
 ```text
 OpenShell repositories
-├── openshell                      Gateway, supervisor, sandbox, CLI, Rust SDK, shared Rust interfaces
-├── openshell-sdk-go                Go SDK
-├── openshell-sdk-python            Python SDK
-├── openshell-sdk-typescript        TypeScript SDK
-├── openshell-packages              install.sh, RPM, DEB, snap
-├── openshell-homebrew              Homebrew tap and formula
-├── openshell-windows               MSI installer and MXC driver
-├── openshell-desktop               Desktop drivers: macOS App Sandbox, Podman, Docker, VM
-├── openshell-kubernetes            Helm chart, Kubernetes driver, operator
-├── openshell-providers-<provider>  One repository per provider integration
-└── openshell-awesome               Curated OpenShell resources and examples
+├── openshell             Gateway, supervisor, sandbox, CLI, Rust SDK, shared Rust interfaces, Kubernetes
+├── sdk-go                Go SDK
+├── sdk-python            Python SDK
+├── sdk-typescript        TypeScript SDK
+├── packages              install.sh, RPM, DEB, snap
+├── homebrew              Homebrew tap and formula
+├── windows               MSI installer and MXC driver
+├── desktop               Desktop drivers: macOS App Sandbox, Podman, Docker, VM
+├── console               OpenShell frontend
+├── providers-<provider>  One repository per provider integration
+└── awesome               Curated OpenShell resources and examples
 ```
 
 This gives maintainers a focused area to own while keeping the shared contracts
@@ -67,9 +70,16 @@ the core versions it supports.
 - Prover.
 - Rust SDK, kept alongside the CLI as the reference client.
 - Shared Rust interfaces used by components across repositories.
+- Kubernetes compute driver, with support for gVisor, Kata, Firecracker, and runc.
+- Helm chart and its publication.
+- Kubernetes operator.
 - A compute driver that assembles these components as processes on the host.
   On Linux, use `systemd-nspawn` for launch and isolation.
 - Publication of binaries.
+
+Kubernetes stays in core for this migration. After this RFC is implemented,
+we will explore splitting the Helm chart, Kubernetes driver, and operator into
+a separate repository.
 
 ### SDK repositories
 
@@ -77,9 +87,9 @@ Each other language SDK gets its own repository:
 
 | Repository | Owns and publishes |
 | --- | --- |
-| `openshell-sdk-go` | Go SDK, with its own maintainers, tests, and releases. |
-| `openshell-sdk-python` | Python SDK, with its own maintainers, tests, and releases. |
-| `openshell-sdk-typescript` | TypeScript SDK, with its own maintainers, tests, and releases. |
+| `sdk-go` | Go SDK, with its own maintainers, tests, and releases. |
+| `sdk-python` | Python SDK, with its own maintainers, tests, and releases. |
+| `sdk-typescript` | TypeScript SDK, with its own maintainers, tests, and releases. |
 
 The Rust SDK stays in core as the reference client used by the CLI. Keeping them
 together lets changes to the gateway, SDK, and CLI be developed and tested in one
@@ -96,15 +106,15 @@ so separate repositories do not depend on manual copying to stay in sync.
 
 | Repository | Owns and publishes |
 | --- | --- |
-| `openshell-packages` | The one-line `install.sh` installation path; publishes RPM, DEB, and snap packages. |
-| `openshell-homebrew` | The Homebrew tap; publishes the `openshell.rb` formula. |
+| `packages` | The one-line `install.sh` installation path; publishes RPM, DEB, and snap packages. |
+| `homebrew` | The Homebrew tap; publishes the `openshell.rb` formula. |
 
-### Windows: `openshell-windows`
+### Windows: `windows`
 
 - MSI installer and its publication.
 - MXC driver and its publication.
 
-### Desktop: `openshell-desktop`
+### Desktop: `desktop`
 
 - macOS isolation through App Sandbox and container integration.
 - Podman integration.
@@ -112,18 +122,18 @@ so separate repositories do not depend on manual copying to stay in sync.
 - Possible microVM support. Whether this belongs here, in core, or in a separate
   repository remains an open question.
 
-### Kubernetes: `openshell-kubernetes`
+### Console: `console`
 
-- Helm chart and its publication.
-- Kubernetes compute driver, with support for gVisor, Kata, Firecracker, and runc.
-- Kubernetes operator.
+The `console` repository holds the OpenShell frontend and owns its development,
+tests, and releases. It consumes the public gateway API and documents which
+core releases it supports.
 
 ### Provider repositories and ownership
 
-Each provider gets its own `openshell-providers-<provider>` repository, such as
-`openshell-providers-aws`, `openshell-providers-google`,
-`openshell-providers-oci`, or `openshell-providers-github`. Each owns its provider
-integration and test infrastructure suited to that integration.
+Each provider gets its own `providers-<provider>` repository, such as
+`providers-aws`, `providers-google`, `providers-oci`, or `providers-github`.
+Each owns its provider integration and test infrastructure suited to that
+integration.
 
 Each repository should have named maintainers and own its tests and published
 artifacts. Shared Rust interfaces live in core alongside the Rust SDK. Core
@@ -140,24 +150,23 @@ Migrate in the following order, preserving history where practical:
    protobuf inputs, SDK release automation, and compatibility tests before
    retiring the existing SDK paths. Document any package or import path changes.
 2. **Packages.** Move `install.sh` and RPM, DEB, and snap packaging into
-   `openshell-packages`. Validate installation and removal using artifacts from
+   `packages`. Validate installation and removal using artifacts from
    a pinned core release.
 3. **Homebrew.** Move the tap and `openshell.rb` formula into
-   `openshell-homebrew`. Validate formula installation against published core
+   `homebrew`. Validate formula installation against published core
    binaries.
-4. **Windows.** Move the MSI installer and MXC driver into `openshell-windows`.
+4. **Windows.** Move the MSI installer and MXC driver into `windows`.
    Establish builds, installer checks, and driver compatibility tests against
    core.
-5. **Kubernetes.** Move the Helm chart, Kubernetes compute driver, and operator
-   into `openshell-kubernetes`. Establish chart publication and deployment tests
-   against a pinned core release.
-6. **Core.** Consolidate `openshell` around the CLI, gateway, supervisor, Linux
-   sandbox runtime, prover, Rust SDK, shared Rust interfaces, and host compute
-   driver. Update core builds and releases to consume the extracted components
-   where needed, and validate that the released pieces work together. Provider
-   integrations remain in place until the next phase.
-7. **Providers.** Break out provider integrations one at a time into
-   `openshell-providers-<provider>`, with maintainers, releases, and test
+5. **Core.** Consolidate `openshell` around the CLI, gateway, supervisor, Linux
+   sandbox runtime, prover, Rust SDK, shared Rust interfaces, host compute driver,
+   and Kubernetes integration. Keep the Helm chart, Kubernetes driver, operator,
+   chart publication, and deployment tests in core. Update core builds and
+   releases to consume the extracted components where needed, and validate that
+   the released pieces work together. Provider integrations remain in place
+   until the next phase.
+6. **Providers.** Break out provider integrations one at a time into
+   `providers-<provider>`, with maintainers, releases, and test
    infrastructure appropriate to each integration.
 
 Before each move, name the maintainers and identify dependencies on the shared
@@ -166,6 +175,10 @@ guidance, and documented compatibility relationship with core. Update
 installation paths, documentation, and contributor skills with each move, and
 validate the replacement before retiring its old paths. Desktop migration timing
 remains an open question.
+
+Create `console` as the home for frontend development, with its own tests,
+release automation, and documented compatibility with core. After this RFC is
+implemented, explore a separate Kubernetes repository as follow-up work.
 
 ## Risks
 

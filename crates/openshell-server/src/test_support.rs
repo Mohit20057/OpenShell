@@ -352,6 +352,19 @@ impl ComputeDriver for FakeComputeDriver {
         Ok(Response::new(ValidateSandboxCreateResponse {}))
     }
 
+    async fn resolve_supervisor_app_endpoint(
+        &self,
+        request: Request<openshell_core::proto::compute::v1::ResolveSupervisorAppEndpointRequest>,
+    ) -> Result<
+        Response<openshell_core::proto::compute::v1::ResolveSupervisorAppEndpointResponse>,
+        Status,
+    > {
+        self.record_traceparent(request.metadata());
+        Err(Status::unimplemented(
+            "supervisor application endpoint resolution is not supported",
+        ))
+    }
+
     async fn get_sandbox(
         &self,
         request: Request<GetSandboxRequest>,

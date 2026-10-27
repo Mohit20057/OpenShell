@@ -770,6 +770,16 @@ impl ComputeDriver for RemoteComputeDriver {
         client.validate_sandbox_create(request).await
     }
 
+    async fn resolve_supervisor_app_endpoint(
+        &self,
+        request: Request<openshell_core::proto::compute::v1::ResolveSupervisorAppEndpointRequest>,
+    ) -> Result<
+        tonic::Response<openshell_core::proto::compute::v1::ResolveSupervisorAppEndpointResponse>,
+        Status,
+    > {
+        self.client().resolve_supervisor_app_endpoint(request).await
+    }
+
     async fn get_sandbox(
         &self,
         request: Request<GetSandboxRequest>,
@@ -6555,6 +6565,41 @@ impl ComputeRuntime {
             .await
     }
 
+    /// Resolve app endpoints independently of ordinary sandbox observation.
+    pub(crate) async fn supervisor_app_endpoint(
+        &self,
+        sandbox: &Sandbox,
+    ) -> Result<Option<openshell_core::proto::compute::v1::SupervisorAppEndpoint>, Status> {
+        let id = sandbox.object_id().to_string();
+        let request = openshell_core::proto::compute::v1::ResolveSupervisorAppEndpointRequest {
+            sandbox_id: id.clone(),
+            name: sandbox.object_name().to_string(),
+        };
+        let response = match self
+            .driver
+            .call(
+                openshell_otel::rpc::RESOLVE_SUPERVISOR_APP_ENDPOINT,
+                Some(&id),
+                |driver| async move {
+                    driver
+                        .resolve_supervisor_app_endpoint(Request::new(request))
+                        .await
+                },
+            )
+            .await
+        {
+            Ok(response) => response.into_inner(),
+            Err(status) if status.code() == Code::Unimplemented => return Ok(None),
+            Err(status) => return Err(status),
+        };
+        if response.sandbox_id != id {
+            return Err(Status::failed_precondition(
+                "driver returned a different sandbox",
+            ));
+        }
+        Ok(response.supervisor_app_endpoint)
+    }
+
     async fn get_driver_sandbox(
         &self,
         sandbox_id: &str,
@@ -8107,6 +8152,7 @@ fn is_terminal_failure_reason(reason: &str) -> bool {
 #[cfg(any(test, feature = "test-support"))]
 #[derive(Debug)]
 pub struct NoopTestDriver {
+    app_endpoint: Option<openshell_core::proto::compute::v1::SupervisorAppEndpoint>,
     workspace_delete_failures: std::sync::atomic::AtomicUsize,
     sandbox_authentication: Option<Result<(String, String), (Code, String)>>,
 }
@@ -8114,8 +8160,19 @@ pub struct NoopTestDriver {
 #[cfg(any(test, feature = "test-support"))]
 impl NoopTestDriver {
     #[cfg(test)]
+    pub fn with_app_endpoint(
+        endpoint: openshell_core::proto::compute::v1::SupervisorAppEndpoint,
+    ) -> Self {
+        Self {
+            app_endpoint: Some(endpoint),
+            ..Self::default()
+        }
+    }
+
+    #[cfg(test)]
     pub fn failing_workspace_deletes(count: usize) -> Self {
         Self {
+            app_endpoint: None,
             workspace_delete_failures: std::sync::atomic::AtomicUsize::new(count),
             sandbox_authentication: None,
         }
@@ -8124,6 +8181,7 @@ impl NoopTestDriver {
     #[cfg(test)]
     pub fn authenticating_sandbox(sandbox_id: impl Into<String>) -> Self {
         Self {
+            app_endpoint: None,
             workspace_delete_failures: std::sync::atomic::AtomicUsize::new(0),
             sandbox_authentication: Some(Ok((sandbox_id.into(), "test-runtime".to_string()))),
         }
@@ -8135,6 +8193,7 @@ impl NoopTestDriver {
         runtime_identity: impl Into<String>,
     ) -> Self {
         Self {
+            app_endpoint: None,
             workspace_delete_failures: std::sync::atomic::AtomicUsize::new(0),
             sandbox_authentication: Some(Ok((sandbox_id.into(), runtime_identity.into()))),
         }
@@ -8143,6 +8202,7 @@ impl NoopTestDriver {
     #[cfg(test)]
     pub fn failing_sandbox_authentication(code: Code, message: impl Into<String>) -> Self {
         Self {
+            app_endpoint: None,
             workspace_delete_failures: std::sync::atomic::AtomicUsize::new(0),
             sandbox_authentication: Some(Err((code, message.into()))),
         }
@@ -8153,6 +8213,7 @@ impl NoopTestDriver {
 impl Default for NoopTestDriver {
     fn default() -> Self {
         Self {
+            app_endpoint: None,
             workspace_delete_failures: std::sync::atomic::AtomicUsize::new(0),
             sandbox_authentication: None,
         }
@@ -8223,6 +8284,21 @@ impl ComputeDriver for NoopTestDriver {
     > {
         Ok(tonic::Response::new(
             openshell_core::proto::compute::v1::ValidateSandboxCreateResponse {},
+        ))
+    }
+
+    async fn resolve_supervisor_app_endpoint(
+        &self,
+        request: Request<openshell_core::proto::compute::v1::ResolveSupervisorAppEndpointRequest>,
+    ) -> Result<
+        tonic::Response<openshell_core::proto::compute::v1::ResolveSupervisorAppEndpointResponse>,
+        Status,
+    > {
+        Ok(tonic::Response::new(
+            openshell_core::proto::compute::v1::ResolveSupervisorAppEndpointResponse {
+                sandbox_id: request.into_inner().sandbox_id,
+                supervisor_app_endpoint: self.app_endpoint.clone(),
+            },
         ))
     }
 
@@ -8788,6 +8864,9 @@ mod tests {
 
     #[derive(Debug, Default)]
     struct TestDriver {
+        endpoint_resolution: Option<
+            Result<openshell_core::proto::compute::v1::ResolveSupervisorAppEndpointResponse, Code>,
+        >,
         listed_sandboxes: Vec<DriverSandbox>,
         current_sandboxes: Vec<DriverSandbox>,
         workspace_rpcs_unimplemented: bool,
@@ -8860,6 +8939,24 @@ mod tests {
                 .expect("validated sandbox observation lock poisoned")
                 .push(request.into_inner().sandbox.expect("validation sandbox"));
             Ok(tonic::Response::new(ValidateSandboxCreateResponse {}))
+        }
+
+        async fn resolve_supervisor_app_endpoint(
+            &self,
+            _request: Request<
+                openshell_core::proto::compute::v1::ResolveSupervisorAppEndpointRequest,
+            >,
+        ) -> Result<
+            tonic::Response<
+                openshell_core::proto::compute::v1::ResolveSupervisorAppEndpointResponse,
+            >,
+            Status,
+        > {
+            match self.endpoint_resolution.clone() {
+                Some(Ok(response)) => Ok(tonic::Response::new(response)),
+                Some(Err(code)) => Err(Status::new(code, "endpoint lookup failed")),
+                None => Err(Status::unimplemented("endpoint resolution unsupported")),
+            }
         }
 
         async fn get_sandbox(
@@ -8988,6 +9085,73 @@ mod tests {
 
         runtime.ensure_workspace("legacy").await.unwrap();
         runtime.delete_workspace("legacy").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn app_endpoint_resolution_is_independent_of_sandbox_observation() {
+        use openshell_core::proto::compute::v1::{
+            ResolveSupervisorAppEndpointResponse, SupervisorAppEndpoint,
+        };
+        let endpoint = SupervisorAppEndpoint {
+            host: "10.0.0.7".into(),
+            port: 9443,
+            runtime_identity: "runtime-a".into(),
+            ..Default::default()
+        };
+        let sandbox = sandbox_record("sandbox", "demo", SandboxPhase::Ready);
+        let cases = [
+            (None, Ok(None)),
+            (Some(Err(Code::Unimplemented)), Ok(None)),
+            (Some(Err(Code::Unavailable)), Err(Code::Unavailable)),
+            (
+                Some(Ok(ResolveSupervisorAppEndpointResponse {
+                    sandbox_id: "sandbox".into(),
+                    supervisor_app_endpoint: None,
+                })),
+                Ok(None),
+            ),
+            (
+                Some(Ok(ResolveSupervisorAppEndpointResponse {
+                    sandbox_id: "other-sandbox".into(),
+                    supervisor_app_endpoint: Some(endpoint.clone()),
+                })),
+                Err(Code::FailedPrecondition),
+            ),
+            (
+                Some(Ok(ResolveSupervisorAppEndpointResponse {
+                    sandbox_id: "sandbox".into(),
+                    supervisor_app_endpoint: Some(endpoint.clone()),
+                })),
+                Ok(Some(endpoint)),
+            ),
+        ];
+        for (resolution, expected) in cases {
+            let runtime = test_runtime(Arc::new(TestDriver {
+                endpoint_resolution: resolution,
+                current_sandboxes: vec![DriverSandbox {
+                    id: "sandbox".into(),
+                    name: "demo".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }))
+            .await;
+            assert_eq!(
+                runtime
+                    .supervisor_app_endpoint(&sandbox)
+                    .await
+                    .map_err(|s| s.code()),
+                expected
+            );
+            // An unsupported, failed, or invalid endpoint lookup must never fail
+            // ordinary sandbox observation.
+            let observed = runtime
+                .get_driver_sandbox("sandbox", "demo")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(observed.id, "sandbox");
+        }
     }
 
     #[derive(Clone)]
@@ -9309,6 +9473,22 @@ mod tests {
             _request: Request<ValidateSandboxCreateRequest>,
         ) -> Result<tonic::Response<ValidateSandboxCreateResponse>, Status> {
             Ok(tonic::Response::new(ValidateSandboxCreateResponse {}))
+        }
+
+        async fn resolve_supervisor_app_endpoint(
+            &self,
+            _request: Request<
+                openshell_core::proto::compute::v1::ResolveSupervisorAppEndpointRequest,
+            >,
+        ) -> Result<
+            tonic::Response<
+                openshell_core::proto::compute::v1::ResolveSupervisorAppEndpointResponse,
+            >,
+            Status,
+        > {
+            Err(Status::unimplemented(
+                "supervisor application endpoint resolution is not supported",
+            ))
         }
 
         async fn get_sandbox(
@@ -12590,6 +12770,22 @@ mod tests {
                 request: Request<ValidateSandboxCreateRequest>,
             ) -> Result<tonic::Response<ValidateSandboxCreateResponse>, Status> {
                 self.0.validate_sandbox_create(request).await
+            }
+
+            async fn resolve_supervisor_app_endpoint(
+                &self,
+                _request: Request<
+                    openshell_core::proto::compute::v1::ResolveSupervisorAppEndpointRequest,
+                >,
+            ) -> Result<
+                tonic::Response<
+                    openshell_core::proto::compute::v1::ResolveSupervisorAppEndpointResponse,
+                >,
+                Status,
+            > {
+                Err(Status::unimplemented(
+                    "supervisor application endpoint resolution is not supported",
+                ))
             }
 
             async fn get_sandbox(
@@ -17580,6 +17776,16 @@ mod tests {
                 }))
                 .await
                 .unwrap();
+            let error = remote
+                .resolve_supervisor_app_endpoint(Request::new(
+                    openshell_core::proto::compute::v1::ResolveSupervisorAppEndpointRequest {
+                        sandbox_id: sandbox.id.clone(),
+                        name: sandbox.name.clone(),
+                    },
+                ))
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), Code::Unimplemented);
             remote
                 .list_sandboxes(Request::new(ListSandboxesRequest {}))
                 .await
@@ -17612,7 +17818,7 @@ mod tests {
         let traceparents = driver.traceparents();
         assert_eq!(
             traceparents.len(),
-            10,
+            11,
             "the client interceptor should cover every RPC"
         );
         assert!(

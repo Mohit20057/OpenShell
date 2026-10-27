@@ -70,6 +70,18 @@ impl ComputeDriver for ComputeDriverService {
         Ok(Response::new(ValidateSandboxCreateResponse {}))
     }
 
+    async fn resolve_supervisor_app_endpoint(
+        &self,
+        _request: Request<openshell_core::proto::compute::v1::ResolveSupervisorAppEndpointRequest>,
+    ) -> Result<
+        Response<openshell_core::proto::compute::v1::ResolveSupervisorAppEndpointResponse>,
+        Status,
+    > {
+        Err(Status::unimplemented(
+            "supervisor application endpoint resolution is not supported",
+        ))
+    }
+
     async fn get_sandbox(
         &self,
         request: Request<GetSandboxRequest>,

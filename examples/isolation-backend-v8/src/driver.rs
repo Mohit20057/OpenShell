@@ -412,6 +412,18 @@ impl compute_driver_server::ComputeDriver for DriverService {
             runtime_identity: identity,
         }))
     }
+    async fn resolve_supervisor_app_endpoint(
+        &self,
+        _request: Request<openshell_core::proto::compute::v1::ResolveSupervisorAppEndpointRequest>,
+    ) -> Result<
+        Response<openshell_core::proto::compute::v1::ResolveSupervisorAppEndpointResponse>,
+        Status,
+    > {
+        Err(Status::unimplemented(
+            "supervisor application endpoint resolution is not supported",
+        ))
+    }
+
     async fn get_sandbox(
         &self,
         q: Request<GetSandboxRequest>,

@@ -382,9 +382,9 @@ reruns without overwriting earlier evidence.
 summarize PRs since the previous stable tag. Prereleases retain a `release-notes`
 artifact, with advisory failures. Stable releases publish the promoted
 prerelease's preview with the prerelease tag replaced by the stable tag. If that
-preview is missing or expired, stable publication generates new notes and
-requires generation to succeed. The promotion summary states whether notes were
-reused or regenerated. Configure the `LLM_INFERENCE_API_KEY` Actions secret and
+preview is missing or expired, the Release workflow's notes job generates new
+notes and requires generation to succeed before publishing. That job's summary
+states whether notes were reused or regenerated. Configure the `LLM_INFERENCE_API_KEY` Actions secret and
 the `ANTHROPIC_BASE_URL` and `ANTHROPIC_MODEL` Actions variables.
 
 To preview notes without building or publishing:
@@ -715,7 +715,7 @@ These workflows run after merge to publish dev/tagged artifacts and verify them.
 | `.github/workflows/release-prerelease.yml` | Pre-release orchestrator, triggered by prerelease tag pushes or dispatched by Release Auto-Tag or manually. A tagless dispatch creates the next candidate on its branch; explicit tags select existing candidates. Builds, then publishes and qualifies in parallel. Qualification failure fails the run and sends the failure notification; published artifacts remain available. |
 | `.github/workflows/release-build.yml` | Shared version computation, binary and image builds, and package builds. Validates that the tag matches the caller's release kind. |
 | `.github/workflows/release-publish.yml` | Shared artifact assembly, OCI image tags and Helm chart publication, and package publication. Stable releases also publish to GitHub Releases, snap, npm, PyPI, and Fern. |
-| `.github/workflows/release-notes.yml` | Shared prompt-driven release notes generation through Inference Hub, used by prerelease previews, notes-only previews, and stable publication when no preview is reused. |
+| `.github/workflows/release-notes.yml` | Shared prompt-driven release notes generation through Inference Hub, used by prerelease previews, notes-only previews, and stable releases. Stable releases reuse the promoted prerelease's preview when available. |
 | `.github/workflows/release-qualification.yml` | Reusable qualification suites and result aggregation. Runs security scans, conformance and feature integration, Docker and VM E2E, protobuf compatibility, and advisory compatibility review. |
 | `.github/workflows/snap-package.yml` | Builds snap and component artifacts for Release Dev, Release, and Pre-release without Store credentials or publication. |
 | `.github/workflows/snap-publish.yml` | Uploads existing snap and component artifacts directly to a Store channel without rebuilding. Release Dev uses `latest/edge`, Pre-release uses `latest/beta`, and Release uses `latest/stable` for the stable rebuild. Uploads queue per channel and architecture, so tagged beta and stable jobs recheck repository tags after earlier publication finishes and before updating their floating channels. Manual dispatch uploads the `snap-linux-*` artifacts from `artifact-run-id`. |

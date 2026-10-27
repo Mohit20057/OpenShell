@@ -19,11 +19,6 @@ on:
         required: false
         default: false
         type: boolean
-      release-notes-reused:
-        description: Whether the calling run already uploaded release-notes from the promoted prerelease's preview
-        required: false
-        default: false
-        type: boolean
       source-sha:
         description: Source commit of the built artifacts in the calling run
         required: true
@@ -48,9 +43,6 @@ on:
       GITLAB_CI_TRIGGER_TOKEN:
         required: false
       GITLAB_CI_TRIGGER_URL:
-        required: false
-      LLM_INFERENCE_API_KEY:
-        description: NVIDIA Inference Hub API key for stable release notes
         required: false
 
 permissions:
@@ -332,22 +324,9 @@ jobs:
           app-version: ${{ inputs.semver }}
           release-kind: public
 
-  release-notes:
-    name: Write Release Notes
-    if: ${{ !inputs.is-prerelease && !inputs.release-notes-reused }}
-    permissions:
-      contents: read
-      pull-requests: read
-    uses: ./.github/workflows/release-notes.yml
-    with:
-      release-tag: ${{ inputs.release-tag }}
-    secrets:
-      LLM_INFERENCE_API_KEY: ${{ secrets.LLM_INFERENCE_API_KEY }}
-
   release:
     name: Publish Release Assets
-    needs: [assemble, release-helm, release-notes]
-    if: ${{ !cancelled() && needs.assemble.result == 'success' && needs.release-helm.result == 'success' && (inputs.is-prerelease || inputs.release-notes-reused || needs.release-notes.result == 'success') }}
+    needs: [assemble, release-helm]
     runs-on: linux-amd64-cpu8
     timeout-minutes: 10
     permissions:
@@ -393,6 +372,7 @@ jobs:
               }
             }
 
+      # Stable callers upload release-notes in the same run before calling Publish.
       - name: Download release notes
         if: ${{ !inputs.is-prerelease }}
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1

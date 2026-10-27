@@ -14,7 +14,7 @@ use crate::error::{Result, SdkError};
 use crate::pagination::{Page, Pager};
 use crate::raw::AuthedGrpcClient;
 use crate::refresh::{RefreshedToken, TokenSource};
-use crate::routing::{OwnerCache, owner_replica, retry_unrouted, routed_to, with_owner_hint};
+use crate::routing::OwnerCache;
 use crate::types::{
     DeleteOptions, DeletionResult, ExecOptions, ExecResult, Health, ListOptions, ResumeOptions,
     SandboxPhase, SandboxRef, SandboxSpec, SandboxTemplateCreateSpec, SandboxTemplateListOptions,
@@ -23,6 +23,7 @@ use crate::types::{
 use crate::{WatchEvent, WatchOptions, transport};
 use futures::{Stream, StreamExt};
 use openshell_core::proto;
+use openshell_core::replica_routing::{owner_replica, retry_unrouted, routed_to, with_owner_hint};
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
@@ -304,16 +305,7 @@ impl OpenShellClient {
 
     /// Fetch a sandbox by name.
     pub async fn get_sandbox(&self, name: &str) -> Result<SandboxRef> {
-        let response = self
-            .unary(|mut grpc| {
-                let request = proto::GetSandboxRequest {
-                    name: name.to_string(),
-                    workspace_scope: Some(proto::workspace_selector("default")),
-                };
-                async move { grpc.get_sandbox(request).await }
-            })
-            .await?;
-        sandbox_from_response(response.sandbox)
+        self.get_sandbox_in("default", name).await
     }
 
     /// List sandboxes.
@@ -847,11 +839,31 @@ impl OpenShellClient {
         }
     }
 
-    /// Best effort: a failed lookup leaves the call unrouted.
-    async fn owner_of(&self, workspace: &str, name: &str) -> Option<AsciiMetadataValue> {
+    /// Errors that exec would hit anyway are returned; any other failed lookup
+    /// leaves the call unrouted.
+    async fn owner_of(&self, workspace: &str, name: &str) -> Result<Option<AsciiMetadataValue>> {
         if let Some(cached) = self.owners.get(workspace, name) {
-            return cached.0;
+            return Ok(cached.0);
         }
+        match self.get_sandbox_in(workspace, name).await {
+            Ok(_) => Ok(self.owners.get(workspace, name).and_then(|cached| cached.0)),
+            Err(err)
+                if matches!(
+                    err.grpc_status().map(tonic::Status::code),
+                    Some(tonic::Code::Unauthenticated | tonic::Code::Unavailable)
+                ) =>
+            {
+                Err(err)
+            }
+            Err(err) => {
+                tracing::debug!(error = %err, "sandbox owner lookup failed; exec is unrouted");
+                Ok(None)
+            }
+        }
+    }
+
+    /// `GetSandbox` that also caches the owner replica the gateway reports.
+    async fn get_sandbox_in(&self, workspace: &str, name: &str) -> Result<SandboxRef> {
         let response = self
             .unary_response(|mut grpc| {
                 let request = with_owner_hint(proto::GetSandboxRequest {
@@ -860,11 +872,10 @@ impl OpenShellClient {
                 });
                 async move { grpc.get_sandbox(request).await }
             })
-            .await
-            .ok()?;
-        let owner = owner_replica(&response);
-        self.owners.insert(workspace, name, owner.clone());
-        owner
+            .await?;
+        self.owners
+            .insert(workspace, name, owner_replica(&response));
+        sandbox_from_response(response.into_inner().sandbox)
     }
 
     /// Open `ExecSandbox` on the owner replica under the unary auth policy.
@@ -873,7 +884,7 @@ impl OpenShellClient {
         workspace: &str,
         request: proto::ExecSandboxRequest,
     ) -> Result<tonic::Streaming<proto::ExecSandboxEvent>> {
-        let owner = self.owner_of(workspace, &request.sandbox).await;
+        let owner = self.owner_of(workspace, &request.sandbox).await?;
         let owners = &self.owners;
         self.unary(|mut grpc| {
             let request = request.clone();
@@ -886,6 +897,12 @@ impl OpenShellClient {
                     Err(status) if retry_unrouted(owner.as_ref(), &status) => {
                         owners.forget(workspace, &request.sandbox);
                         grpc.exec_sandbox(request).await
+                    }
+                    Err(status) => {
+                        if owner.is_some() && status.code() == tonic::Code::Unavailable {
+                            owners.forget(workspace, &request.sandbox);
+                        }
+                        Err(status)
                     }
                     response => response,
                 }
@@ -1101,17 +1118,7 @@ impl WorkspaceScopedClient {
 
     /// Fetch a sandbox by name in this workspace.
     pub async fn get_sandbox(&self, name: &str) -> Result<SandboxRef> {
-        let response = self
-            .client
-            .unary(|mut grpc| {
-                let request = proto::GetSandboxRequest {
-                    name: name.to_string(),
-                    workspace_scope: Some(proto::workspace_selector(&self.workspace)),
-                };
-                async move { grpc.get_sandbox(request).await }
-            })
-            .await?;
-        sandbox_from_response(response.sandbox)
+        self.client.get_sandbox_in(&self.workspace, name).await
     }
 
     /// List sandboxes in this workspace.

@@ -1861,16 +1861,24 @@ async fn exec_buffers_stdout_stderr_and_exit() {
     );
 }
 
-/// Run `count` execs on `my-box` and return the mock with the routes it saw.
-async fn run_execs(state: MockState, count: usize) -> Arc<MockState> {
+type ExecOutcome = Result<i32, Option<tonic::Code>>;
+
+/// Run `count` execs on `my-box`; return the mock and each exit or error code.
+async fn run_execs(state: MockState, count: usize) -> (Arc<MockState>, Vec<ExecOutcome>) {
     let state = Arc::new(state);
     let client = connect(&start_mock(state.clone()).await).await;
+    let mut outcomes = Vec::new();
     for _ in 0..count {
-        let _ = client
+        let outcome = client
             .exec("my-box", &["echo".to_string()], ExecOptions::default())
             .await;
+        outcomes.push(
+            outcome
+                .map(|result| result.exit_code)
+                .map_err(|err| err.grpc_status().map(Status::code)),
+        );
     }
-    state
+    (state, outcomes)
 }
 
 async fn routes(state: &MockState) -> Vec<String> {
@@ -1879,7 +1887,7 @@ async fn routes(state: &MockState) -> Vec<String> {
 
 #[tokio::test]
 async fn exec_routes_to_the_reported_owner_and_reuses_it() {
-    let state = run_execs(
+    let (state, outcomes) = run_execs(
         MockState {
             owner_replica: Some("openshell-1"),
             ..Default::default()
@@ -1887,17 +1895,19 @@ async fn exec_routes_to_the_reported_owner_and_reuses_it() {
         2,
     )
     .await;
+    assert_eq!(outcomes, [Ok(7); 2]);
     assert_eq!(routes(&state).await, ["openshell-1"; 2]);
     assert_eq!(state.owner_lookups.load(Ordering::SeqCst), 1);
 
-    let state = run_execs(MockState::default(), 2).await;
+    let (state, outcomes) = run_execs(MockState::default(), 2).await;
+    assert_eq!(outcomes, [Ok(7); 2]);
     assert_eq!(routes(&state).await, ["", ""]);
     assert_eq!(state.owner_lookups.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
 async fn exec_retries_unrouted_only_when_the_owner_route_has_no_endpoints() {
-    let state = run_execs(
+    let (state, outcomes) = run_execs(
         MockState {
             owner_replica: Some("openshell-1"),
             routed_exec_error: Some(Status::unavailable("")),
@@ -1906,24 +1916,27 @@ async fn exec_retries_unrouted_only_when_the_owner_route_has_no_endpoints() {
         2,
     )
     .await;
+    assert_eq!(outcomes, [Ok(7); 2]);
     assert_eq!(routes(&state).await, ["openshell-1", "", "openshell-1", ""]);
     assert_eq!(state.owner_lookups.load(Ordering::SeqCst), 2);
 
-    let state = run_execs(
+    let (state, outcomes) = run_execs(
         MockState {
             owner_replica: Some("openshell-1"),
             routed_exec_error: Some(Status::unavailable("supervisor not connected")),
             ..Default::default()
         },
-        1,
+        2,
     )
     .await;
-    assert_eq!(routes(&state).await, ["openshell-1"]);
+    assert_eq!(outcomes, [Err(Some(tonic::Code::Unavailable)); 2]);
+    assert_eq!(routes(&state).await, ["openshell-1"; 2]);
+    assert_eq!(state.owner_lookups.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]
-async fn exec_runs_unrouted_when_the_owner_lookup_fails() {
-    let state = run_execs(
+async fn exec_runs_unrouted_only_when_the_owner_lookup_fails_for_another_reason() {
+    let (state, outcomes) = run_execs(
         MockState {
             owner_replica: Some("openshell-1"),
             get_error: Some(Status::internal("lookup failed")),
@@ -1932,26 +1945,40 @@ async fn exec_runs_unrouted_when_the_owner_lookup_fails() {
         1,
     )
     .await;
+    assert_eq!(outcomes, [Ok(7)]);
     assert_eq!(routes(&state).await, [""]);
-    assert!(state.last_exec_request.lock().await.is_some());
+
+    let (state, outcomes) = run_execs(
+        MockState {
+            get_error: Some(Status::unavailable("gateway down")),
+            ..Default::default()
+        },
+        1,
+    )
+    .await;
+    assert_eq!(outcomes, [Err(Some(tonic::Code::Unavailable))]);
+    assert!(routes(&state).await.is_empty());
 }
 
 #[tokio::test]
-async fn workspace_exec_looks_up_the_owner_in_its_workspace() {
+async fn workspace_get_sandbox_caches_the_owner_for_exec() {
     let state = Arc::new(MockState {
         owner_replica: Some("openshell-1"),
         ..Default::default()
     });
     let client = connect(&start_mock(state.clone()).await).await;
-    client
-        .workspace("team")
+    let team = client.workspace("team");
+    team.get_sandbox("my-box").await.unwrap();
+    let result = team
         .exec("my-box", &["echo".to_string()], ExecOptions::default())
         .await
         .unwrap();
+    assert_eq!(result.exit_code, 7);
     assert_eq!(
         state.last_get_workspace.lock().await.as_deref(),
         Some("team")
     );
+    assert_eq!(state.get_calls.load(Ordering::SeqCst), 1);
     assert_eq!(routes(&state).await, ["openshell-1"]);
 }
 

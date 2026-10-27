@@ -1,11 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Routes long-lived sandbox calls to the replica that owns the sandbox.
+//! Owner replicas the gateway reported for sandboxes.
 
-use openshell_core::replica_routing::{
-    OWNER_REPLICA_HEADER, OWNER_REQUEST_HEADER, ROUTE_REPLICA_HEADER,
-};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -51,62 +48,9 @@ fn key(workspace: &str, name: &str) -> (String, String) {
     (workspace.to_string(), name.to_string())
 }
 
-pub fn with_owner_hint<T>(message: T) -> tonic::Request<T> {
-    let mut request = tonic::Request::new(message);
-    request
-        .metadata_mut()
-        .insert(OWNER_REQUEST_HEADER, AsciiMetadataValue::from_static("1"));
-    request
-}
-
-pub fn owner_replica<T>(response: &tonic::Response<T>) -> Option<AsciiMetadataValue> {
-    response.metadata().get(OWNER_REPLICA_HEADER).cloned()
-}
-
-pub fn routed_to<T>(message: T, replica: Option<&AsciiMetadataValue>) -> tonic::Request<T> {
-    let mut request = tonic::Request::new(message);
-    if let Some(replica) = replica {
-        request
-            .metadata_mut()
-            .insert(ROUTE_REPLICA_HEADER, replica.clone());
-    }
-    request
-}
-
-/// Envoy Gateway answers a replica route with no ready endpoints with
-/// `grpc-status: 14` and no message; gateway errors always carry one.
-pub fn retry_unrouted(replica: Option<&AsciiMetadataValue>, status: &tonic::Status) -> bool {
-    let message = status.message();
-    replica.is_some()
-        && status.code() == tonic::Code::Unavailable
-        && (message.is_empty()
-            || message.contains("no healthy upstream")
-            || message.contains("connection failure"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn only_unrouted_unavailable_is_retried() {
-        let replica = AsciiMetadataValue::from_static("openshell-1");
-        let unavailable = |message| tonic::Status::unavailable(message);
-        assert!(retry_unrouted(Some(&replica), &unavailable("")));
-        assert!(retry_unrouted(
-            Some(&replica),
-            &unavailable("no healthy upstream")
-        ));
-        assert!(!retry_unrouted(None, &unavailable("")));
-        assert!(!retry_unrouted(
-            Some(&replica),
-            &unavailable("supervisor not connected")
-        ));
-        assert!(!retry_unrouted(
-            Some(&replica),
-            &tonic::Status::not_found("")
-        ));
-    }
 
     #[test]
     fn cache_distinguishes_unknown_from_no_owner() {

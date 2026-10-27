@@ -134,8 +134,10 @@ This RFC does not restate Cedar; see:
 | Gateway and runtime versions | Any | Both must support Cedar; the CLI and SDKs refuse to send a Cedar policy to a gateway that does not advertise it, and the gateway withholds a Cedar policy from a runtime that cannot interpret it |
 | View the policy | `openshell policy get` | `openshell policy get` prints the Cedar text, then middleware and endpoint settings; `--full` adds provider credential rules |
 
-Validation happens three times with the same checks: in the CLI before the
-file is sent, at the gateway, and in the supervisor. A policy OpenShell cannot
+Validation happens twice with the same checks: at the gateway when the policy
+is submitted, and in the supervisor when it is loaded. The CLI and SDKs do not
+link the Cedar engine; they read the `.cedar` file, send its text as is, and
+print the load-time warnings the gateway returns. A policy OpenShell cannot
 enforce exactly is rejected with the reason, never loaded with part of its
 meaning dropped. Rejected revisions on a live sandbox follow the gateway's
 `policy_validation_failure_mode`, as for YAML.
@@ -905,7 +907,8 @@ contains the schema and engine crates (`openshell-policy-cedar-schema`,
 `openshell-policy-cedar`), the proto fields and capability flags, CLI,
 gateway, and supervisor integration, the `PolicyEngine` enum, the middleware
 file with `endpoint_settings`, credentials-only providers with token-grant
-admission, the `cedar` feature flag on `openshell-policy`, Cedar fields and
+admission, the opt-in `cedar` feature on `openshell-policy` that only the
+gateway and supervisor enable, Cedar fields and
 capability checks in the Rust, Python, Go, and TypeScript SDKs, the parity
 harness, the `e2e/cedar` suite and its CI matrix entry, Cedar versions of
 every example and e2e policy, the Cedar policies documentation page, the
@@ -965,6 +968,38 @@ Kubernetes, and VM matrices, and the Windows MSVC lane, all passing. Not yet
 verified against a live gateway: native TCP, WebSocket, address ranges, and
 symlinked binaries beyond what the parity harness covers.
 
+### Rollout
+
+Cedar ships as an opt-in, development-only feature. A later review of the
+pull request asked for this, and the branch implements it:
+
+- `openshell-policy` has no default features; its `cedar` feature pulls in
+  `openshell-policy-cedar`. Only `openshell-gateway` and
+  `openshell-supervisor` expose a `cedar` feature that forwards to it. The
+  CLI, SDKs, compute drivers, providers, and sandbox runtime never link the
+  engine, in any build.
+- Release Dev builds the gateway and supervisor with `cedar` and verifies
+  the Cedar crates appear in the binaries' embedded dependency lists.
+  Pre-release and stable builds pass no feature and verify the Cedar crates
+  are absent. Branch checks lint and test both configurations, and
+  `mise run rust:verify:cedar-boundary` asserts every stable binary graph
+  excludes `cedar-policy` while the two opt-in features include it.
+- `HealthResponse.supports_cedar_policy` and the supervisor's
+  `GetSandboxConfigRequest.supports_cedar_policy` derive from the feature,
+  so a stable gateway or supervisor never claims support it lacks. A stable
+  gateway rejects Cedar on sandbox create and policy update; over state that
+  already holds Cedar sandboxes it refuses to start them, deliver their
+  configuration, or change their policy until they are deleted or the
+  gateway returns to a development build.
+- The Cedar documentation page is marked development-only and publishes in
+  the `dev` docs version only.
+
+Promotion into pre-release and stable builds follows acceptance of this RFC
+and the schema-affecting open questions below being decided, because schema
+changes after a stable release are breaking for Cedar authors. Whether the
+exclusion is for the next stable release only or until acceptance is for the
+maintainers to confirm.
+
 ## Risks
 
 - **OpenShell's own Cedar.** `ai-openshell/cedar` is a fork OpenShell
@@ -984,12 +1019,14 @@ symlinked binaries beyond what the parity harness covers.
   conditions must be top-level conjuncts; host selectors are limited to 253
   bytes; query evaluation is capped at 4,096 combinations. Each fails closed
   and is reported.
-- **Mixed versions.** Cedar needs the gateway and the sandbox runtime
-  upgraded together. The CLI and SDKs refuse a gateway that does not
+- **Mixed versions.** Cedar needs a development build of both the gateway
+  and the sandbox runtime. Stable builds do not link the engine, so the only
+  mixed case is a development gateway with a stable or older runtime, or an
+  operator switching a gateway from a development build to a stable one over
+  existing Cedar sandboxes. The CLI and SDKs refuse a gateway that does not
   advertise Cedar support, and the gateway refuses a runtime that does not,
   so the failure is a refused command or a sandbox that does not start, never
-  a sandbox running with less than its policy. Operators upgrading a fleet
-  see Cedar sandboxes fail on runtimes that are still old.
+  a sandbox running with less than its policy.
 - **Providers do not open access.** Authors used to attaching a provider and
   getting its endpoints must now write the permits. Forgetting the
   `HttpRequest` policy for a credentialed endpoint refuses the connection.

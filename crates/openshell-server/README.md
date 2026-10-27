@@ -273,3 +273,20 @@ return preferred `url`, configured `application_url`, and a gateway alternative
 deployment origins are recomputed for durable replay without repeating the
 mutation or changing resource identities. These are configured addresses, not
 installation, ingress acceptance, or application health signals.
+
+Discovery accepts an explicit workspace, up to 64 distinct `workspaces`, or the
+existing all-workspaces selector. Omission and combined selectors fail.
+Workspace users retain role/scope/membership authorization for every requested
+workspace; all-workspaces access requires platform administration or a dedicated
+certificate grant. Discovery certificates carry `OU=discovery`, use the configured
+TLS client CA, and receive authority only through the operator-managed fingerprint
+mapping at `gateway.auth.discovery_grants_file`. They never become user/operator
+principals. Certificate expiry and grant removal are rechecked on active watches.
+
+All-workspaces collection includes future active workspaces and omits terminating
+ones, with a 64-workspace scan bound. Selected-workspace collection does not scan
+unrelated workspaces. Combined snapshots retain the 4,096-route/4-MiB output bound
+and ten-second collection deadline; each workspace scan retains its existing
+1,000-record/4-MiB input bounds. Overflow and storage failures are errors, never
+partial successful views. A workspace-set change during collection requires a
+retry; this is not a cross-resource transactional snapshot.

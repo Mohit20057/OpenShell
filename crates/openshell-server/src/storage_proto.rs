@@ -164,7 +164,7 @@ mod tests {
     // SandboxPhase enum. Stored rows never carried those values, so prior
     // payloads decode unchanged.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "8176663e842c3febc30686fc78341eaeca8249e1161336117abbeeb25e19c331";
+        "0308847a7f463a2a6c6ab44de685d491a9dd17deb0a9354b00f9a8db309b84fe";
     const DURABLE_SCHEMA_SHA256: &str =
         "ffb20595e36032a9476d1c6956e2dcdc814f85286fc4735751e5ec6f499ea9ed";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =

@@ -246,7 +246,7 @@ pub fn print_sandbox_policy(policy: &SandboxPolicy) {
     println!();
     if let Ok(text) = openshell_policy::serialize_sandbox_policy(policy) {
         // A Cedar policy serializes as its Cedar text, which is not YAML.
-        let cedar = !policy.cedar_policy_source.is_empty();
+        let cedar = policy.is_cedar();
         for line in text.lines() {
             if line == "---" {
                 continue;

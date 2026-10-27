@@ -152,6 +152,7 @@ use cedar_policy::{
     ResourceConstraint, Schema, ValidationMode, Validator,
 };
 use ipnet::IpNet;
+use openshell_core::endpoint_path::path_specificity;
 use openshell_core::host_pattern::HostPattern;
 use openshell_policy_cedar_schema::{
     DeclaredAttributes, actions, context_fields, endpoint_fields, entity_types,
@@ -722,32 +723,22 @@ impl QueryKeys {
 
     /// Adds the tag keys of every `hasTag` and `getTag` call within `expr`.
     fn add_expr(&mut self, expr: &Value) {
-        match expr {
-            Value::Object(fields) => {
-                for (name, value) in fields {
-                    if name == "hasTag" || name == "getTag" {
-                        let key = value
-                            .get("right")
-                            .and_then(|right| right.get("Value"))
-                            .and_then(Value::as_str);
-                        match (key, &mut *self) {
-                            (Some(key), Self::Named(keys)) => {
-                                keys.insert(key.to_string());
-                            }
-                            (Some(_), Self::Any) => {}
-                            (None, _) => *self = Self::Any,
-                        }
+        visit::<()>(expr, &mut |name, value| {
+            if name == "hasTag" || name == "getTag" {
+                let key = value
+                    .get("right")
+                    .and_then(|right| right.get("Value"))
+                    .and_then(Value::as_str);
+                match (key, &mut *self) {
+                    (Some(key), Self::Named(keys)) => {
+                        keys.insert(key.to_string());
                     }
-                    self.add_expr(value);
+                    (Some(_), Self::Any) => {}
+                    (None, _) => *self = Self::Any,
                 }
             }
-            Value::Array(values) => {
-                for value in values {
-                    self.add_expr(value);
-                }
-            }
-            _ => {}
-        }
+            Step::Descend
+        });
     }
 }
 
@@ -776,26 +767,44 @@ pub fn analyze(schema: &Schema, policies: &PolicySet) -> Result<PolicyAnalysis, 
     }
 
     let declared = openshell_policy_cedar_schema::declared_attributes()?;
-    let mut read_only = BTreeSet::new();
-    let mut read_write = BTreeSet::new();
-    let mut dns_ports: BTreeMap<(String, NetworkTransport, Vec<IpNet>), BTreeSet<u16>> =
-        BTreeMap::new();
-    let mut network_permits = HashMap::new();
-    let mut unresolved = HashMap::new();
-    let mut l7_declared: BTreeMap<(String, u16), DeclaredEndpoint> = BTreeMap::new();
-    let mut staged_http = Vec::new();
-    let mut hostless_permits = Vec::new();
-    let mut query_keys = QueryKeys::default();
-    let mut staged_query_keys = QueryKeys::default();
-    let mut binary_alias_paths = BTreeSet::new();
-    let mut binary_glob_patterns = BTreeSet::new();
-    let mut http_permits = HashMap::new();
-
+    let mut collector = Collector::default();
     for policy in policies.policies() {
+        collector.policy(policy, schema, &declared)?;
+    }
+    collector.finish()
+}
+
+/// What [`analyze`] collects from each policy of a set, before it checks
+/// the set as a whole.
+#[derive(Default)]
+struct Collector {
+    read_only: BTreeSet<String>,
+    read_write: BTreeSet<String>,
+    dns_ports: BTreeMap<(String, NetworkTransport, Vec<IpNet>), BTreeSet<u16>>,
+    network_permits: HashMap<PolicyId, NetworkPermit>,
+    unresolved: HashMap<PolicyId, Policy>,
+    l7_declared: BTreeMap<(String, u16), DeclaredEndpoint>,
+    staged_http: Vec<StagedHttpPolicy>,
+    hostless_permits: Vec<HostlessPermit>,
+    query_keys: QueryKeys,
+    staged_query_keys: QueryKeys,
+    binary_alias_paths: BTreeSet<String>,
+    binary_glob_patterns: BTreeSet<String>,
+    http_permits: HashMap<PolicyId, HttpPermit>,
+}
+
+impl Collector {
+    /// Checks one policy and collects what it contributes.
+    fn policy(
+        &mut self,
+        policy: &Policy,
+        schema: &Schema,
+        declared: &DeclaredAttributes,
+    ) -> Result<(), CedarEngineError> {
         let policy_id = display_id(policy);
-        staged_query_keys.add_policy(policy);
+        self.staged_query_keys.add_policy(policy);
         if !is_staged(policy) {
-            query_keys.add_policy(policy);
+            self.query_keys.add_policy(policy);
         }
         let json = policy
             .to_json()
@@ -808,19 +817,19 @@ pub fn analyze(schema: &Schema, policies: &PolicySet) -> Result<PolicyAnalysis, 
             conditions,
             BinarySet::Aliases,
             &policy_id,
-            &mut binary_alias_paths,
+            &mut self.binary_alias_paths,
         )?;
         collect_binary_set_literals(
             conditions,
             BinarySet::Globs,
             &policy_id,
-            &mut binary_glob_patterns,
+            &mut self.binary_glob_patterns,
         )?;
         check_delimited_patterns(conditions, &policy_id)?;
         check_principal_identity(conditions, &policy_id)?;
         check_principal_constraints(policy, conditions, &policy_id)?;
         let scope = ActionScope::of(policy);
-        check_has_tests(conditions, policy, &policy_id, &scope, schema, &declared)?;
+        check_has_tests(conditions, policy, &policy_id, &scope, schema, declared)?;
         let touches_filesystem = (scope.includes(actions::READ_FILE)
             || scope.includes(actions::WRITE_FILE))
             && resource_may_be(policy, entity_types::FILESYSTEM_PATH);
@@ -905,235 +914,355 @@ pub fn analyze(schema: &Schema, policies: &PolicySet) -> Result<PolicyAnalysis, 
                 allowed_ips,
                 unresolved: stripped,
             } => {
-                unresolved.insert(policy.id().clone(), *stripped);
+                self.unresolved.insert(policy.id().clone(), *stripped);
                 allowed_ips
             }
         };
 
         if touches_filesystem {
-            let grant = filesystem_grant(policy, &policy_id, &scope)?;
-            let target = if grant.writes {
-                &mut read_write
-            } else {
-                &mut read_only
-            };
-            target.extend(grant.paths);
+            self.filesystem(policy, &policy_id, &scope)?;
         }
-
         if touches_http_request {
-            let key = match scope_endpoint(policy) {
-                Some(endpoint) => parse_endpoint(&policy_id, &endpoint)?,
-                None => condition_host_glob(policy, &policy_id)?.ok_or_else(|| {
-                    CedarEngineError::UnsupportedPolicy {
-                        policy_id: policy_id.clone(),
-                        reason: "a policy on the HttpRequest action must name its endpoint, in \
-                                 the scope (resource == Sandbox::NetworkEndpoint::\"host:port\") \
-                                 or as exactly one `.`-delimited host glob \
-                                 (`resource.host like(\"*.example.com\", \".\")`) and one \
-                                 `resource.port == <port>` top-level `when` conjunct, so the \
-                                 proxy knows which connections to inspect"
-                            .to_string(),
-                    }
-                })?,
-            };
-            let endpoint = format!("{}:{}", key.0, key.1);
-            let explicit_path = path_annotation
-                .map(|path| validate_path(&policy_id, path))
-                .transpose()?;
-            let path = explicit_path.clone().unwrap_or_default();
-            let protocol = protocol_annotation
-                .map(|value| {
-                    L7Protocol::from_annotation(value).ok_or_else(|| {
-                        CedarEngineError::UnsupportedL7Protocol {
-                            policy_id: policy_id.clone(),
-                            protocol: value.to_string(),
-                        }
-                    })
-                })
-                .transpose()?;
-            // A staged policy never changes inspection: only deciding
-            // policies make an endpoint or path inspected or declare its
-            // protocol.
-            let declared = match enforcement {
-                EnforcementAnnotation::Staged => {
-                    staged_http.push(StagedHttpPolicy {
-                        policy_id: policy_id.clone(),
-                        endpoint: key.clone(),
-                        path: explicit_path,
-                        protocol,
-                    });
-                    None
-                }
-                EnforcementAnnotation::Enforce | EnforcementAnnotation::Audit => {
-                    let declared = l7_declared
-                        .entry(key.clone())
-                        .or_default()
-                        .paths
-                        .entry(path.clone())
-                        .or_default();
-                    match (declared.protocol, protocol) {
-                        (Some(first), Some(second)) if first != second => {
-                            return Err(CedarEngineError::ConflictingL7Protocol {
-                                endpoint: format!("{endpoint}{path}"),
-                                first: first.to_string(),
-                                second: second.to_string(),
-                            });
-                        }
-                        (None, Some(protocol)) => declared.protocol = Some(protocol),
-                        _ => {}
-                    }
-                    if enforcement == EnforcementAnnotation::Audit {
-                        declared.audit_policies += 1;
-                    } else {
-                        declared.enforced_policies += 1;
-                    }
-                    Some(declared)
-                }
-            };
-            if policy.effect() == Effect::Permit {
-                let reads_graphql =
-                    reads_context_attr(conditions, |attr| attr.starts_with(GRAPHQL_FIELD_PREFIX));
-                if let Some(declared) = declared
-                    && permits_method_without_graphql(&json, WEBSOCKET_TEXT_METHOD)
-                {
-                    declared.generic_permits.push(policy_id.clone());
-                }
-                http_permits.insert(
-                    policy.id().clone(),
-                    HttpPermit {
-                        endpoint: key,
-                        path,
-                        graphql_aware: reads_graphql
-                            || mentions_resource_attr(conditions, endpoint_fields::PROTOCOL),
-                    },
-                );
-            }
+            self.http_request(policy, &policy_id, &json, enforcement)?;
         }
-
         if touches_network_connect && policy.effect() == Effect::Permit {
-            let endpoint = match scope_endpoint(policy) {
-                Some(endpoint) => Some(parse_endpoint(&policy_id, &endpoint)?),
-                None => condition_endpoint(policy, &policy_id)?,
-            };
-            if transport == Some(NetworkTransport::Tcp)
-                && let Some((host, _)) = &endpoint
-                && !host.contains('*')
-            {
-                check_tcp_host(&policy_id, host)?;
+            self.network_connect(policy, policy_id, transport, allowed_ips)?;
+        }
+        Ok(())
+    }
+
+    /// Collects the Landlock grant of a policy on the filesystem actions.
+    fn filesystem(
+        &mut self,
+        policy: &Policy,
+        policy_id: &str,
+        scope: &ActionScope,
+    ) -> Result<(), CedarEngineError> {
+        let grant = filesystem_grant(policy, policy_id, scope)?;
+        let target = if grant.writes {
+            &mut self.read_write
+        } else {
+            &mut self.read_only
+        };
+        target.extend(grant.paths);
+        Ok(())
+    }
+
+    /// Collects the inspected endpoint, path, and protocol of a policy on
+    /// the `HttpRequest` action, and where it permits requests.
+    fn http_request(
+        &mut self,
+        policy: &Policy,
+        policy_id: &str,
+        json: &Value,
+        enforcement: EnforcementAnnotation,
+    ) -> Result<(), CedarEngineError> {
+        let conditions = json.get("conditions").unwrap_or(&Value::Null);
+        let path_annotation = policy.annotation(PATH_ANNOTATION);
+        let protocol_annotation = policy.annotation(PROTOCOL_ANNOTATION);
+        let key = match scope_endpoint(policy) {
+            Some(endpoint) => parse_endpoint(policy_id, &endpoint)?,
+            None => condition_host_glob(policy, policy_id)?.ok_or_else(|| {
+                CedarEngineError::UnsupportedPolicy {
+                    policy_id: policy_id.to_string(),
+                    reason: "a policy on the HttpRequest action must name its endpoint, in \
+                             the scope (resource == Sandbox::NetworkEndpoint::\"host:port\") \
+                             or as exactly one `.`-delimited host glob \
+                             (`resource.host like(\"*.example.com\", \".\")`) and one \
+                             `resource.port == <port>` top-level `when` conjunct, so the \
+                             proxy knows which connections to inspect"
+                        .to_string(),
+                }
+            })?,
+        };
+        let endpoint = format!("{}:{}", key.0, key.1);
+        let explicit_path = path_annotation
+            .map(|path| validate_path(policy_id, path))
+            .transpose()?;
+        let path = explicit_path.clone().unwrap_or_default();
+        let protocol = protocol_annotation
+            .map(|value| {
+                L7Protocol::from_annotation(value).ok_or_else(|| {
+                    CedarEngineError::UnsupportedL7Protocol {
+                        policy_id: policy_id.to_string(),
+                        protocol: value.to_string(),
+                    }
+                })
+            })
+            .transpose()?;
+        // A staged policy never changes inspection: only deciding
+        // policies make an endpoint or path inspected or declare its
+        // protocol.
+        let declared = match enforcement {
+            EnforcementAnnotation::Staged => {
+                self.staged_http.push(StagedHttpPolicy {
+                    policy_id: policy_id.to_string(),
+                    endpoint: key.clone(),
+                    path: explicit_path,
+                    protocol,
+                });
+                None
             }
-            network_permits.insert(
+            EnforcementAnnotation::Enforce | EnforcementAnnotation::Audit => {
+                let declared = self
+                    .l7_declared
+                    .entry(key.clone())
+                    .or_default()
+                    .paths
+                    .entry(path.clone())
+                    .or_default();
+                match (declared.protocol, protocol) {
+                    (Some(first), Some(second)) if first != second => {
+                        return Err(CedarEngineError::ConflictingL7Protocol {
+                            endpoint: format!("{endpoint}{path}"),
+                            first: first.to_string(),
+                            second: second.to_string(),
+                        });
+                    }
+                    (None, Some(protocol)) => declared.protocol = Some(protocol),
+                    _ => {}
+                }
+                if enforcement == EnforcementAnnotation::Audit {
+                    declared.audit_policies += 1;
+                } else {
+                    declared.enforced_policies += 1;
+                }
+                Some(declared)
+            }
+        };
+        if policy.effect() == Effect::Permit {
+            let reads_graphql =
+                reads_context_attr(conditions, |attr| attr.starts_with(GRAPHQL_FIELD_PREFIX));
+            if let Some(declared) = declared
+                && permits_method_without_graphql(json, WEBSOCKET_TEXT_METHOD)
+            {
+                declared.generic_permits.push(policy_id.to_string());
+            }
+            self.http_permits.insert(
                 policy.id().clone(),
-                NetworkPermit {
-                    endpoint: endpoint.clone().filter(|(host, _)| !host.contains('*')),
-                    allowed_ips: allowed_ips.clone(),
+                HttpPermit {
+                    endpoint: key,
+                    path,
+                    graphql_aware: reads_graphql
+                        || mentions_resource_attr(conditions, endpoint_fields::PROTOCOL),
                 },
             );
-            match endpoint {
-                Some((host, port)) => {
-                    dns_ports
-                        .entry((host, transport.unwrap_or_default(), allowed_ips))
-                        .or_default()
-                        .insert(port);
-                }
-                None if transport.is_some() => {
-                    return Err(CedarEngineError::UnsupportedPolicy {
-                        policy_id,
-                        reason: "a @transport(\"tcp\") permit must name one DNS host and port, \
-                                 in its scope (resource == Sandbox::NetworkEndpoint::\"host:port\") \
-                                 or as `resource.host` and `resource.port` conditions; native TCP \
-                                 has no hostless form"
-                            .to_string(),
-                    });
-                }
-                None => hostless_permits.push(HostlessPermit {
-                    policy_id,
-                    port: condition_port(policy),
-                }),
-            }
         }
+        Ok(())
     }
 
-    let dns_endpoints: Vec<AuthorizedNetworkEndpoint> = dns_ports
-        .into_iter()
-        .map(
-            |((host, transport, allowed_ips), ports)| AuthorizedNetworkEndpoint {
-                host,
-                ports: ports.into_iter().collect(),
-                transport,
-                allowed_ips,
+    /// Collects what a `NetworkConnect` permit requires of a connection and
+    /// the policy DNS eligibility it grants.
+    fn network_connect(
+        &mut self,
+        policy: &Policy,
+        policy_id: String,
+        transport: Option<NetworkTransport>,
+        allowed_ips: Vec<IpNet>,
+    ) -> Result<(), CedarEngineError> {
+        let endpoint = match scope_endpoint(policy) {
+            Some(endpoint) => Some(parse_endpoint(&policy_id, &endpoint)?),
+            None => condition_endpoint(policy, &policy_id)?,
+        };
+        if transport == Some(NetworkTransport::Tcp)
+            && let Some((host, _)) = &endpoint
+            && !host.contains('*')
+        {
+            check_tcp_host(&policy_id, host)?;
+        }
+        self.network_permits.insert(
+            policy.id().clone(),
+            NetworkPermit {
+                endpoint: endpoint.clone().filter(|(host, _)| !host.contains('*')),
+                allowed_ips: allowed_ips.clone(),
             },
-        )
-        .collect();
-    let mut overlaps = HostOverlaps::new();
-    check_tcp_endpoints(
-        &dns_endpoints,
-        l7_declared.keys(),
-        &hostless_permits,
-        &mut overlaps,
-    )?;
-
-    // Entries that can select one host are routed together, so the audit
-    // warning, the ambiguity check, and staged comparison consider them
-    // together.
-    let index = HostIndex::new(l7_declared.keys());
-    let overlapping = index.overlapping_pairs(&mut overlaps)?;
-    let enforced: Vec<bool> = l7_declared
-        .values()
-        .map(DeclaredEndpoint::has_enforced_policies)
-        .collect();
-    let mut enforced_nearby = enforced.clone();
-    for &(first, second) in &overlapping {
-        enforced_nearby[first] |= enforced[second];
-        enforced_nearby[second] |= enforced[first];
-    }
-
-    let mut l7_endpoints = BTreeMap::new();
-    let mut l7_host_patterns = Vec::new();
-    let mut warnings = Vec::new();
-    for (((host, port), declared), enforced_nearby) in l7_declared.into_iter().zip(enforced_nearby)
-    {
-        let paths = declared.finish(&host, port, enforced_nearby, &mut warnings)?;
-        check_unambiguous_paths(&host, port, &paths)?;
-        if host.contains('*') {
-            // `host_glob` only produces patterns the YAML matcher compiles.
-            let pattern =
-                HostPattern::new(&host).map_err(|reason| CedarEngineError::UnsupportedPolicy {
-                    policy_id: format!("{host}:{port}"),
-                    reason: format!("host glob cannot be matched: {reason}"),
-                })?;
-            l7_host_patterns.push(L7HostPattern {
-                host: host.clone(),
-                port,
-                pattern,
-            });
+        );
+        match endpoint {
+            Some((host, port)) => {
+                self.dns_ports
+                    .entry((host, transport.unwrap_or_default(), allowed_ips))
+                    .or_default()
+                    .insert(port);
+            }
+            None if transport.is_some() => {
+                return Err(CedarEngineError::UnsupportedPolicy {
+                    policy_id,
+                    reason: "a @transport(\"tcp\") permit must name one DNS host and port, \
+                             in its scope (resource == Sandbox::NetworkEndpoint::\"host:port\") \
+                             or as `resource.host` and `resource.port` conditions; native TCP \
+                             has no hostless form"
+                        .to_string(),
+                });
+            }
+            None => self.hostless_permits.push(HostlessPermit {
+                policy_id,
+                port: condition_port(policy),
+            }),
         }
-        l7_endpoints.insert((host, port), paths);
+        Ok(())
     }
-    check_unambiguous_hosts(&l7_endpoints, &overlapping)?;
-    mark_staged(
-        &mut l7_endpoints,
-        &staged_http,
-        &mut overlaps,
-        &mut warnings,
-    )?;
 
-    Ok(PolicyAnalysis {
-        filesystem: FilesystemGrants {
-            read_only: read_only.into_iter().collect(),
-            read_write: read_write.into_iter().collect(),
-        },
-        dns_endpoints,
-        l7_endpoints,
-        l7_host_patterns,
-        query_keys,
-        staged_query_keys,
-        network_permits,
-        unresolved,
-        binary_alias_paths,
-        binary_glob_patterns,
-        http_permits,
-        warnings,
+    /// Checks the collected policies as a set and derives the analysis.
+    fn finish(self) -> Result<PolicyAnalysis, CedarEngineError> {
+        let Self {
+            read_only,
+            read_write,
+            dns_ports,
+            network_permits,
+            unresolved,
+            l7_declared,
+            staged_http,
+            hostless_permits,
+            query_keys,
+            staged_query_keys,
+            binary_alias_paths,
+            binary_glob_patterns,
+            http_permits,
+        } = self;
+        let dns_endpoints: Vec<AuthorizedNetworkEndpoint> = dns_ports
+            .into_iter()
+            .map(
+                |((host, transport, allowed_ips), ports)| AuthorizedNetworkEndpoint {
+                    host,
+                    ports: ports.into_iter().collect(),
+                    transport,
+                    allowed_ips,
+                },
+            )
+            .collect();
+        let mut overlaps = HostOverlaps::new();
+        check_tcp_endpoints(
+            &dns_endpoints,
+            l7_declared.keys(),
+            &hostless_permits,
+            &mut overlaps,
+        )?;
+
+        // Entries that can select one host are routed together, so the audit
+        // warning, the ambiguity check, and staged comparison consider them
+        // together.
+        let index = HostIndex::new(l7_declared.keys());
+        let overlapping = index.overlapping_pairs(&mut overlaps)?;
+        let enforced: Vec<bool> = l7_declared
+            .values()
+            .map(DeclaredEndpoint::has_enforced_policies)
+            .collect();
+        let mut enforced_nearby = enforced.clone();
+        for &(first, second) in &overlapping {
+            enforced_nearby[first] |= enforced[second];
+            enforced_nearby[second] |= enforced[first];
+        }
+
+        let mut l7_endpoints = BTreeMap::new();
+        let mut l7_host_patterns = Vec::new();
+        let mut warnings = Vec::new();
+        for (((host, port), declared), enforced_nearby) in
+            l7_declared.into_iter().zip(enforced_nearby)
+        {
+            let paths = declared.finish(&host, port, enforced_nearby, &mut warnings)?;
+            check_unambiguous_paths(&host, port, &paths)?;
+            if host.contains('*') {
+                // `host_glob` only produces patterns the YAML matcher compiles.
+                let pattern = HostPattern::new(&host).map_err(|reason| {
+                    CedarEngineError::UnsupportedPolicy {
+                        policy_id: format!("{host}:{port}"),
+                        reason: format!("host glob cannot be matched: {reason}"),
+                    }
+                })?;
+                l7_host_patterns.push(L7HostPattern {
+                    host: host.clone(),
+                    port,
+                    pattern,
+                });
+            }
+            l7_endpoints.insert((host, port), paths);
+        }
+        check_unambiguous_hosts(&l7_endpoints, &overlapping)?;
+        mark_staged(
+            &mut l7_endpoints,
+            &staged_http,
+            &mut overlaps,
+            &mut warnings,
+        )?;
+
+        Ok(PolicyAnalysis {
+            filesystem: FilesystemGrants {
+                read_only: read_only.into_iter().collect(),
+                read_write: read_write.into_iter().collect(),
+            },
+            dns_endpoints,
+            l7_endpoints,
+            l7_host_patterns,
+            query_keys,
+            staged_query_keys,
+            network_permits,
+            unresolved,
+            binary_alias_paths,
+            binary_glob_patterns,
+            http_permits,
+            warnings,
+        })
+    }
+}
+
+/// What [`visit`] does after visiting one field of an expression object.
+enum Step<B> {
+    /// Visit the field's value as well.
+    Descend,
+    /// Leave the field's value unvisited.
+    Skip,
+    /// End the walk with this result.
+    Stop(B),
+}
+
+/// Walks the JSON form of a Cedar expression depth first, calling `f` with
+/// the name and value of every field of every object within `expr`, in
+/// field order, and descending into a field's value as `f` asks.
+///
+/// Returns the result `f` stopped with, if it stopped.
+fn visit<'a, B>(expr: &'a Value, f: &mut impl FnMut(&'a str, &'a Value) -> Step<B>) -> Option<B> {
+    match expr {
+        Value::Object(fields) => {
+            for (name, value) in fields {
+                match f(name, value) {
+                    Step::Descend => {
+                        if let Some(result) = visit(value, f) {
+                            return Some(result);
+                        }
+                    }
+                    Step::Skip => {}
+                    Step::Stop(result) => return Some(result),
+                }
+            }
+            None
+        }
+        Value::Array(values) => values.iter().find_map(|value| visit(value, f)),
+        _ => None,
+    }
+}
+
+/// Returns whether `found` holds for some field within `expr`.
+fn any_field(expr: &Value, found: impl Fn(&str, &Value) -> bool) -> bool {
+    visit(expr, &mut |name, value| {
+        if found(name, value) {
+            Step::Stop(())
+        } else {
+            Step::Descend
+        }
     })
+    .is_some()
+}
+
+/// The variable an `attr` or `has` node reads from directly, such as
+/// `context` for `context.method`.
+fn receiver_var(access: &Value) -> Option<&str> {
+    access.get("left")?.get("Var")?.as_str()
+}
+
+/// The variable and attribute an `attr` or `has` node reads, when it reads
+/// from a variable directly: `("context", "method")` for `context.method`.
+fn var_attr(access: &Value) -> Option<(&str, &str)> {
+    Some((receiver_var(access)?, access.get("attr")?.as_str()?))
 }
 
 /// A `Set<String>` context field holding binary identities the supervisor
@@ -1236,59 +1365,65 @@ fn binary_set_literals_in(
     set: BinarySet,
     literals: &mut BTreeSet<String>,
 ) -> Result<(), String> {
-    match expr {
-        Value::Object(fields) => {
-            for (name, value) in fields {
-                if name == "Var" && value.as_str() == Some("context") {
-                    return Err(format!(
-                        "the whole `context` record includes {}; read its attributes instead",
-                        set.field()
-                    ));
-                }
-                if (name == "." || name == "has")
-                    && let Some(attr) = context_attr(value)
-                {
-                    if name == "." && attr == set.field() {
-                        return Err(set.forms());
-                    }
-                    continue;
-                }
-                if matches!(name.as_str(), "contains" | "containsAny" | "containsAll")
-                    && value
-                        .get("left")
-                        .and_then(|left| left.get("."))
-                        .and_then(context_attr)
-                        == Some(set.field())
-                {
-                    let right = value.get("right").unwrap_or(&Value::Null);
-                    let elements = if name == "contains" {
-                        vec![right]
-                    } else {
-                        right
-                            .get("Set")
-                            .and_then(Value::as_array)
-                            .map(|elements| elements.iter().collect())
-                            .ok_or_else(|| set.forms())?
-                    };
-                    for element in elements {
-                        let literal = element
-                            .get("Value")
-                            .and_then(Value::as_str)
-                            .ok_or_else(|| set.forms())?;
-                        set.check_literal(literal)?;
-                        literals.insert(literal.to_string());
-                    }
-                    continue;
-                }
-                binary_set_literals_in(value, set, literals)?;
-            }
-            Ok(())
+    let error = visit(expr, &mut |name, value| {
+        if name == "Var" && value.as_str() == Some("context") {
+            return Step::Stop(format!(
+                "the whole `context` record includes {}; read its attributes instead",
+                set.field()
+            ));
         }
-        Value::Array(values) => values
-            .iter()
-            .try_for_each(|value| binary_set_literals_in(value, set, literals)),
-        _ => Ok(()),
+        if (name == "." || name == "has")
+            && let Some(attr) = context_attr(value)
+        {
+            if name == "." && attr == set.field() {
+                return Step::Stop(set.forms());
+            }
+            return Step::Skip;
+        }
+        if matches!(name, "contains" | "containsAny" | "containsAll")
+            && value
+                .get("left")
+                .and_then(|left| left.get("."))
+                .and_then(context_attr)
+                == Some(set.field())
+        {
+            return match set_test_literals(name, value, set, literals) {
+                Ok(()) => Step::Skip,
+                Err(reason) => Step::Stop(reason),
+            };
+        }
+        Step::Descend
+    });
+    error.map_or(Ok(()), Err)
+}
+
+/// Adds the literals of one `contains`-family test of `set`, the method
+/// `name` with operands `call`.
+fn set_test_literals(
+    name: &str,
+    call: &Value,
+    set: BinarySet,
+    literals: &mut BTreeSet<String>,
+) -> Result<(), String> {
+    let right = call.get("right").unwrap_or(&Value::Null);
+    let elements = if name == "contains" {
+        vec![right]
+    } else {
+        right
+            .get("Set")
+            .and_then(Value::as_array)
+            .map(|elements| elements.iter().collect())
+            .ok_or_else(|| set.forms())?
+    };
+    for element in elements {
+        let literal = element
+            .get("Value")
+            .and_then(Value::as_str)
+            .ok_or_else(|| set.forms())?;
+        set.check_literal(literal)?;
+        literals.insert(literal.to_string());
     }
+    Ok(())
 }
 
 /// Rejects `has` tests on `principal`, `resource`, or `context` of an
@@ -1311,9 +1446,7 @@ fn check_has_tests(
     schema: &Schema,
     declared: &DeclaredAttributes,
 ) -> Result<(), CedarEngineError> {
-    let mut tests = Vec::new();
-    collect_var_has_tests(conditions, &mut tests);
-    for (variable, attr) in tests {
+    for (variable, attr) in var_has_tests(conditions) {
         for env in schema.request_envs() {
             let action = env.action().id().unescaped();
             if !scope.includes(action) {
@@ -1346,32 +1479,20 @@ fn check_has_tests(
     Ok(())
 }
 
-/// Collects the `(variable, attribute)` of every `has` node within `expr`
+/// Returns the `(variable, attribute)` of every `has` node within `expr`
 /// whose left operand is `principal`, `resource`, or `context`.
-fn collect_var_has_tests<'a>(expr: &'a Value, tests: &mut Vec<(&'a str, &'a str)>) {
-    match expr {
-        Value::Object(fields) => {
-            for (name, value) in fields {
-                if name == "has"
-                    && let Some(variable) = value
-                        .get("left")
-                        .and_then(|left| left.get("Var"))
-                        .and_then(Value::as_str)
-                    && let Some(attr) = value.get("attr").and_then(Value::as_str)
-                    && matches!(variable, "principal" | "resource" | "context")
-                {
-                    tests.push((variable, attr));
-                }
-                collect_var_has_tests(value, tests);
-            }
+fn var_has_tests(expr: &Value) -> Vec<(&str, &str)> {
+    let mut tests = Vec::new();
+    visit::<()>(expr, &mut |name, value| {
+        if name == "has"
+            && let Some((variable, attr)) = var_attr(value)
+            && matches!(variable, "principal" | "resource" | "context")
+        {
+            tests.push((variable, attr));
         }
-        Value::Array(values) => {
-            for value in values {
-                collect_var_has_tests(value, tests);
-            }
-        }
-        _ => {}
-    }
+        Step::Descend
+    });
+    tests
 }
 
 /// Rejects delimited `like` patterns within `expr` whose `**` is next to a
@@ -1382,28 +1503,23 @@ fn collect_var_has_tests<'a>(expr: &'a Value, tests: &mut Vec<(&'a str, &'a str)
 /// Returns [`CedarEngineError::AmbiguousRecursiveWildcard`] for the first
 /// such pattern.
 fn check_delimited_patterns(expr: &Value, policy_id: &str) -> Result<(), CedarEngineError> {
-    match expr {
-        Value::Object(fields) => {
-            for (name, value) in fields {
-                if name == "like"
-                    && let Some(delimiter) = value.get("delim").and_then(Value::as_str)
-                    && let Some(elements) = value.get("pattern").and_then(Value::as_array)
-                    && let Some(pattern) = ambiguous_recursive_wildcard(elements, delimiter)
-                {
-                    return Err(CedarEngineError::AmbiguousRecursiveWildcard {
-                        policy_id: policy_id.to_string(),
-                        pattern,
-                        delimiter: delimiter.to_string(),
-                    });
-                }
-                check_delimited_patterns(value, policy_id)?;
-            }
-            Ok(())
+    let ambiguous = visit(expr, &mut |name, value| {
+        if name == "like"
+            && let Some(delimiter) = value.get("delim").and_then(Value::as_str)
+            && let Some(elements) = value.get("pattern").and_then(Value::as_array)
+            && let Some(pattern) = ambiguous_recursive_wildcard(elements, delimiter)
+        {
+            return Step::Stop((pattern, delimiter));
         }
-        Value::Array(values) => values
-            .iter()
-            .try_for_each(|value| check_delimited_patterns(value, policy_id)),
-        _ => Ok(()),
+        Step::Descend
+    });
+    match ambiguous {
+        Some((pattern, delimiter)) => Err(CedarEngineError::AmbiguousRecursiveWildcard {
+            policy_id: policy_id.to_string(),
+            pattern,
+            delimiter: delimiter.to_string(),
+        }),
+        None => Ok(()),
     }
 }
 
@@ -1419,34 +1535,27 @@ fn check_delimited_patterns(expr: &Value, policy_id: &str) -> Result<(), CedarEn
 ///
 /// Returns [`CedarEngineError::UnsupportedPolicy`] for the first such read.
 fn check_principal_identity(expr: &Value, policy_id: &str) -> Result<(), CedarEngineError> {
-    match expr {
-        Value::Object(fields) => {
-            for (name, value) in fields {
-                if name == "."
-                    && value.get("left").is_some_and(may_be_process)
-                    && let Some(attr @ ("user" | "group")) =
-                        value.get("attr").and_then(Value::as_str)
-                {
-                    return Err(CedarEngineError::UnsupportedPolicy {
-                        policy_id: policy_id.to_string(),
-                        reason: format!(
-                            "it reads `principal.{attr}`, but sandbox identity attributes are \
-                             not yet available to policies: every request carries the same \
-                             placeholder user and group, so the condition cannot tell \
-                             processes apart; remove it (the sandbox's run-as user and group \
-                             are enforced by the runtime, not by policy)"
-                        ),
-                    });
-                }
-                check_principal_identity(value, policy_id)?;
-            }
-            Ok(())
+    let read = visit(expr, &mut |name, value| {
+        if name == "."
+            && value.get("left").is_some_and(may_be_process)
+            && let Some(attr @ ("user" | "group")) = value.get("attr").and_then(Value::as_str)
+        {
+            return Step::Stop(attr);
         }
-        Value::Array(values) => values
-            .iter()
-            .try_for_each(|value| check_principal_identity(value, policy_id)),
-        _ => Ok(()),
-    }
+        Step::Descend
+    });
+    read.map_or(Ok(()), |attr| {
+        Err(CedarEngineError::UnsupportedPolicy {
+            policy_id: policy_id.to_string(),
+            reason: format!(
+                "it reads `principal.{attr}`, but sandbox identity attributes are \
+                 not yet available to policies: every request carries the same \
+                 placeholder user and group, so the condition cannot tell \
+                 processes apart; remove it (the sandbox's run-as user and group \
+                 are enforced by the runtime, not by policy)"
+            ),
+        })
+    })
 }
 
 /// Rejects a test of which process the principal is, in the scope or within
@@ -1486,46 +1595,29 @@ fn check_principal_constraints(
 /// `==`, `!=`, `in`, or a `contains` method, or tests its type other than
 /// as a bare `is Sandbox::Process`.
 fn tests_principal(expr: &Value) -> bool {
-    match expr {
-        Value::Object(fields) => fields.iter().any(|(name, value)| {
-            let compares = match name.as_str() {
-                "==" | "!=" | "in" | "contains" | "containsAll" | "containsAny" => {
-                    ["left", "right"]
-                        .iter()
-                        .any(|operand| value.get(operand).is_some_and(may_be_process))
-                }
-                "is" => {
-                    value.get("in").is_some_and(may_be_process)
-                        || value.get("left").is_some_and(may_be_process)
-                            && (value.get("in").is_some()
-                                || value.get("entity_type").and_then(Value::as_str)
-                                    != Some(entity_types::PROCESS))
-                }
-                _ => false,
-            };
-            compares || tests_principal(value)
-        }),
-        Value::Array(values) => values.iter().any(tests_principal),
+    any_field(expr, |name, value| match name {
+        "==" | "!=" | "in" | "contains" | "containsAll" | "containsAny" => ["left", "right"]
+            .iter()
+            .any(|operand| value.get(operand).is_some_and(may_be_process)),
+        "is" => {
+            value.get("in").is_some_and(may_be_process)
+                || value.get("left").is_some_and(may_be_process)
+                    && (value.get("in").is_some()
+                        || value.get("entity_type").and_then(Value::as_str)
+                            != Some(entity_types::PROCESS))
+        }
         _ => false,
-    }
+    })
 }
 
 /// Returns whether `expr` contains `principal` or a `Process` entity
 /// literal, so it may evaluate to a `Process`.
 fn may_be_process(expr: &Value) -> bool {
-    match expr {
-        Value::Object(fields) => {
-            fields.get("Var").and_then(Value::as_str) == Some("principal")
-                || fields
-                    .get("__entity")
-                    .and_then(|entity| entity.get("type"))
-                    .and_then(Value::as_str)
-                    == Some(entity_types::PROCESS)
-                || fields.values().any(may_be_process)
-        }
-        Value::Array(values) => values.iter().any(may_be_process),
+    any_field(expr, |name, value| match name {
+        "Var" => value.as_str() == Some("principal"),
+        "__entity" => value.get("type").and_then(Value::as_str) == Some(entity_types::PROCESS),
         _ => false,
-    }
+    })
 }
 
 /// Returns the pattern's text when a `MultiWildcard` in `elements` is next
@@ -1573,44 +1665,38 @@ fn ambiguous_recursive_wildcard(elements: &[Value], delimiter: &str) -> Option<S
 
 /// True if a `.` or `has` node within `expr` reads a `context` attribute
 /// `accept` accepts, or the whole `context` record, which includes them.
-fn reads_context_attr(expr: &Value, accept: impl Fn(&str) -> bool + Copy) -> bool {
-    match expr {
-        Value::Object(fields) => fields.iter().any(|(name, value)| {
-            if name == "Var" && value.as_str() == Some("context") {
-                return true;
-            }
-            if (name == "." || name == "has")
-                && let Some(attr) = context_attr(value)
-            {
-                return accept(attr);
-            }
-            reads_context_attr(value, accept)
-        }),
-        Value::Array(values) => values.iter().any(|value| reads_context_attr(value, accept)),
-        _ => false,
-    }
+fn reads_context_attr(expr: &Value, accept: impl Fn(&str) -> bool) -> bool {
+    visit(expr, &mut |name, value| {
+        if name == "Var" && value.as_str() == Some("context") {
+            return Step::Stop(());
+        }
+        if (name == "." || name == "has")
+            && let Some(attr) = context_attr(value)
+        {
+            return if accept(attr) {
+                Step::Stop(())
+            } else {
+                Step::Skip
+            };
+        }
+        Step::Descend
+    })
+    .is_some()
 }
 
 /// True if `expr` reads or tests `resource.<attr>`.
 fn mentions_resource_attr(expr: &Value, attr: &str) -> bool {
-    match expr {
-        Value::Object(fields) => fields.iter().any(|(name, value)| {
-            if (name == "." || name == "has")
-                && value
-                    .get("left")
-                    .and_then(|left| left.get("Var"))
-                    .and_then(Value::as_str)
-                    == Some("resource")
-            {
-                return value.get("attr").and_then(Value::as_str) == Some(attr);
-            }
-            mentions_resource_attr(value, attr)
-        }),
-        Value::Array(values) => values
-            .iter()
-            .any(|value| mentions_resource_attr(value, attr)),
-        _ => false,
-    }
+    visit(expr, &mut |name, value| {
+        if (name == "." || name == "has") && receiver_var(value) == Some("resource") {
+            return if value.get("attr").and_then(Value::as_str) == Some(attr) {
+                Step::Stop(())
+            } else {
+                Step::Skip
+            };
+        }
+        Step::Descend
+    })
+    .is_some()
 }
 
 /// What a permit's conditions can be for a GraphQL-over-WebSocket client
@@ -1783,14 +1869,9 @@ fn message_truth(expr: &Value, method: &str) -> MessageTruth {
 /// The attribute an `attr` or `has` node reads from `context`, if it reads
 /// one from `context` directly.
 fn context_attr(access: &Value) -> Option<&str> {
-    let reads_context = access
-        .get("left")
-        .and_then(|left| left.get("Var"))
-        .and_then(Value::as_str)
-        == Some("context");
-    reads_context
-        .then(|| access.get("attr").and_then(Value::as_str))
-        .flatten()
+    var_attr(access)
+        .filter(|(variable, _)| *variable == "context")
+        .map(|(_, attr)| attr)
 }
 
 /// How a `NetworkConnect` policy reads `context.destination_ip`.
@@ -1943,30 +2024,30 @@ fn destination_ip_use(
 /// True if `expr` reads `context.destination_ip`, tests for it, or uses the
 /// whole `context` record, which includes it.
 fn reads_destination_ip(expr: &Value) -> bool {
-    match expr {
-        Value::Object(fields) => fields.iter().any(|(name, value)| {
-            // A variable reference; a record key named `Var` holds an
-            // expression instead, which is inspected below.
-            if name == "Var"
-                && let Some(variable) = value.as_str()
+    visit(expr, &mut |name, value| {
+        // A variable reference; a record key named `Var` holds an
+        // expression instead, which is inspected below.
+        if name == "Var"
+            && let Some(variable) = value.as_str()
+        {
+            return if variable == "context" {
+                Step::Stop(())
+            } else {
+                Step::Skip
+            };
+        }
+        if (name == "." || name == "has") && receiver_var(value) == Some("context") {
+            return if value.get("attr").and_then(Value::as_str)
+                == Some(context_fields::DESTINATION_IP)
             {
-                return variable == "context";
-            }
-            if (name == "." || name == "has")
-                && value
-                    .get("left")
-                    .and_then(|left| left.get("Var"))
-                    .and_then(Value::as_str)
-                    == Some("context")
-            {
-                return value.get("attr").and_then(Value::as_str)
-                    == Some(context_fields::DESTINATION_IP);
-            }
-            reads_destination_ip(value)
-        }),
-        Value::Array(values) => values.iter().any(reads_destination_ip),
-        _ => false,
-    }
+                Step::Stop(())
+            } else {
+                Step::Skip
+            };
+        }
+        Step::Descend
+    })
+    .is_some()
 }
 
 /// True if every read of `destination_ip` within `expr` lies in an `&&`
@@ -2005,13 +2086,7 @@ fn address_reads_guarded(expr: &Value) -> bool {
 
 /// True if `expr` is `context has destination_ip`.
 fn is_destination_ip_guard(expr: &Value) -> bool {
-    expr.get("has").is_some_and(|has| {
-        has.get("left")
-            .and_then(|left| left.get("Var"))
-            .and_then(Value::as_str)
-            == Some("context")
-            && has.get("attr").and_then(Value::as_str) == Some(context_fields::DESTINATION_IP)
-    })
+    expr.get("has").and_then(var_attr) == Some(("context", context_fields::DESTINATION_IP))
 }
 
 /// Collects the `ip("...")` literals of an `||` of
@@ -2034,14 +2109,8 @@ fn range_disjunction(expr: &Value, literals: &mut Vec<String>) -> bool {
     else {
         return false;
     };
-    let reads_address = address.get(".").is_some_and(|access| {
-        access
-            .get("left")
-            .and_then(|left| left.get("Var"))
-            .and_then(Value::as_str)
-            == Some("context")
-            && access.get("attr").and_then(Value::as_str) == Some(context_fields::DESTINATION_IP)
-    });
+    let reads_address =
+        address.get(".").and_then(var_attr) == Some(("context", context_fields::DESTINATION_IP));
     let literal =
         range
             .get("ip")
@@ -2253,6 +2322,18 @@ fn host_tokens(pattern: &str) -> Vec<HostToken> {
 
 /// Returns whether some host matches both host patterns, each an exact
 /// host or a host glob in policy DNS syntax.
+///
+/// This is exact, character by character, so the load-time ambiguity and
+/// conflict checks reject only selectors that can really share a host, and
+/// [`HostOverlaps`] bounds its work. `openshell_core::host_pattern`'s
+/// `host_patterns_overlap`, which YAML ambiguity checks, the prover, and the
+/// TLS-skip checks of Cedar endpoint settings use, compares label by label
+/// and may report an overlap that does not exist: it treats any two globs in
+/// one label as overlapping, so `a*.example.com` and `b*.example.com` overlap
+/// there. Overreporting is safe for those
+/// callers, which fail closed, but would reject valid Cedar policies here.
+/// `overlap_tests` checks that core's answer covers every overlap this one
+/// finds among the host shapes Cedar emits.
 pub fn host_patterns_overlap(left: &str, right: &str) -> bool {
     if !left.contains('*') && !right.contains('*') {
         return left == right;
@@ -2519,12 +2600,6 @@ fn validate_path(policy_id: &str, path: &str) -> Result<String, CedarEngineError
         return Err(invalid("must start with '/' or be '**'"));
     }
     Ok(path.to_string())
-}
-
-/// Ranks a path as the relay ranks endpoint paths when selecting one for a
-/// request: the matching path with the most characters other than `*` wins.
-fn path_specificity(path: &str) -> usize {
-    path.chars().filter(|c| *c != '*').count()
 }
 
 /// Rejects two paths of one endpoint that the relay could not order.
@@ -2967,14 +3042,7 @@ fn collect_conjuncts<'a>(expr: &'a Value, operands: &mut Vec<&'a Value>) {
 
 /// True if `expr` is `resource.<attr>`.
 fn is_resource_attr(expr: &Value, attr: &str) -> bool {
-    expr.get(".").is_some_and(|access| {
-        access
-            .get("left")
-            .and_then(|left| left.get("Var"))
-            .and_then(Value::as_str)
-            == Some("resource")
-            && access.get("attr").and_then(Value::as_str) == Some(attr)
-    })
+    expr.get(".").and_then(var_attr) == Some(("resource", attr))
 }
 
 /// Returns the operand of `resource.<attr> == <literal>`, in either order.
@@ -3294,11 +3362,7 @@ fn collect_resource_in_paths(expr: &Value, paths: &mut Vec<String>) -> bool {
     let Some(test) = expr.get("in") else {
         return false;
     };
-    let is_resource = test
-        .get("left")
-        .and_then(|left| left.get("Var"))
-        .and_then(Value::as_str)
-        == Some("resource");
+    let is_resource = receiver_var(test) == Some("resource");
     let entity = test
         .get("right")
         .and_then(|right| right.get("Value"))
@@ -3326,10 +3390,11 @@ pub fn display_id(policy: &Policy) -> String {
 #[cfg(test)]
 mod overlap_tests {
     use super::{
-        HostIndex, HostOverlaps, MAX_HOST_OVERLAP_WORK, globs_overlap, host_patterns_overlap,
-        literal_last_label,
+        HostIndex, HostOverlaps, MAX_HOST_OVERLAP_WORK, exact_host, globs_overlap, host_glob,
+        host_patterns_overlap, literal_last_label,
     };
     use crate::CedarEngineError;
+    use serde_json::{Value, json};
 
     const PATTERNS: &[&str] = &[
         "api.example.com",
@@ -3378,6 +3443,81 @@ mod overlap_tests {
                         (literal_last_label(left), literal_last_label(right))
                 {
                     assert_eq!(left_label, right_label, "{left} vs {right}");
+                }
+            }
+        }
+    }
+
+    /// More host shapes Cedar emits, beside [`PATTERNS`].
+    const EMITTED: &[&str] = &[
+        "b*.example.com",
+        "*-api.example.com",
+        "api-*.example.com",
+        "*.*.example.com",
+        "a*b*c.example.com",
+        "**.example.org",
+        "**.api.example.com",
+        "foo.*.example.com",
+        "api.example.*",
+        "*.example.*",
+        "*.com.example.com",
+    ];
+
+    /// Returns `pattern` as the elements of a delimited Cedar `like` pattern.
+    fn like_elements(pattern: &str) -> Vec<Value> {
+        let mut elements = Vec::new();
+        let mut literal = String::new();
+        let mut chars = pattern.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c != '*' {
+                literal.push(c);
+                continue;
+            }
+            if !literal.is_empty() {
+                elements.push(json!({ "Literal": std::mem::take(&mut literal) }));
+            }
+            elements.push(json!(if chars.next_if_eq(&'*').is_some() {
+                "MultiWildcard"
+            } else {
+                "Wildcard"
+            }));
+        }
+        if !literal.is_empty() {
+            elements.push(json!({ "Literal": literal }));
+        }
+        elements
+    }
+
+    /// Returns whether analysis can key an endpoint by `pattern`: an exact
+    /// host, or a host glob `host_glob` emits as written.
+    fn cedar_emits(pattern: &str) -> bool {
+        if pattern.contains('*') {
+            host_glob(&like_elements(pattern)).as_deref() == Some(pattern)
+        } else {
+            exact_host(pattern).is_some()
+        }
+    }
+
+    #[test]
+    fn core_overlap_covers_every_overlap_among_the_hosts_cedar_emits() {
+        let hosts: Vec<&str> = PATTERNS
+            .iter()
+            .chain(EMITTED)
+            .copied()
+            .filter(|pattern| cedar_emits(pattern))
+            .collect();
+        assert!(
+            EMITTED.iter().all(|pattern| hosts.contains(pattern)),
+            "{hosts:?}"
+        );
+        for left in &hosts {
+            for right in &hosts {
+                if host_patterns_overlap(left, right) {
+                    assert_eq!(
+                        openshell_core::host_pattern::host_patterns_overlap(left, right),
+                        Ok(true),
+                        "{left} vs {right}"
+                    );
                 }
             }
         }

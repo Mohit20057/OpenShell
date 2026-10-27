@@ -23,7 +23,7 @@ use http_response::{
 use crate::l7::EndpointObserver;
 use crate::l7::http::{parse_chunk_size_line, validate_chunk_trailer_line};
 use crate::l7::provider::{BodyLength, L7Provider, L7Request, RelayOutcome};
-use crate::opa::PolicyGenerationGuard;
+use crate::policy_types::PolicyGenerationGuard;
 use aws_sigv4::http_request::SignableBody;
 use base64::Engine as _;
 use miette::{IntoDiagnostic, Result, miette};

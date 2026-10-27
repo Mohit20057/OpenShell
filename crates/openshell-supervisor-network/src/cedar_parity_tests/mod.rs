@@ -60,7 +60,8 @@ use crate::l7::L7RequestInfo;
 use crate::l7::graphql::{GraphqlOperationInfo, GraphqlRequestInfo};
 use crate::l7::jsonrpc::{JsonRpcCallInfo, JsonRpcRequestInfo, McpMethodClassification};
 use crate::l7::relay::L7EvalContext;
-use crate::opa::{EgressAuthorization, NetworkAction, NetworkInput, OpaEngine};
+use crate::opa::OpaEngine;
+use crate::policy_types::{EgressAuthorization, NetworkAction, NetworkInput};
 
 const REGO: &str = include_str!("../../data/sandbox-policy.rego");
 const BINARY: &str = "/usr/bin/curl";
@@ -673,7 +674,7 @@ impl Engines {
                     .as_deref()
                     .cloned()
                     .unwrap_or_else(|| l7_ctx(host, 443, BINARY));
-                let owners = |tunnel: miette::Result<crate::opa::TunnelPolicyEngine>| {
+                let owners = |tunnel: miette::Result<crate::policy_engine::TunnelPolicyEngine>| {
                     tunnel.and_then(|tunnel| {
                         crate::l7::relay::admitted_token_grant_owners(&tunnel, &ctx, request)
                     })
@@ -820,7 +821,7 @@ fn deny_reason_outcome(result: &miette::Result<(bool, String)>) -> String {
 /// An allowed, inspected connection ready to relay one exchange.
 struct PreparedRelay {
     configs: Vec<crate::l7::L7EndpointConfig>,
-    engine: crate::opa::TunnelPolicyEngine,
+    engine: crate::policy_engine::TunnelPolicyEngine,
     ctx: L7EvalContext,
 }
 
@@ -829,7 +830,7 @@ impl PreparedRelay {
     /// the outcome when the connection is denied or not inspected.
     fn prepare(
         authorization: miette::Result<EgressAuthorization>,
-        tunnel: impl FnOnce(u64) -> miette::Result<crate::opa::TunnelPolicyEngine>,
+        tunnel: impl FnOnce(u64) -> miette::Result<crate::policy_engine::TunnelPolicyEngine>,
         ctx: &L7EvalContext,
     ) -> Result<Self, String> {
         let authorization =
@@ -1190,7 +1191,7 @@ fn owners_outcome(result: &miette::Result<std::collections::HashSet<String>>) ->
 }
 
 fn dns_outcome(
-    snapshot: &miette::Result<crate::opa::PolicyDnsEligibilitySnapshot>,
+    snapshot: &miette::Result<crate::policy_types::PolicyDnsEligibilitySnapshot>,
     name: &str,
     port: u16,
 ) -> String {
@@ -1211,7 +1212,7 @@ fn dns_outcome(
 }
 
 fn dns_records_outcome(
-    snapshot: &miette::Result<crate::opa::PolicyDnsEligibilitySnapshot>,
+    snapshot: &miette::Result<crate::policy_types::PolicyDnsEligibilitySnapshot>,
 ) -> String {
     match snapshot {
         Ok(snapshot) => records_outcome(&snapshot.endpoints),
@@ -1221,7 +1222,7 @@ fn dns_records_outcome(
 
 /// Summarizes endpoint records as sorted `host:ports` entries, with `/tcp`
 /// for a native TCP record, joined by `;`, or `none`.
-fn records_outcome(records: &[crate::opa::MatchedEndpoint]) -> String {
+fn records_outcome(records: &[crate::policy_types::MatchedEndpoint]) -> String {
     let mut summaries: Vec<String> = records
         .iter()
         .map(|record| {
@@ -1246,7 +1247,7 @@ fn records_outcome(records: &[crate::opa::MatchedEndpoint]) -> String {
 
 fn matched_endpoints_outcome(
     result: &miette::Result<EgressAuthorization>,
-    snapshot: &miette::Result<crate::opa::PolicyDnsEligibilitySnapshot>,
+    snapshot: &miette::Result<crate::policy_types::PolicyDnsEligibilitySnapshot>,
 ) -> String {
     let authorization = match result {
         Ok(authorization) if matches!(authorization.action, NetworkAction::Allow { .. }) => {

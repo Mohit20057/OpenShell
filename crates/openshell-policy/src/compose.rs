@@ -72,10 +72,10 @@ pub fn compose_effective_policy(
     provider_layers: &[ProviderPolicyLayer],
 ) -> SandboxPolicy {
     let mut effective = source_policy.clone();
-    let rules = if effective.cedar_policy_source.is_empty() {
-        &mut effective.network_policies
-    } else {
+    let rules = if effective.is_cedar() {
         &mut effective.provider_credential_rules
+    } else {
+        &mut effective.network_policies
     };
 
     for layer in provider_layers {

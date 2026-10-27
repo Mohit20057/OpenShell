@@ -40,7 +40,7 @@ use cedar_policy::{Policy, PolicyId, PolicySet, ValidationMode, Validator};
 
 use crate::analysis::QueryKeys;
 use crate::limits::{self, SourceShape};
-use crate::{CedarEngineError, Evaluator, HttpRequestInput, Principal, QueryCombinations};
+use crate::{CedarEngineError, Evaluator, HttpRequestInput, Principal, QueryCombinations, Subject};
 
 /// Annotation naming the owner whose grant a `permit` admits.
 pub const TOKEN_GRANT_OWNER_ANNOTATION: &str = "token_grant_owner";
@@ -369,13 +369,15 @@ impl TokenGrantRules {
                 let outcome = self.evaluator.authorize(
                     &self.policies,
                     &self.evaluator.uids.http_request,
-                    &Principal {
-                        user: &request.user,
-                        group: &request.group,
+                    &Subject {
+                        principal: Principal {
+                            user: &request.user,
+                            group: &request.group,
+                        },
+                        host: &request.host,
+                        port: request.port,
+                        protocol: "",
                     },
-                    &request.host,
-                    request.port,
-                    "",
                     context.clone(),
                     Some(self.evaluator.query_entity(query.combination(index))?),
                     &|_| false,
@@ -598,10 +600,7 @@ enum Glob {
 /// one pattern with and one without it. With the `.` delimiter, Rego's
 /// rewriting of `.` into `/./` makes the two agree.
 fn translate_glob(pattern: &str, delimiter: char) -> Glob {
-    if pattern
-        .chars()
-        .any(|c| matches!(c, '[' | ']' | '{' | '}' | '\\' | '\0'))
-    {
+    if pattern.contains(MAY_FAIL_GLOB_CHARS) {
         return Glob::MayFail("character classes, alternatives, and escapes are not supported");
     }
     if pattern.contains('?') {
@@ -689,10 +688,20 @@ struct Binaries {
     permit_reasons: Vec<String>,
     forbid: Cond,
     forbid_reasons: Vec<String>,
+    /// Which sides' approximations are already reported.
+    noted: BinaryNotes,
 }
 
-/// Characters a binary glob may hold that Rego's matcher could fail to
-/// compile, which fails the YAML evaluation and so admits no owner.
+/// Whether a policy's binary approximations are reported, per side: once
+/// per policy and side.
+#[derive(Debug, Default)]
+struct BinaryNotes {
+    permit: bool,
+    forbid: bool,
+}
+
+/// Characters a glob may hold that Rego's matcher could fail to compile,
+/// which fails the YAML evaluation and so admits no owner.
 const MAY_FAIL_GLOB_CHARS: [char; 6] = ['[', ']', '{', '}', '\\', '\0'];
 
 /// Accumulates generated policies.
@@ -710,10 +719,9 @@ struct Compiler {
 
 impl Compiler {
     fn policy(&mut self, policy: &ProviderPolicy) {
-        let binaries = self.binaries(policy);
-        let mut noted = (false, false);
+        let mut binaries = self.binaries(policy);
         for (index, endpoint) in policy.endpoints.iter().enumerate() {
-            self.endpoint(policy, index, endpoint, &binaries, &mut noted);
+            self.endpoint(policy, index, endpoint, &mut binaries);
         }
     }
 
@@ -758,6 +766,7 @@ impl Compiler {
             permit_reasons: permit_scope.reasons,
             forbid,
             forbid_reasons: forbid_scope.reasons,
+            noted: BinaryNotes::default(),
         }
     }
 
@@ -788,8 +797,7 @@ impl Compiler {
         policy: &ProviderPolicy,
         index: usize,
         endpoint: &ProviderEndpoint,
-        binaries: &Binaries,
-        noted: &mut (bool, bool),
+        binaries: &mut Binaries,
     ) {
         let jsonrpc_family = matches!(endpoint.protocol.as_str(), "json-rpc" | "mcp");
         let mcp = endpoint.protocol == "mcp";
@@ -807,18 +815,18 @@ impl Compiler {
                 if rule.method.is_some() {
                     let label = format!("rules[{rule_index}]");
                     if jsonrpc_family {
-                        self.emit(&ctx, binaries, noted, Some(slot), location, &label, |s| {
+                        self.emit(&ctx, binaries, Some(slot), location, &label, |s| {
                             jsonrpc_cond(s, endpoint, rule, true)
                         });
                     } else {
-                        self.emit(&ctx, binaries, noted, Some(slot), location, &label, |s| {
+                        self.emit(&ctx, binaries, Some(slot), location, &label, |s| {
                             rest_cond(s, rule)
                         });
                     }
                 }
                 if rule.operation_type.is_some() {
                     let label = format!("rules[{rule_index}]/graphql");
-                    self.emit(&ctx, binaries, noted, Some(slot), location, &label, |s| {
+                    self.emit(&ctx, binaries, Some(slot), location, &label, |s| {
                         graphql_cond(s, rule, true)
                     });
                 }
@@ -832,7 +840,6 @@ impl Compiler {
                 self.emit(
                     &ctx,
                     binaries,
-                    noted,
                     Some(slot),
                     RuleLocation::Endpoint,
                     "mcp_allow_all_known_methods",
@@ -856,7 +863,6 @@ impl Compiler {
                 self.emit(
                     &ctx,
                     binaries,
-                    noted,
                     Some(slot),
                     RuleLocation::Endpoint,
                     "mcp_response",
@@ -865,7 +871,6 @@ impl Compiler {
                 self.emit(
                     &ctx,
                     binaries,
-                    noted,
                     Some(slot),
                     RuleLocation::Endpoint,
                     "mcp_receive_stream",
@@ -886,18 +891,18 @@ impl Compiler {
             if rule.method.is_some() {
                 let label = format!("deny_rules[{rule_index}]");
                 if jsonrpc_family {
-                    self.emit(&ctx, binaries, noted, None, location, &label, |s| {
+                    self.emit(&ctx, binaries, None, location, &label, |s| {
                         jsonrpc_cond(s, endpoint, rule, false)
                     });
                 } else {
-                    self.emit(&ctx, binaries, noted, None, location, &label, |s| {
+                    self.emit(&ctx, binaries, None, location, &label, |s| {
                         rest_cond(s, rule)
                     });
                 }
             }
             if rule.operation_type.is_some() {
                 let label = format!("deny_rules[{rule_index}]/graphql");
-                self.emit(&ctx, binaries, noted, None, location, &label, |s| {
+                self.emit(&ctx, binaries, None, location, &label, |s| {
                     graphql_cond(s, rule, false)
                 });
             }
@@ -907,7 +912,6 @@ impl Compiler {
             self.emit(
                 &ctx,
                 binaries,
-                noted,
                 None,
                 RuleLocation::ProtocolDeny,
                 "json_rpc_response",
@@ -920,7 +924,6 @@ impl Compiler {
             self.emit(
                 &ctx,
                 binaries,
-                noted,
                 None,
                 RuleLocation::ProtocolDeny,
                 "graphql_operations",
@@ -946,15 +949,10 @@ impl Compiler {
     }
 
     /// Generates one policy: a `permit` for `slot`, or a `forbid`.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "the arguments locate and annotate one generated policy"
-    )]
     fn emit(
         &mut self,
         ctx: &Ctx<'_>,
-        binaries: &Binaries,
-        noted: &mut (bool, bool),
+        binaries: &mut Binaries,
         slot: Option<usize>,
         location: RuleLocation,
         label: &str,
@@ -1005,12 +1003,12 @@ impl Compiler {
         // Binary approximations are reported once per policy and side.
         let (seen, reasons, handling) = match side {
             Side::Permit => (
-                &mut noted.0,
+                &mut binaries.noted.permit,
                 &binaries.permit_reasons,
                 Handling::PermitNarrowed,
             ),
             Side::Forbid => (
-                &mut noted.1,
+                &mut binaries.noted.forbid,
                 &binaries.forbid_reasons,
                 Handling::ForbidWidened,
             ),
@@ -1292,10 +1290,7 @@ fn fields_cond(scope: &mut Scope, patterns: &[String], allow: bool) -> Cond {
     {
         return any_field;
     }
-    if let Some(pattern) = patterns.iter().find(|p| {
-        p.chars()
-            .any(|c| matches!(c, '[' | ']' | '{' | '}' | '\\' | '\0'))
-    }) {
+    if let Some(pattern) = patterns.iter().find(|p| p.contains(MAY_FAIL_GLOB_CHARS)) {
         return scope.may_fail(format!("field glob {pattern:?} may be invalid"));
     }
     let literals: Vec<String> = patterns

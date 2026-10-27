@@ -14,7 +14,7 @@ use openshell_core::proto::{NetworkEndpoint, SandboxPolicy};
 /// Returns an error if the Cedar policy cannot be compiled or Cedar support is
 /// unavailable in this build.
 pub fn configured_mcp_endpoints(policy: &SandboxPolicy) -> Result<Vec<NetworkEndpoint>> {
-    if policy.cedar_policy_source.is_empty() {
+    if !policy.is_cedar() {
         return Ok(policy
             .network_policies
             .values()
@@ -62,14 +62,9 @@ pub fn cedar_mcp_endpoints(
         .flat_map(|rule| &rule.endpoints)
         .chain(policy.endpoint_settings.iter())
     {
-        let ports = if endpoint.ports.is_empty() {
-            vec![endpoint.port]
-        } else {
-            endpoint.ports.clone()
-        };
-        let inspected = ports
-            .into_iter()
-            .filter_map(|port| u16::try_from(port).ok())
+        let inspected = crate::selector_ports(endpoint)
+            .iter()
+            .filter_map(|port| u16::try_from(*port).ok())
             .any(|port| {
                 cedar
                     .configured_l7_endpoints()
@@ -99,7 +94,7 @@ pub fn cedar_mcp_endpoints(
                             .max_by_key(|(path, _)| {
                                 (
                                     path == &endpoint.path,
-                                    path.chars().filter(|c| *c != '*').count(),
+                                    openshell_core::endpoint_path::path_specificity(path),
                                 )
                             })
                             .is_some_and(|(_, inspection)| inspection.protocol == L7Protocol::Mcp)

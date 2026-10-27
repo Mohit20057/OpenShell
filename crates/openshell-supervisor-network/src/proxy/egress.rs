@@ -12,7 +12,7 @@
 //! drifting as more adapters are added.
 
 use super::destination::DestinationValidationPlan;
-use crate::opa::NetworkAction;
+use crate::policy_types::NetworkAction;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
@@ -41,7 +41,7 @@ pub(super) struct EndpointDecision {
     pub(super) policy_configs: Vec<crate::policy_types::EndpointConfig>,
     /// Full endpoint identities and metadata captured in the same generation.
     #[allow(dead_code, reason = "consumed when the policy DNS adapter lands")]
-    pub(super) matched_endpoints: Vec<crate::opa::MatchedEndpoint>,
+    pub(super) matched_endpoints: Vec<crate::policy_types::MatchedEndpoint>,
     /// Whether policy matched the requested hostname exactly (not by glob).
     pub(super) exact_declared_host: bool,
     /// For a Cedar sandbox, how resolved addresses are checked.
@@ -63,7 +63,9 @@ impl Default for EndpointDecision {
 }
 
 impl EndpointDecision {
-    pub(super) fn from_authorization(authorization: &crate::opa::EgressAuthorization) -> Self {
+    pub(super) fn from_authorization(
+        authorization: &crate::policy_types::EgressAuthorization,
+    ) -> Self {
         Self {
             policy_configs: authorization.endpoint_configs.clone(),
             matched_endpoints: authorization.matched_endpoints.clone(),

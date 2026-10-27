@@ -112,7 +112,7 @@ use tonic::{Code, Request, Response, Status};
 use tracing::{debug, info, warn};
 
 use super::validation::{
-    level_matches, require_cedar_policy_support, require_policy_enforceable_by_driver,
+    level_matches, require_gateway_cedar_support, require_policy_enforceable_by_driver,
     source_matches, validate_and_canonicalize_policy, validate_and_canonicalize_policy_report,
     validate_caller_annotations, validate_no_reserved_provider_policy_keys, validate_policy_safety,
     validate_static_fields_unchanged,
@@ -2514,7 +2514,7 @@ pub(super) fn skip_sandbox_with_unsupported_cedar_policy(sandbox: &Sandbox) -> b
         .spec
         .as_ref()
         .and_then(|spec| spec.policy.as_ref())
-        .is_some_and(|policy| require_cedar_policy_support(policy).is_err());
+        .is_some_and(|policy| require_gateway_cedar_support(policy).is_err());
     if unsupported {
         warn!(
             workspace = %sandbox.object_workspace(),
@@ -2913,7 +2913,7 @@ async fn handle_get_sandbox_config_inner(
     .await?;
     let config = load_sandbox_config(state, &sandbox).await?;
     if matches!(principal, Principal::Sandbox(_)) {
-        require_cedar_support(req.supports_cedar_policy, config.policy.as_ref())?;
+        require_supervisor_cedar_support(req.supports_cedar_policy, config.policy.as_ref())?;
     }
     Ok(Response::new(config))
 }
@@ -2926,12 +2926,11 @@ const CEDAR_SUPPORT_REQUIRED: &str = "Cedar policy requires a supervisor with Ce
 /// instead: an older supervisor might treat it as a usable YAML
 /// configuration. Pushed configuration delivers the refusal as a
 /// configuration that is not admitted.
-pub fn require_cedar_support(
+pub fn require_supervisor_cedar_support(
     supports_cedar_policy: bool,
     policy: Option<&ProtoSandboxPolicy>,
 ) -> Result<(), Status> {
-    if !supports_cedar_policy && policy.is_some_and(|policy| !policy.cedar_policy_source.is_empty())
-    {
+    if !supports_cedar_policy && policy.is_some_and(ProtoSandboxPolicy::is_cedar) {
         return Err(Status::unimplemented(CEDAR_SUPPORT_REQUIRED));
     }
     Ok(())
@@ -4325,7 +4324,7 @@ async fn handle_update_config_inner(
             // A global policy replaces every sandbox's policy, and a sandbox
             // cannot switch formats after it starts, so a Cedar global policy
             // would be rejected by every YAML sandbox.
-            if !new_policy.cedar_policy_source.is_empty() {
+            if new_policy.is_cedar() {
                 return Err(Status::invalid_argument(
                     "global policies must be YAML; Cedar policies can only be set per sandbox",
                 ));
@@ -4726,7 +4725,7 @@ async fn handle_update_config_inner(
         .policy
         .ok_or_else(|| Status::invalid_argument("policy is required"))?;
     clear_provider_credentialed_markers(&mut new_policy);
-    require_cedar_policy_support(&new_policy)?;
+    require_gateway_cedar_support(&new_policy)?;
     require_policy_enforceable_by_driver(state.compute.driver_enforces_policy(), &new_policy)?;
     let global_settings = load_global_settings(state.store.as_ref()).await?;
     if global_settings.settings.contains_key(POLICY_SETTING_KEY) {
@@ -7499,7 +7498,7 @@ fn parse_proto_l7_target(
 /// Rejects merge operations on a Cedar policy, which has no YAML rules to
 /// merge into.
 fn require_mergeable_policy(policy: &ProtoSandboxPolicy) -> Result<(), Status> {
-    if policy.cedar_policy_source.is_empty() {
+    if !policy.is_cedar() {
         return Ok(());
     }
     Err(Status::failed_precondition(
@@ -8241,7 +8240,7 @@ fn validate_and_canonicalize_stored_policy(
 ) -> Result<ProtoSandboxPolicy, Status> {
     // A gateway built without Cedar serves no stored Cedar policy, including
     // one a Cedar-enabled build of the gateway accepted.
-    require_cedar_policy_support(&policy).map_err(|error| {
+    require_gateway_cedar_support(&policy).map_err(|error| {
         Status::failed_precondition(format!(
             "stored policy source '{source}' is a Cedar policy: {}",
             error.message()

@@ -1050,7 +1050,7 @@ pub fn cedar_sandbox_policy(cedar_policy_source: String) -> Result<SandboxPolicy
 pub fn serialize_sandbox_policy(policy: &SandboxPolicy) -> Result<String> {
     validate_proto_version_for_authored_serialization(policy)?;
     validate_policy_enum_values(policy)?;
-    if !policy.cedar_policy_source.is_empty() {
+    if policy.is_cedar() {
         return Ok(policy.cedar_policy_source.clone());
     }
     let canonical = validate_and_canonicalize_mcp_policy_schema(policy.clone())
@@ -1080,7 +1080,7 @@ pub fn sandbox_policy_to_json_value(policy: &SandboxPolicy) -> Result<serde_json
         .map_err(|error| miette::miette!("cannot serialize invalid sandbox policy: {error}"))?;
     let json_repr = from_proto(&canonical)?;
     let json = openshell_policy_schema::policy_to_json_value(&json_repr)?;
-    if canonical.cedar_policy_source.is_empty() {
+    if !canonical.is_cedar() {
         return Ok(json);
     }
     let mut cedar = serde_json::json!({
@@ -1161,13 +1161,8 @@ pub fn provider_credentialed_endpoints(policy: &SandboxPolicy) -> Vec<String> {
         .flat_map(|rule| &rule.endpoints)
         .filter(|endpoint| endpoint.provider_credentialed)
         .flat_map(|endpoint| {
-            let ports = if endpoint.ports.is_empty() {
-                vec![endpoint.port]
-            } else {
-                endpoint.ports.clone()
-            };
-            ports
-                .into_iter()
+            selector_ports(endpoint)
+                .iter()
                 .map(move |port| format!("{}:{port}{}", endpoint.host, endpoint.path))
         })
         .collect();
@@ -1322,14 +1317,14 @@ pub fn apply_middleware_file(policy: &mut SandboxPolicy, path: &Path) -> Result<
         ));
     }
     let file = parse_middleware_file(path)?;
-    if !file.endpoint_settings.is_empty() && policy.cedar_policy_source.is_empty() {
+    if !file.endpoint_settings.is_empty() && !policy.is_cedar() {
         return Err(miette::miette!(
             "invalid middleware file {}: {}",
             path.display(),
             PolicyViolation::EndpointSettingsRequireCedar
         ));
     }
-    if file.process.is_some() && policy.cedar_policy_source.is_empty() {
+    if file.process.is_some() && !policy.is_cedar() {
         return Err(miette::miette!(
             "invalid middleware file {}: process applies only to Cedar policies; a YAML policy \
              sets its process section itself",
@@ -1849,11 +1844,8 @@ impl fmt::Display for PolicyViolation {
 pub fn validate_sandbox_policy(
     policy: &SandboxPolicy,
 ) -> std::result::Result<(), Vec<PolicyViolation>> {
-    validate_sandbox_policy_with_mcp_presence(
-        policy,
-        McpVersionPresence::RequireMaterialized,
-        &mut Vec::new(),
-    )
+    validate_sandbox_policy_with_mcp_presence(policy, McpVersionPresence::RequireMaterialized)
+        .map(drop)
 }
 
 /// Validate filesystem paths shared by typed policies and raw OPA data.
@@ -1918,7 +1910,7 @@ enum McpVersionPresence {
 }
 
 /// Validates `policy.cedar_policy_source`, when non-empty, returning its
-/// load-time warnings.
+/// load-time warnings and loaded engine.
 ///
 /// Checks mutual exclusivity with `network_policies`, that the Cedar engine
 /// accepts the policy (parse, strict schema validation, and supported
@@ -1929,9 +1921,9 @@ enum McpVersionPresence {
 fn validate_cedar_policy_source(
     policy: &SandboxPolicy,
     violations: &mut Vec<PolicyViolation>,
-) -> Vec<String> {
-    if policy.cedar_policy_source.is_empty() {
-        return Vec::new();
+) -> ValidationOutput {
+    if !policy.is_cedar() {
+        return ValidationOutput::default();
     }
     if !policy.network_policies.is_empty() {
         violations.push(PolicyViolation::CedarMutuallyExclusiveWithNetworkPolicies);
@@ -1956,12 +1948,25 @@ fn validate_cedar_policy_source(
             &policy.endpoint_settings,
             violations,
         )
+        .map_or_else(ValidationOutput::default, |engine| ValidationOutput {
+            warnings: engine.warnings().iter().map(ToString::to_string).collect(),
+            cedar: Some(std::sync::Arc::new(engine)),
+        })
     }
     #[cfg(not(feature = "cedar"))]
     {
         violations.push(PolicyViolation::CedarUnsupported);
-        Vec::new()
+        ValidationOutput::default()
     }
+}
+
+/// What one validation pass derives from a policy besides its violations.
+#[derive(Default)]
+struct ValidationOutput {
+    warnings: Vec<String>,
+    /// The engine loaded from `cedar_policy_source`, when it loads.
+    #[cfg(feature = "cedar")]
+    cedar: Option<std::sync::Arc<openshell_policy_cedar::CedarEngine>>,
 }
 
 /// The filesystem access a policy grants, whatever its policy language.
@@ -1989,7 +1994,7 @@ pub struct EffectiveFilesystem {
 pub fn effective_filesystem(
     policy: &SandboxPolicy,
 ) -> std::result::Result<EffectiveFilesystem, PolicyViolation> {
-    if policy.cedar_policy_source.is_empty() {
+    if !policy.is_cedar() {
         return Ok(EffectiveFilesystem {
             filesystem: policy.filesystem.clone(),
             needs_proxy_baseline: false,
@@ -2006,12 +2011,11 @@ pub fn effective_filesystem(
 fn validate_sandbox_policy_with_mcp_presence(
     policy: &SandboxPolicy,
     mcp_version_presence: McpVersionPresence,
-    warnings: &mut Vec<String>,
-) -> std::result::Result<(), Vec<PolicyViolation>> {
+) -> std::result::Result<ValidationOutput, Vec<PolicyViolation>> {
     let mut violations = Vec::new();
 
-    warnings.extend(validate_cedar_policy_source(policy, &mut violations));
-    if !policy.endpoint_settings.is_empty() && policy.cedar_policy_source.is_empty() {
+    let output = validate_cedar_policy_source(policy, &mut violations);
+    if !policy.endpoint_settings.is_empty() && !policy.is_cedar() {
         violations.push(PolicyViolation::EndpointSettingsRequireCedar);
     }
     violations.extend(validate_endpoint_settings(&policy.endpoint_settings));
@@ -2264,7 +2268,7 @@ fn validate_sandbox_policy_with_mcp_presence(
     violations.extend(middleware::validate(policy));
 
     if violations.is_empty() {
-        Ok(())
+        Ok(output)
     } else {
         Err(violations)
     }
@@ -2439,8 +2443,21 @@ fn endpoint_setting_rejected_fields(
         .collect()
 }
 
-/// Returns the ports an endpoint selector covers.
-fn effective_endpoint_ports(endpoint: &NetworkEndpoint) -> Vec<u32> {
+/// Returns the ports an endpoint selector lists, as written: `ports`, or else
+/// the singular `port`, even when it is unset (0).
+#[must_use]
+pub fn selector_ports(endpoint: &NetworkEndpoint) -> &[u32] {
+    if endpoint.ports.is_empty() {
+        std::slice::from_ref(&endpoint.port)
+    } else {
+        &endpoint.ports
+    }
+}
+
+/// Returns the ports an endpoint selector covers: [`selector_ports`]
+/// without an unset singular `port`.
+#[must_use]
+pub fn effective_endpoint_ports(endpoint: &NetworkEndpoint) -> Vec<u32> {
     if endpoint.ports.is_empty() {
         (endpoint.port != 0)
             .then_some(endpoint.port)
@@ -2784,7 +2801,7 @@ pub fn validate_and_canonicalize_sandbox_policy(
 }
 
 /// A policy accepted by [`validate_and_canonicalize_sandbox_policy_report`].
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct ValidatedPolicy {
     /// The canonical policy, safe to hash and persist.
     pub policy: SandboxPolicy,
@@ -2793,6 +2810,11 @@ pub struct ValidatedPolicy {
     /// enforced policies of the same `host:port`. They never change
     /// enforcement.
     pub warnings: Vec<String>,
+    /// The engine validation loaded from `cedar_policy_source`, so callers
+    /// need not load the policy again; `None` for a YAML policy.
+    /// Canonicalization does not change the Cedar text.
+    #[cfg(feature = "cedar")]
+    pub cedar: Option<std::sync::Arc<openshell_policy_cedar::CedarEngine>>,
 }
 
 /// Like [`validate_and_canonicalize_sandbox_policy`], also returning the
@@ -2800,20 +2822,21 @@ pub struct ValidatedPolicy {
 pub fn validate_and_canonicalize_sandbox_policy_report(
     mut policy: SandboxPolicy,
 ) -> std::result::Result<ValidatedPolicy, PolicyValidationError> {
-    let mut warnings = Vec::new();
-    validate_sandbox_policy_with_mcp_presence(
-        &policy,
-        McpVersionPresence::AllowDefaultable,
-        &mut warnings,
-    )
-    .map_err(|violations| PolicyValidationError { violations })?;
+    let output =
+        validate_sandbox_policy_with_mcp_presence(&policy, McpVersionPresence::AllowDefaultable)
+            .map_err(|violations| PolicyValidationError { violations })?;
     materialize_default_mcp_versions(&mut policy);
     canonicalize_mcp_version_allowlists(&mut policy);
     debug_assert!(
         validate_sandbox_policy(&policy).is_ok(),
         "validated MCP canonicalization must preserve every policy invariant"
     );
-    Ok(ValidatedPolicy { policy, warnings })
+    Ok(ValidatedPolicy {
+        policy,
+        warnings: output.warnings,
+        #[cfg(feature = "cedar")]
+        cedar: output.cedar,
+    })
 }
 
 /// Replace absent protobuf MCP options and empty revision lists with the

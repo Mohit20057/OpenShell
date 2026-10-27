@@ -359,7 +359,7 @@ network_policies:
 "#,
     )
     .unwrap();
-    let input = |binary_path: PathBuf| crate::opa::NetworkInput {
+    let input = |binary_path: PathBuf| crate::policy_types::NetworkInput {
         host: "target.example".to_string(),
         port: 443,
         binary_path,

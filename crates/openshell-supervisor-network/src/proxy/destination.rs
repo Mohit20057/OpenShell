@@ -771,7 +771,7 @@ mod tests {
         let engine = crate::cedar_only::CedarOnlyEngine::from_policy_str(policy)
             .expect("Cedar policy loads");
         engine
-            .authorize_egress(&crate::opa::NetworkInput {
+            .authorize_egress(&crate::policy_types::NetworkInput {
                 host: host.to_string(),
                 port,
                 binary_path: "/usr/bin/curl".into(),
@@ -1034,7 +1034,7 @@ permit (principal, action == Sandbox::Action::"NetworkConnect",
         );
         crate::cedar_only::CedarOnlyEngine::from_proto(&proto)
             .expect("Cedar policy loads")
-            .authorize_egress(&crate::opa::NetworkInput {
+            .authorize_egress(&crate::policy_types::NetworkInput {
                 host: host.to_string(),
                 port,
                 binary_path: "/usr/bin/curl".into(),

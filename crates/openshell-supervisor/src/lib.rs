@@ -2979,8 +2979,8 @@ async fn load_policy_with_gateway(
             // A Cedar-authored policy's Landlock grants come from the Cedar
             // text, not `filesystem`, so its baseline paths are added after
             // extraction in `prepare_startup_configuration` instead.
-            let enriched = proto_policy.cedar_policy_source.is_empty()
-                && enrich_proto_baseline_paths(&mut proto_policy);
+            let enriched =
+                !proto_policy.is_cedar() && enrich_proto_baseline_paths(&mut proto_policy);
             let sync_policy = proto_sync_payload_for_enriched_policy(&proto_policy, enriched)
                 .filter(|_| snapshot.policy_source == openshell_core::proto::PolicySource::Sandbox);
             if let Some(sync_policy) = sync_policy {
@@ -3278,18 +3278,18 @@ fn prepare_startup_configuration(
             "Provider environment revision changed during configuration preparation"
         ));
     }
-    if !SUPPORTS_CEDAR_POLICY && !policy.cedar_policy_source.is_empty() {
-        return Err(miette::miette!(
-            "Cedar policy support is not enabled in this supervisor build"
-        ));
-    }
     // The policy's format selects its engine, which validates the policy as
     // it builds, as a reload validates while staging. A Cedar policy builds
-    // no OPA engine (see `openshell_supervisor_network::policy_engine`).
+    // no OPA engine (see `openshell_supervisor_network::policy_engine`), and
+    // a build without Cedar support rejects it here.
     let engine = PolicyEngine::from_proto(policy)?;
     let mut process_policy = SandboxPolicy::try_from(policy.clone())?;
-    let filesystem = openshell_policy::effective_filesystem(policy)
-        .map_err(|violation| miette::miette!("{violation}"))?;
+    let filesystem = match &engine {
+        // The engine just loaded this policy; its grants need no second load.
+        PolicyEngine::Cedar(cedar) => cedar.effective_filesystem()?,
+        PolicyEngine::Opa(_) => openshell_policy::effective_filesystem(policy)
+            .map_err(|violation| miette::miette!("{violation}"))?,
+    };
     process_policy.filesystem = filesystem.filesystem.map(Into::into).unwrap_or_default();
     // Same baseline a YAML policy gets, under the same condition: YAML adds
     // it to its own `filesystem` section only when the policy has network
@@ -3571,8 +3571,8 @@ async fn reload_gateway_configuration_runtime(
             miette::miette!("runtime reload requires a policy payload but none was returned"),
         ));
     };
-    match (engine, policy.cedar_policy_source.is_empty()) {
-        (PolicyEngine::Cedar(_), true) => {
+    match (engine, policy.is_cedar()) {
+        (PolicyEngine::Cedar(_), false) => {
             return Err(GatewayRuntimeReloadError::PolicyValidation(
                 miette::miette!(
                     "candidate policy is YAML, but this sandbox enforces a Cedar policy; \
@@ -3580,7 +3580,7 @@ async fn reload_gateway_configuration_runtime(
                 ),
             ));
         }
-        (PolicyEngine::Opa(_), false) => {
+        (PolicyEngine::Opa(_), true) => {
             return Err(GatewayRuntimeReloadError::PolicyValidation(
                 miette::miette!(
                     "candidate policy is Cedar, but this sandbox enforces a YAML policy; \
@@ -6688,7 +6688,7 @@ network_policies:
         allowed_host: &str,
         generation: u64,
     ) {
-        use openshell_supervisor_network::opa::{NetworkAction, NetworkInput};
+        use openshell_supervisor_network::policy_types::{NetworkAction, NetworkInput};
 
         assert_eq!(engine.current_generation(), generation);
         for host in ["allowed.example.com", "repaired.example.com"] {
@@ -6801,7 +6801,7 @@ network_policies:
 
     #[tokio::test]
     async fn local_file_startup_normalizes_matchers_and_rejects_malformed_policy() {
-        use openshell_supervisor_network::opa::NetworkInput;
+        use openshell_supervisor_network::policy_types::NetworkInput;
 
         let files = tempfile::tempdir().expect("policy directory");
         let rules_path = files.path().join("policy.rego");
@@ -7294,7 +7294,7 @@ permit (principal, action == Sandbox::Action::"NetworkConnect",
     #[test]
     fn policy_rejection_quarantines_the_cedar_engine_of_a_cedar_sandbox() {
         let cedar = cedar_engine();
-        let input = openshell_supervisor_network::opa::NetworkInput {
+        let input = openshell_supervisor_network::policy_types::NetworkInput {
             host: "pypi.org".to_string(),
             port: 443,
             binary_path: std::path::PathBuf::from("/usr/bin/curl"),
@@ -7304,7 +7304,7 @@ permit (principal, action == Sandbox::Action::"NetworkConnect",
         };
         assert!(matches!(
             cedar.authorize_egress(&input).unwrap().action,
-            openshell_supervisor_network::opa::NetworkAction::Allow { .. }
+            openshell_supervisor_network::policy_types::NetworkAction::Allow { .. }
         ));
 
         let disposition = apply_gateway_runtime_reload_failure(
@@ -7323,7 +7323,7 @@ permit (principal, action == Sandbox::Action::"NetworkConnect",
         assert!(cedar.fail_closed_reason().is_some());
         assert!(matches!(
             cedar.authorize_egress(&input).unwrap().action,
-            openshell_supervisor_network::opa::NetworkAction::Deny { .. }
+            openshell_supervisor_network::policy_types::NetworkAction::Deny { .. }
         ));
         assert!(cedar.policy_dns_eligibility_snapshot().unwrap().fail_closed);
     }

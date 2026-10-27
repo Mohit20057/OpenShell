@@ -27,7 +27,7 @@ use super::{DeliveryDisposition, MAX_SUPERVISOR_CONFIG_MESSAGE_BYTES, Supervisor
 use crate::ServerState;
 use crate::grpc::policy::{
     build_provider_environment_snapshot_from_inputs, build_sandbox_config_snapshot_from_inputs,
-    is_configuration_rejection, load_sandbox_config_inputs, require_cedar_support,
+    is_configuration_rejection, load_sandbox_config_inputs, require_supervisor_cedar_support,
     unadmitted_sandbox_config,
 };
 use crate::persistence::ObjectId;
@@ -930,7 +930,7 @@ async fn build_config_bootstrap(
             Err(error) => return Err(error),
         };
         if let Err(error) =
-            require_cedar_support(supports_cedar_policy, sandbox_config.policy.as_ref())
+            require_supervisor_cedar_support(supports_cedar_policy, sandbox_config.policy.as_ref())
         {
             return Ok(rejected(error));
         }

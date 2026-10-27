@@ -69,7 +69,7 @@ use super::provider::{
     get_provider_record, is_valid_env_key, validate_provider_environment_keys_unique_with_catalog,
 };
 use super::validation::{
-    level_matches, require_cedar_policy_support, require_policy_enforceable_by_driver,
+    level_matches, require_gateway_cedar_support, require_policy_enforceable_by_driver,
     source_matches, validate_and_canonicalize_policy_report, validate_dns1123_label,
     validate_exec_request_fields, validate_no_reserved_provider_policy_keys,
     validate_policy_safety, validate_sandbox_governance_spec, validate_sandbox_spec,
@@ -1826,7 +1826,7 @@ async fn handle_start_sandbox_inner(
     )
     .await?;
     if let Some(policy) = resolved.spec.as_ref().and_then(|spec| spec.policy.as_ref()) {
-        require_cedar_policy_support(policy)?;
+        require_gateway_cedar_support(policy)?;
         require_policy_enforceable_by_driver(state.compute.driver_enforces_policy(), policy)?;
     }
     let workspace = resolved.object_workspace().to_string();
@@ -1928,7 +1928,7 @@ async fn handle_resume_sandbox_inner(
     )
     .await?;
     if let Some(policy) = resolved.spec.as_ref().and_then(|spec| spec.policy.as_ref()) {
-        require_cedar_policy_support(policy)?;
+        require_gateway_cedar_support(policy)?;
         require_policy_enforceable_by_driver(state.compute.driver_enforces_policy(), policy)?;
     }
     let workspace = resolved.object_workspace().to_string();

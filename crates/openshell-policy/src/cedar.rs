@@ -32,13 +32,15 @@ fn load(cedar_policy_source: &str) -> std::result::Result<CedarEngine, PolicyVio
 
 /// Checks that the Cedar engine accepts `cedar_policy_source`, that its
 /// Landlock grants pass the same path checks as YAML `filesystem` paths, and
-/// that no `endpoint_settings` entry skips TLS on an endpoint it inspects,
-/// returning its load-time warnings.
+/// that no `endpoint_settings` entry skips TLS on an endpoint it inspects.
+///
+/// Returns the loaded engine, whose warnings are the policy's load-time
+/// warnings, so callers need not load the policy again.
 pub(crate) fn validate(
     cedar_policy_source: &str,
     endpoint_settings: &[NetworkEndpoint],
     violations: &mut Vec<PolicyViolation>,
-) -> Vec<String> {
+) -> Option<CedarEngine> {
     match load(cedar_policy_source) {
         Ok(engine) => {
             let grants = engine.filesystem_grants();
@@ -48,18 +50,18 @@ pub(crate) fn validate(
                 violations.extend(errors);
             }
             violations.extend(tls_skip_on_inspected_endpoints(&engine, endpoint_settings));
-            engine.warnings().iter().map(ToString::to_string).collect()
+            Some(engine)
         }
         Err(violation) => {
             violations.push(violation);
-            Vec::new()
+            None
         }
     }
 }
 
 /// Rejects `endpoint_settings` entries with `tls: skip` that select an
-/// endpoint `HttpRequest` policies inspect: the proxy relays a skipped
-/// connection without terminating TLS, so those policies would never run.
+/// endpoint `HttpRequest` policies inspect (see
+/// [`tls_skip_inspected_endpoint`]).
 fn tls_skip_on_inspected_endpoints(
     engine: &CedarEngine,
     endpoint_settings: &[NetworkEndpoint],
@@ -67,17 +69,10 @@ fn tls_skip_on_inspected_endpoints(
     endpoint_settings
         .iter()
         .enumerate()
-        .filter(|(_, setting)| setting.tls == NetworkTlsMode::Skip as i32)
         .filter_map(|(index, setting)| {
-            let ports = crate::effective_endpoint_ports(setting);
-            let (host, port, _, _) =
-                engine.configured_l7_endpoints().find(|(host, port, ..)| {
-                    ports.contains(&u32::from(*port))
-                    // An unparseable host is rejected elsewhere; count it as
-                    // overlapping so the check fails closed.
-                    && openshell_core::host_pattern::host_patterns_overlap(&setting.host, host)
-                        .unwrap_or(true)
-                })?;
+            // An unparseable host is rejected elsewhere; count it as
+            // overlapping so the check fails closed.
+            let (host, port) = tls_skip_inspected_endpoint(engine, setting, true)?;
             Some(PolicyViolation::InvalidEndpointSetting {
                 index,
                 host: setting.host.clone(),
@@ -91,22 +86,76 @@ fn tls_skip_on_inspected_endpoints(
         .collect()
 }
 
+/// Returns the first inspected `host:port` that `endpoint` selects when it
+/// sets `tls: skip`.
+///
+/// The proxy relays a skipped connection without terminating TLS, so the
+/// `HttpRequest` policies inspecting it would never run.
+///
+/// `unparseable_host_selects` decides an endpoint host the host matcher
+/// rejects: `true` fails closed for a check that rejects the endpoint, and
+/// `false` leaves out an endpoint, such as a host-less provider endpoint,
+/// that can select no inspected connection.
+#[must_use]
+pub fn tls_skip_inspected_endpoint(
+    engine: &CedarEngine,
+    endpoint: &NetworkEndpoint,
+    unparseable_host_selects: bool,
+) -> Option<(String, u16)> {
+    if endpoint.tls != NetworkTlsMode::Skip as i32 {
+        return None;
+    }
+    let ports = crate::effective_endpoint_ports(endpoint);
+    engine
+        .configured_l7_endpoints()
+        .find(|(host, port, ..)| {
+            ports.contains(&u32::from(*port))
+                && openshell_core::host_pattern::host_patterns_overlap(&endpoint.host, host)
+                    .unwrap_or(unparseable_host_selects)
+        })
+        .map(|(host, port, _, _)| (host, port))
+}
+
 /// The Landlock grants a Cedar policy authorizes. A Cedar policy has no
 /// `include_workdir`, and needs the supervisor's proxy baseline paths when it
 /// can permit `NetworkConnect`.
 pub(crate) fn effective_filesystem(
     cedar_policy_source: &str,
 ) -> std::result::Result<EffectiveFilesystem, PolicyViolation> {
-    let engine = load(cedar_policy_source)?;
+    Ok(engine_filesystem(&load(cedar_policy_source)?))
+}
+
+/// The Landlock grants of a loaded Cedar policy; see
+/// [`crate::effective_filesystem`].
+#[must_use]
+pub fn engine_filesystem(engine: &CedarEngine) -> EffectiveFilesystem {
     let grants = engine.filesystem_grants();
-    Ok(EffectiveFilesystem {
+    EffectiveFilesystem {
         filesystem: Some(FilesystemPolicy {
             include_workdir: false,
             read_only: grants.read_only.clone(),
             read_write: grants.read_write.clone(),
         }),
         needs_proxy_baseline: engine.has_network_permits(),
-    })
+    }
+}
+
+/// The proxy's protocol for an endpoint Cedar inspects with `protocol`.
+///
+/// `websocket-graphql` is a `websocket` endpoint; whether the relay applies
+/// GraphQL message policy is carried separately (see
+/// [`openshell_policy_cedar::L7Protocol::websocket_graphql_messages`]).
+impl From<openshell_policy_cedar::L7Protocol> for crate::L7Protocol {
+    fn from(protocol: openshell_policy_cedar::L7Protocol) -> Self {
+        use openshell_policy_cedar::L7Protocol as Cedar;
+        match protocol {
+            Cedar::Rest => Self::Rest,
+            Cedar::JsonRpc => Self::JsonRpc,
+            Cedar::Mcp => Self::Mcp,
+            Cedar::Graphql => Self::Graphql,
+            Cedar::Websocket | Cedar::WebsocketGraphql => Self::Websocket,
+        }
+    }
 }
 
 /// Validates the provider credential rules of a Cedar sandbox as a YAML
@@ -268,4 +317,39 @@ fn value_matchers(matchers: &Value) -> BTreeMap<String, ValueMatcher> {
             (key.clone(), ValueMatcher { globs })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::L7Protocol;
+    use openshell_policy_cedar::L7Protocol as Cedar;
+
+    #[test]
+    fn every_cedar_protocol_converts_to_the_config_protocol_of_its_label() {
+        // Fails to compile when a protocol is added, so it gets a row below.
+        let _ = |protocol: Cedar| match protocol {
+            Cedar::Rest
+            | Cedar::JsonRpc
+            | Cedar::Mcp
+            | Cedar::Graphql
+            | Cedar::Websocket
+            | Cedar::WebsocketGraphql => {}
+        };
+        for (cedar, expected) in [
+            (Cedar::Rest, L7Protocol::Rest),
+            (Cedar::JsonRpc, L7Protocol::JsonRpc),
+            (Cedar::Mcp, L7Protocol::Mcp),
+            (Cedar::Graphql, L7Protocol::Graphql),
+            (Cedar::Websocket, L7Protocol::Websocket),
+            (Cedar::WebsocketGraphql, L7Protocol::Websocket),
+        ] {
+            assert_eq!(L7Protocol::from(cedar), expected, "{cedar}");
+            // The same protocol the proxy's config parser reads from the label.
+            assert_eq!(
+                L7Protocol::parse(cedar.config_label()),
+                Some(expected),
+                "{cedar}"
+            );
+        }
+    }
 }

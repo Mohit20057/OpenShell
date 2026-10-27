@@ -141,7 +141,7 @@ impl OpenShellClient {
         &self,
         policy: Option<&proto::SandboxPolicy>,
     ) -> Result<()> {
-        if policy.is_some_and(|policy| !policy.cedar_policy_source.is_empty()) {
+        if policy.is_some_and(proto::SandboxPolicy::is_cedar) {
             let info = self
                 .unary(|mut grpc| async move { grpc.health(proto::HealthRequest {}).await })
                 .await?;

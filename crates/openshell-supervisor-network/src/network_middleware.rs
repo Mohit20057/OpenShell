@@ -156,20 +156,6 @@ impl std::fmt::Debug for MiddlewareState {
 }
 
 impl MiddlewareState {
-    #[cfg(feature = "cedar")]
-    /// Starts at generation 0 with `configs` and no connected services.
-    pub fn new(configs: MiddlewareConfigs) -> Self {
-        let (generation_tx, _) = watch::channel(0);
-        Self {
-            active: RwLock::new(ActiveMiddleware {
-                configs,
-                runner: ChainRunner::default(),
-            }),
-            generation: Arc::new(AtomicU64::new(0)),
-            generation_tx,
-        }
-    }
-
     fn read(&self) -> Result<std::sync::RwLockReadGuard<'_, ActiveMiddleware>> {
         self.active
             .read()
@@ -249,8 +235,25 @@ impl MiddlewareState {
         self.advance_generation();
         Ok(())
     }
+}
 
-    #[cfg(feature = "cedar")]
+/// Construction and commits. Only the Cedar engine owns a middleware state,
+/// so a build without Cedar never creates or changes one.
+#[cfg(feature = "cedar")]
+impl MiddlewareState {
+    /// Starts at generation 0 with `configs` and no connected services.
+    pub fn new(configs: MiddlewareConfigs) -> Self {
+        let (generation_tx, _) = watch::channel(0);
+        Self {
+            active: RwLock::new(ActiveMiddleware {
+                configs,
+                runner: ChainRunner::default(),
+            }),
+            generation: Arc::new(AtomicU64::new(0)),
+            generation_tx,
+        }
+    }
+
     /// Activates `configs`, and `registry` when given, as a new generation.
     ///
     /// `prepare` runs under the write lock before the generation advances;
@@ -284,7 +287,6 @@ impl MiddlewareState {
         self.generation_guard(generation)
     }
 
-    #[cfg(feature = "cedar")]
     /// Applies a configuration change that keeps the middleware itself.
     ///
     /// `change` runs under the write lock and returns whether the

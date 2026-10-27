@@ -354,7 +354,7 @@ struct EligibleEndpoint {
 }
 
 fn eligible_endpoints(
-    endpoints: &[crate::opa::MatchedEndpoint],
+    endpoints: &[crate::policy_types::MatchedEndpoint],
     name: &NormalizedName,
     trusted_host_gateway: Option<std::net::IpAddr>,
 ) -> Result<Vec<EligibleEndpoint>, PolicyDnsError> {

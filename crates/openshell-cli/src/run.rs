@@ -1552,7 +1552,7 @@ async fn require_cedar_gateway_support(
     client: &mut crate::tls::GrpcClient,
     policy: Option<&SandboxPolicy>,
 ) -> Result<()> {
-    if policy.is_some_and(|policy| !policy.cedar_policy_source.is_empty()) {
+    if policy.is_some_and(SandboxPolicy::is_cedar) {
         let info = client
             .health(openshell_core::proto::HealthRequest {})
             .await
@@ -1579,7 +1579,7 @@ async fn require_cedar_gateway_support(
 fn render_policy_text(policy: &SandboxPolicy) -> Result<String> {
     let mut text = openshell_policy::serialize_sandbox_policy(policy)
         .wrap_err("failed to serialize policy")?;
-    if policy.cedar_policy_source.is_empty() {
+    if !policy.is_cedar() {
         return Ok(text);
     }
     if let Some(middleware) = openshell_policy::serialize_network_middlewares(policy)
@@ -6040,11 +6040,7 @@ pub async fn sandbox_policy_update(
             "policy is managed globally; delete the global policy before using `openshell policy update`"
         ));
     }
-    if current
-        .policy
-        .as_ref()
-        .is_some_and(|policy| !policy.cedar_policy_source.is_empty())
-    {
+    if current.policy.as_ref().is_some_and(SandboxPolicy::is_cedar) {
         return Err(miette!(
             "incremental policy updates are not available for Cedar policies; edit the Cedar \
              policy and replace it with `openshell policy set`"

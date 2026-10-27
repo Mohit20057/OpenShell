@@ -10,7 +10,8 @@
 
 use super::*;
 use crate::l7::token_grant_injection::{TokenGrantRequest, TokenGrantResolver};
-use crate::opa::{NetworkInput, OpaEngine};
+use crate::opa::OpaEngine;
+use crate::policy_types::NetworkInput;
 use crate::token_grant::test_support::{CacheAcquisition, CachedTokenGrantResolver};
 use openshell_core::proto::{
     ProviderCredentialTokenGrant, ProviderCredentialTokenGrantType, ProviderProfileCredential,

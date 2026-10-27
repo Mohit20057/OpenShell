@@ -3707,7 +3707,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::opa::{NetworkInput, OpaEngine};
+    use crate::opa::OpaEngine;
+    use crate::policy_types::NetworkInput;
     use openshell_core::proto::{StaticCredentialBinding, StaticCredentialEndpointBinding};
     use openshell_core::provider_credentials::ProviderCredentialState;
     use openshell_core::token_grant_failure::{

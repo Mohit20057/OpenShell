@@ -1021,8 +1021,8 @@ pub(super) const SUPPORTS_CEDAR_POLICY: bool = cfg!(feature = "cedar");
 /// Keyed to this crate's own feature, so the gateway rejects exactly what its
 /// health response says it cannot handle, whatever features other crates in
 /// the same build enable.
-pub(super) fn require_cedar_policy_support(policy: &ProtoSandboxPolicy) -> Result<(), Status> {
-    if !SUPPORTS_CEDAR_POLICY && !policy.cedar_policy_source.is_empty() {
+pub(super) fn require_gateway_cedar_support(policy: &ProtoSandboxPolicy) -> Result<(), Status> {
+    if !SUPPORTS_CEDAR_POLICY && policy.is_cedar() {
         return Err(Status::failed_precondition(
             "this gateway was built without Cedar policy support; Cedar policies require a \
              development build of the gateway and supervisor",
@@ -1038,7 +1038,7 @@ pub(super) fn require_policy_enforceable_by_driver(
     driver_enforces_policy: bool,
     policy: &ProtoSandboxPolicy,
 ) -> Result<(), Status> {
-    if driver_enforces_policy && !policy.cedar_policy_source.is_empty() {
+    if driver_enforces_policy && policy.is_cedar() {
         return Err(Status::failed_precondition(
             "the compute driver enforces sandbox policy itself and cannot enforce Cedar \
              policies; use a compute driver whose sandboxes run the OpenShell supervisor",
@@ -1052,7 +1052,7 @@ pub(super) fn require_policy_enforceable_by_driver(
 /// Delegates to [`openshell_policy::validate_sandbox_policy`] and converts
 /// violations into a gRPC `INVALID_ARGUMENT` status.
 pub(super) fn validate_policy_safety(policy: &ProtoSandboxPolicy) -> Result<(), Status> {
-    require_cedar_policy_support(policy)?;
+    require_gateway_cedar_support(policy)?;
     if let Err(violations) = openshell_policy::validate_sandbox_policy(policy) {
         let messages: Vec<String> = violations.iter().map(ToString::to_string).collect();
         return Err(Status::invalid_argument(format!(
@@ -1079,7 +1079,7 @@ pub(super) fn validate_and_canonicalize_policy(
 pub(super) fn validate_and_canonicalize_policy_report(
     policy: ProtoSandboxPolicy,
 ) -> Result<openshell_policy::ValidatedPolicy, Status> {
-    require_cedar_policy_support(&policy)?;
+    require_gateway_cedar_support(&policy)?;
     openshell_policy::validate_and_canonicalize_sandbox_policy_report(policy).map_err(|error| {
         Status::invalid_argument(format!("policy contains unsafe content: {error}"))
     })
@@ -1120,7 +1120,7 @@ pub(super) fn validate_static_fields_unchanged(
     // formats via update would leave the originally-chosen engine stale
     // (silently evaluating against the old policy) while the other engine's
     // reload is simply never consulted.
-    if baseline.cedar_policy_source.is_empty() != new.cedar_policy_source.is_empty() {
+    if baseline.is_cedar() != new.is_cedar() {
         return Err(Status::invalid_argument(
             "cannot switch a live sandbox between YAML and Cedar policy formats; \
              recreate the sandbox instead",
@@ -1249,7 +1249,7 @@ mod tests {
     fn cedar_policies_are_rejected_without_the_cedar_feature() {
         let policy = cedar_policy();
         for status in [
-            require_cedar_policy_support(&policy).expect_err("Cedar is unsupported"),
+            require_gateway_cedar_support(&policy).expect_err("Cedar is unsupported"),
             validate_policy_safety(&policy).expect_err("Cedar is unsupported"),
             validate_and_canonicalize_policy(policy.clone()).expect_err("Cedar is unsupported"),
         ] {
@@ -1260,7 +1260,7 @@ mod tests {
                  development build of the gateway and supervisor"
             );
         }
-        assert!(require_cedar_policy_support(&ProtoSandboxPolicy::default()).is_ok());
+        assert!(require_gateway_cedar_support(&ProtoSandboxPolicy::default()).is_ok());
     }
 
     #[cfg(feature = "cedar")]

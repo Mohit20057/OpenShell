@@ -33,7 +33,7 @@ use openshell_policy::{
 };
 use std::sync::{Arc, Mutex};
 
-use crate::opa::PolicyGenerationGuard;
+use crate::policy_types::PolicyGenerationGuard;
 use crate::policy_types::{
     AccessSetting, EndpointConfig, EndpointProtocol, EnforcementSetting, TlsSetting,
 };
@@ -446,11 +446,7 @@ impl L7EndpointConfig {
     }
 
     pub fn path_specificity(&self) -> usize {
-        if self.path.is_empty() {
-            0
-        } else {
-            self.path.chars().filter(|c| *c != '*').count()
-        }
+        openshell_core::endpoint_path::path_specificity(&self.path)
     }
 
     pub fn deny_uninspected_body_credentials(&self, has_resolver: bool) -> bool {

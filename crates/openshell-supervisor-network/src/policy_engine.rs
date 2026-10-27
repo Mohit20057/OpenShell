@@ -50,10 +50,10 @@ impl PolicyEngine {
     /// Returns an error if the policy is invalid, or is a Cedar policy and
     /// this build has no Cedar support.
     pub fn from_proto(policy: &openshell_core::proto::SandboxPolicy) -> Result<Self> {
-        if policy.cedar_policy_source.is_empty() {
-            Ok(Self::Opa(Arc::new(OpaEngine::from_proto(policy)?)))
-        } else {
+        if policy.is_cedar() {
             Ok(Self::Cedar(Arc::new(CedarOnlyEngine::from_proto(policy)?)))
+        } else {
+            Ok(Self::Opa(Arc::new(OpaEngine::from_proto(policy)?)))
         }
     }
 

@@ -645,13 +645,15 @@ impl CedarEngine {
         let outcome = self.evaluator.authorize(
             policies,
             &self.evaluator.uids.network_connect,
-            &Principal {
-                user: &request.user,
-                group: &request.group,
+            &Subject {
+                principal: Principal {
+                    user: &request.user,
+                    group: &request.group,
+                },
+                host: &request.host,
+                port: request.port,
+                protocol,
             },
-            &request.host,
-            request.port,
-            protocol,
             context,
             None,
             &|_| false,
@@ -820,13 +822,15 @@ impl CedarEngine {
             let outcome = self.evaluator.authorize(
                 policies,
                 &self.evaluator.uids.http_request,
-                &Principal {
-                    user: &request.user,
-                    group: &request.group,
+                &Subject {
+                    principal: Principal {
+                        user: &request.user,
+                        group: &request.group,
+                    },
+                    host: &request.host,
+                    port: request.port,
+                    protocol,
                 },
-                &request.host,
-                request.port,
-                protocol,
                 context.clone(),
                 Some(query_entity),
                 excluded,
@@ -1010,30 +1014,26 @@ impl Evaluator {
         .map_err(|e| CedarEngineError::EntityBuild(Box::new(e)))
     }
 
-    /// Runs one authorization query.
-    ///
-    /// `protocol` is the endpoint's `resource.protocol`: the inspection
-    /// protocol of the request's routed path, or `""` when not inspected.
+    /// Runs one authorization query for `subject`.
     ///
     /// The `excluded` permits are disregarded: they neither allow the
     /// request nor fail it with an evaluation error, so the outcome is that
     /// of `policies` without them. Only permits may be excluded.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "one call per action; the arguments are the request's distinct parts"
-    )]
     pub(crate) fn authorize(
         &self,
         policies: &PolicySet,
         action: &EntityUid,
-        principal: &Principal<'_>,
-        host: &str,
-        port: u16,
-        protocol: &str,
+        subject: &Subject<'_>,
         context: Vec<(&str, RestrictedExpression)>,
         query: Option<Entity>,
         excluded: &dyn Fn(&PolicyId) -> bool,
     ) -> Result<Outcome, CedarEngineError> {
+        let Subject {
+            principal,
+            host,
+            port,
+            protocol,
+        } = subject;
         let host = normalize_host(host);
         let host_port = format!("{host}:{port}");
 
@@ -1076,7 +1076,7 @@ impl Evaluator {
                 ),
                 (
                     endpoint_fields::PORT.to_string(),
-                    RestrictedExpression::new_long(i64::from(port)),
+                    RestrictedExpression::new_long(i64::from(*port)),
                 ),
                 (
                     endpoint_fields::PROTOCOL.to_string(),
@@ -1230,6 +1230,16 @@ impl<'a> QueryCombinations<'a> {
 pub(crate) struct Principal<'a> {
     pub(crate) user: &'a str,
     pub(crate) group: &'a str,
+}
+
+/// Who makes one authorization query, and the endpoint it is for.
+pub(crate) struct Subject<'a> {
+    pub(crate) principal: Principal<'a>,
+    pub(crate) host: &'a str,
+    pub(crate) port: u16,
+    /// The endpoint's `resource.protocol`: the inspection protocol of the
+    /// request's routed path, or `""` when not inspected.
+    pub(crate) protocol: &'a str,
 }
 
 fn string(value: &str) -> RestrictedExpression {

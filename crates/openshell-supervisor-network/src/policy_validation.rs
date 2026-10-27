@@ -31,18 +31,32 @@ pub(crate) const POLICY_VALIDATION_DIAGNOSTIC_MAX_BYTES: usize = 512;
 /// Returns a bounded, redacted diagnostic if the policy is invalid or its
 /// network endpoint selectors are ambiguous.
 pub fn validate_sandbox_policy(policy: &ProtoSandboxPolicy) -> Result<ProtoSandboxPolicy> {
-    let policy = openshell_policy::validate_and_canonicalize_sandbox_policy(policy.clone())
-        .map_err(|error| {
-            miette::miette!(render_bounded_validation_diagnostics(
-                "policy validation failed",
-                error
-                    .violations()
-                    .iter()
-                    .map(redacted_policy_violation_category),
-            ))
-        })?;
+    validate_sandbox_policy_report(policy).map(|validated| validated.policy)
+}
 
-    let ambiguities = openshell_policy::find_endpoint_ambiguities(&policy);
+/// Like [`validate_sandbox_policy`], also returning what validation derived,
+/// such as the Cedar engine it loaded.
+///
+/// # Errors
+///
+/// See [`validate_sandbox_policy`].
+pub fn validate_sandbox_policy_report(
+    policy: &ProtoSandboxPolicy,
+) -> Result<openshell_policy::ValidatedPolicy> {
+    let validated = openshell_policy::validate_and_canonicalize_sandbox_policy_report(
+        policy.clone(),
+    )
+    .map_err(|error| {
+        miette::miette!(render_bounded_validation_diagnostics(
+            "policy validation failed",
+            error
+                .violations()
+                .iter()
+                .map(redacted_policy_violation_category),
+        ))
+    })?;
+
+    let ambiguities = openshell_policy::find_endpoint_ambiguities(&validated.policy);
     if !ambiguities.is_empty() {
         return Err(miette::miette!(render_repeated_validation_diagnostic(
             "network endpoint ambiguity validation failed",
@@ -50,7 +64,7 @@ pub fn validate_sandbox_policy(policy: &ProtoSandboxPolicy) -> Result<ProtoSandb
             "ambiguous network endpoint selectors",
         )));
     }
-    Ok(policy)
+    Ok(validated)
 }
 
 /// Select a fixed category without formatting authored fields or nested reasons.

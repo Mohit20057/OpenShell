@@ -1190,7 +1190,7 @@ async fn sync_policy_with_client(
     policy: &ProtoSandboxPolicy,
     workspace: &str,
 ) -> Result<()> {
-    if !policy.cedar_policy_source.is_empty() {
+    if policy.is_cedar() {
         let info = client
             .health(crate::proto::HealthRequest {})
             .await

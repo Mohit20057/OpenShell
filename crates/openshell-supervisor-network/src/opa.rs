@@ -80,7 +80,12 @@ pub struct PolicyDecision {
     pub matched_policy: Option<String>,
 }
 
+// Transitional: these engine-neutral types moved to `policy_types` and
+// `policy_engine`. Import them from there; these paths remain only for
+// compatibility.
+#[doc(hidden)]
 pub use crate::policy_engine::TunnelPolicyEngine;
+#[doc(hidden)]
 pub use crate::policy_types::{
     EgressAuthorization, MatchedEndpoint, NetworkAction, NetworkInput,
     PolicyDnsEligibilitySnapshot, PolicyGenerationGuard,

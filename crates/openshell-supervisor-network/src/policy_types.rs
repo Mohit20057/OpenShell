@@ -229,7 +229,7 @@ pub struct GraphqlPersistedQuery {
 /// OPA engine produces it from its Rego data; the Cedar engine builds it from
 /// provider endpoints, endpoint settings, and its `HttpRequest` analysis.
 /// Fields absent from the policy take their defaults.
-#[allow(
+#[expect(
     clippy::struct_excessive_bools,
     reason = "Endpoint config mirrors independent policy schema toggles."
 )]

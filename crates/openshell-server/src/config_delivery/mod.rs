@@ -29,7 +29,7 @@ use crate::gateway_members::{GatewayMember, GatewayMemberIndex, MEMBER_TTL};
 use crate::grpc::policy::{
     SandboxConfigInputs, build_provider_environment_snapshot_from_inputs,
     build_sandbox_config_snapshot_from_inputs, is_configuration_rejection,
-    load_sandbox_config_inputs, require_cedar_support, unadmitted_sandbox_config,
+    load_sandbox_config_inputs, require_supervisor_cedar_support, unadmitted_sandbox_config,
 };
 use crate::supervisor_owner::{OWNER_TTL, SupervisorOwnerIndex, dialable_peer_endpoint};
 
@@ -454,7 +454,8 @@ async fn build_sandbox_config(
     };
     match built {
         Ok((inputs, snapshot)) => Ok(Some(
-            match require_cedar_support(supports_cedar_policy, snapshot.policy.as_ref()) {
+            match require_supervisor_cedar_support(supports_cedar_policy, snapshot.policy.as_ref())
+            {
                 Ok(()) => BuiltSandboxConfig::Built(Box::new(inputs), snapshot),
                 Err(error) => rejected(error),
             },

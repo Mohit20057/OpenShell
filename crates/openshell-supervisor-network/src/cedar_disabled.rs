@@ -117,6 +117,10 @@ impl CedarOnlyEngine {
         match *self {}
     }
 
+    pub fn effective_filesystem(&self) -> Result<openshell_policy::EffectiveFilesystem> {
+        match *self {}
+    }
+
     pub fn policy_dns_eligibility_snapshot(&self) -> Result<PolicyDnsEligibilitySnapshot> {
         match *self {}
     }

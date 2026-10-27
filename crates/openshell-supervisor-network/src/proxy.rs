@@ -14,12 +14,12 @@ use openshell_sandbox_backend::test_support as rpc_test;
 
 use crate::identity::{BinaryIdentityCache, SuppliedIdentityError};
 use crate::l7::tls::ProxyTlsState;
-use crate::opa::{NetworkAction, PolicyGenerationGuard};
 #[cfg(any(target_os = "linux", test))]
 use crate::policy_dns::PolicyEndpointId;
 use crate::policy_dns::{MappingLookup, MappingLookupError, ResolvedEndpointStore};
 use crate::policy_engine::PolicyEngine;
 use crate::policy_local::{POLICY_LOCAL_HOST, PolicyLocalContext};
+use crate::policy_types::{NetworkAction, PolicyGenerationGuard};
 use crate::upstream_proxy::{self, UpstreamProxyConfig};
 use futures::{FutureExt as _, StreamExt as _, stream::FuturesUnordered};
 use http::StatusCode;
@@ -939,7 +939,7 @@ pub(crate) async fn stage_transparent_open_for_test(
 #[cfg(all(test, feature = "cedar"))]
 pub(crate) fn connect_destination_outcome_for_test(
     engine: &PolicyEngine,
-    input: &crate::opa::NetworkInput,
+    input: &crate::policy_types::NetworkInput,
     addresses: &[IpAddr],
 ) -> String {
     let Ok(authorization) = engine.authorize_egress(input) else {
@@ -1149,6 +1149,10 @@ fn cedar_admitted_addresses(
         .into_iter()
         .filter(|ip| {
             let rejection = destination::cedar_address_rejection(cedar, host, *ip);
+            // Plumbing, not a decision event: the connection still dials
+            // the admitted addresses, and its decision is logged on its own.
+            // A caller left with no address reports the denial as OCSF, and
+            // policy DNS drops answers YAML `allowed_ips` reject the same way.
             if let Some(reason) = &rejection {
                 debug!(host, %ip, reason, "Cedar destination rules dropped a pinned address");
             }
@@ -1281,7 +1285,7 @@ impl Drop for TransparentTcpHandle {
 /// transparent TCP listener refuses the connection.
 #[cfg(any(target_os = "linux", all(test, feature = "cedar")))]
 pub(crate) fn correlated_endpoint(
-    matched_endpoints: &[crate::opa::MatchedEndpoint],
+    matched_endpoints: &[crate::policy_types::MatchedEndpoint],
     mapping: &MappingLookup,
 ) -> Option<PolicyEndpointId> {
     matched_endpoints
@@ -2011,7 +2015,7 @@ fn emit_forward_success_activity(tx: Option<&ActivitySender>, l7_activity_pendin
 /// middleware cannot be invoked with only half of the re-evaluation context.
 struct ForwardL7Reevaluation<'a> {
     config: &'a crate::l7::L7EndpointConfig,
-    engine: &'a crate::opa::TunnelPolicyEngine,
+    engine: &'a crate::policy_engine::TunnelPolicyEngine,
     request_info: &'a crate::l7::L7RequestInfo,
 }
 
@@ -3784,7 +3788,7 @@ fn authorize_egress_intent_inner(
     entrypoint_pid: &AtomicU32,
     intent: EgressIntent,
 ) -> EgressDecision {
-    use crate::opa::NetworkInput;
+    use crate::policy_types::NetworkInput;
     use std::sync::atomic::Ordering;
 
     let deny = |reason: String,
@@ -3889,7 +3893,7 @@ fn evaluate_endpoint_only_opa(engine: &PolicyEngine, intent: EgressIntent) -> Eg
 }
 
 fn evaluate_endpoint_only_opa_inner(engine: &PolicyEngine, intent: EgressIntent) -> EgressDecision {
-    let input = crate::opa::NetworkInput {
+    let input = crate::policy_types::NetworkInput {
         host: intent.destination.host.clone(),
         port: intent.destination.port,
         binary_path: PathBuf::new(),
@@ -4030,7 +4034,7 @@ fn authorize_supplied_identity_with_denial_inner(
         .executable
         .digest
         .expect("supplied identity validation requires a leaf digest");
-    let input = crate::opa::NetworkInput {
+    let input = crate::policy_types::NetworkInput {
         host: intent.destination.host.clone(),
         port: intent.destination.port,
         binary_path: identity.executable.path.clone(),
@@ -4271,7 +4275,7 @@ fn query_endpoint_credential_guard(
         return Ok(crate::l7::EndpointCredentialGuard::default());
     }
 
-    let input = crate::opa::NetworkInput {
+    let input = crate::policy_types::NetworkInput {
         host: host.to_string(),
         port,
         binary_path: decision.binary.clone().unwrap_or_default(),
@@ -5858,7 +5862,7 @@ async fn handle_forward_proxy(
         PolicyEngine::Cedar(_) => network_engine.middleware_generation(),
     };
     let mut websocket_extensions = crate::l7::rest::WebSocketExtensionMode::Preserve;
-    let mut forward_tunnel_engine: Option<crate::opa::TunnelPolicyEngine> = None;
+    let mut forward_tunnel_engine: Option<crate::policy_engine::TunnelPolicyEngine> = None;
     // L7 endpoint config and evaluated request info, carried past the L7
     // block so a middleware-transformed body can be re-evaluated against the
     // same policy inputs before it is forwarded.
@@ -6504,7 +6508,7 @@ async fn handle_forward_proxy(
     }
 
     let middleware_path = path.split_once('?').map_or(path.as_str(), |(path, _)| path);
-    let middleware_input = crate::opa::NetworkInput {
+    let middleware_input = crate::policy_types::NetworkInput {
         host: host_lc.clone(),
         port,
         binary_path: decision.binary.clone().unwrap_or_default(),
@@ -10936,7 +10940,7 @@ network_policies:
       - { path: /usr/bin/node }
 "#;
         let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
-        let input = crate::opa::NetworkInput {
+        let input = crate::policy_types::NetworkInput {
             host: "api.example.test".into(),
             port: 80,
             binary_path: PathBuf::from("/usr/bin/node"),
@@ -11639,13 +11643,13 @@ network_policies:
         policy_name: &str,
     ) -> (
         crate::l7::L7EndpointConfig,
-        crate::opa::TunnelPolicyEngine,
+        crate::policy_engine::TunnelPolicyEngine,
         crate::l7::relay::L7EvalContext,
     ) {
         let policy = include_str!("../data/sandbox-policy.rego");
         let engine = OpaEngine::from_strings(policy, data).unwrap();
         let authorization = engine
-            .authorize_egress(&crate::opa::NetworkInput {
+            .authorize_egress(&crate::policy_types::NetworkInput {
                 host: host.to_string(),
                 port,
                 binary_path: PathBuf::from("/usr/bin/node"),
@@ -11755,7 +11759,7 @@ network_policies:
 
     async fn forward_websocket_denied_after_upgrade(
         config: crate::l7::L7EndpointConfig,
-        tunnel_engine: crate::opa::TunnelPolicyEngine,
+        tunnel_engine: crate::policy_engine::TunnelPolicyEngine,
         ctx: crate::l7::relay::L7EvalContext,
         path: &str,
         payload: &str,
@@ -15262,7 +15266,7 @@ network_policies:
 "#
             );
             let engine = OpaEngine::from_strings(POLICY_REGO, &data).expect("load policy");
-            let input = crate::opa::NetworkInput {
+            let input = crate::policy_types::NetworkInput {
                 host: "203.0.113.10".to_string(),
                 port: 443,
                 binary_path: PathBuf::from("/tmp/openshell-connect-test/connect-bash"),

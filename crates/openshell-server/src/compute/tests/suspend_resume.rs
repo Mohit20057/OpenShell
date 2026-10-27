@@ -538,3 +538,189 @@ async fn failed_recovered_resume_preserves_retryable_state() {
         }
     }
 }
+
+#[tokio::test]
+async fn successful_resume_compensation_records_stopped_without_retained_state() {
+    for (missing_identity, ready_before_response) in [(false, false), (true, false), (false, true)]
+    {
+        let driver = ControlledDriver::new();
+        driver.set_runtime_identity(if missing_identity {
+            ""
+        } else {
+            "new-runtime-identity"
+        });
+        if ready_before_response {
+            driver.block_start();
+        }
+        let (_directory, mut runtime) = runtime_with_binding_store_failure(driver.clone()).await;
+        enable_suspend_resume(&mut runtime);
+        let mut sandbox = sandbox_record(
+            "sb-resume-store-failure",
+            "resume-store-failure",
+            SandboxPhase::Suspended,
+        );
+        set_compute_runtime_binding(&mut sandbox, "previous-runtime-identity");
+        let old_generation = sandbox_runtime_generation(&sandbox).unwrap();
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        let error = if ready_before_response {
+            let pending = {
+                let runtime = runtime.clone();
+                let name = sandbox.object_name().to_string();
+                tokio::spawn(async move { runtime.resume_sandbox("default", &name, false).await })
+            };
+            driver.start_started.notified().await;
+            let starting = stored(&runtime, sandbox.object_id()).await;
+            runtime
+                .store
+                .update_message_cas::<Sandbox, _>(
+                    sandbox.object_id(),
+                    sandbox_resource_version(&starting),
+                    |current| current.set_phase(SandboxPhase::Ready as i32),
+                )
+                .await
+                .unwrap();
+            register_test_supervisor_session(&runtime, sandbox.object_id());
+            driver.release_start();
+            pending.await.unwrap().unwrap_err()
+        } else {
+            runtime
+                .resume_sandbox("default", sandbox.object_name(), false)
+                .await
+                .unwrap_err()
+        };
+        assert!(
+            error.message().contains(if missing_identity {
+                "did not return a runtime identity"
+            } else {
+                "persist compute runtime identity failed"
+            }),
+            "{error}"
+        );
+        assert_eq!(driver.start_calls(), 1);
+        assert_eq!(driver.stop_calls(), 1);
+        let stopped = stored(&runtime, sandbox.object_id()).await;
+        assert_eq!(stopped.phase(), SandboxPhase::Stopped as i32);
+        assert_eq!(
+            ready_condition(&stopped).unwrap().reason,
+            "ResumeRolledBack"
+        );
+        assert!(!has_resume_intent(&stopped));
+        assert!(!runtime.supervisor_sessions.has_session(sandbox.object_id()));
+        assert_ne!(
+            sandbox_runtime_generation(&stopped).unwrap(),
+            old_generation
+        );
+        assert_eq!(
+            runtime
+                .resume_sandbox("default", sandbox.object_name(), false)
+                .await
+                .unwrap_err()
+                .code(),
+            Code::FailedPrecondition
+        );
+        // A clean start is still available, without reusing the consumed reference.
+        driver.set_runtime_identity("previous-runtime-identity");
+        if ready_before_response {
+            driver.release_start();
+        }
+        runtime
+            .start_sandbox("default", sandbox.object_name())
+            .await
+            .unwrap();
+        assert_eq!(
+            driver.start_resume_requests(),
+            vec![(true, false), (false, false)]
+        );
+    }
+}
+
+#[tokio::test]
+async fn failed_resume_compensation_does_not_retry_a_consumed_reference() {
+    let driver = ControlledDriver::new();
+    driver.set_runtime_identity("new-runtime-identity");
+    driver.set_stop_outcome(ControlledLifecycleOutcome::Error("stop response lost"));
+    let (_directory, mut runtime) = runtime_with_binding_store_failure(driver.clone()).await;
+    enable_suspend_resume(&mut runtime);
+    let mut sandbox = sandbox_record(
+        "sb-resume-stop-fail",
+        "resume-stop-fail",
+        SandboxPhase::Suspended,
+    );
+    set_compute_runtime_binding(&mut sandbox, "previous-runtime-identity");
+    runtime.store.put_message(&sandbox).await.unwrap();
+
+    let error = runtime
+        .resume_sandbox("default", sandbox.object_name(), false)
+        .await
+        .unwrap_err();
+    assert!(error.message().contains("stop response lost"));
+    let unresolved = stored(&runtime, sandbox.object_id()).await;
+    assert_eq!(unresolved.phase(), SandboxPhase::Starting as i32);
+    assert!(
+        !has_resume_intent(&unresolved),
+        "the successful restore consumed its reference before cleanup"
+    );
+    assert_eq!(
+        runtime
+            .resume_sandbox("default", sandbox.object_name(), false)
+            .await
+            .unwrap_err()
+            .code(),
+        Code::FailedPrecondition
+    );
+    driver.set_runtime_identity("previous-runtime-identity");
+    runtime
+        .start_sandbox("default", sandbox.object_name())
+        .await
+        .unwrap();
+    assert_eq!(
+        driver.start_resume_requests(),
+        vec![(true, false), (false, false)]
+    );
+}
+
+#[tokio::test]
+async fn stale_resume_compensation_cannot_clear_a_newer_operation_intent() {
+    let driver = ControlledDriver::new();
+    let runtime = suspend_capable_runtime(driver.clone()).await;
+    let mut sandbox = sandbox_record("sb-resume-owner", "resume-owner", SandboxPhase::Starting);
+    sandbox.status.as_mut().unwrap().provisioning = Some(
+        provisioning_deadline::new_preparation_record(openshell_core::time::now_ms(), 1800),
+    );
+    let generation = sandbox_runtime_generation(&sandbox).unwrap();
+    write_start_intent(
+        &mut sandbox.metadata.as_mut().unwrap().annotations,
+        generation.as_str(),
+        StartIntent::Resume {
+            restart_if_restore_fails: false,
+        },
+    );
+    runtime.store.put_message(&sandbox).await.unwrap();
+    let current = stored(&runtime, sandbox.object_id()).await;
+    let ((), old_settled) = runtime
+        .await_provisioning_operation(&current, async { Ok(()) })
+        .await
+        .unwrap();
+    let ((), newer) = runtime
+        .await_provisioning_operation(&old_settled, async { Ok(()) })
+        .await
+        .unwrap();
+    let gate = runtime.lifecycle_gates.lock_for(sandbox.object_id()).await;
+    let error = runtime
+        .compensate_successful_start(
+            &gate,
+            &old_settled,
+            &sandbox,
+            Status::internal("missing binding"),
+        )
+        .await;
+    assert!(error.message().contains("cleanup deferred"));
+    assert_eq!(driver.stop_calls(), 0);
+    let retained = stored(&runtime, sandbox.object_id()).await;
+    assert!(has_resume_intent(&retained));
+    assert_eq!(
+        sandbox_resource_version(&retained),
+        sandbox_resource_version(&newer)
+    );
+}

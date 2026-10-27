@@ -814,12 +814,22 @@ pub async fn run_sandbox_with_backend(
         .chain(health_port.map(ReadinessEndpoint::Tcp))
         .map(|endpoint| ControlReadiness::start(endpoint, Some(instance_readiness.clone())))
         .collect::<Result<Vec<_>>>()?;
+    // Only a dedicated process maps process-wide signals to one instance.
+    let suspend_signal = SuspendSignal::install()?;
+    let suspend = Box::pin(futures::stream::unfold(
+        suspend_signal,
+        |mut signal| async move {
+            signal.recv().await;
+            Some(((), signal))
+        },
+    ));
     let result = Box::pin(run_sandbox_instance(
         backend_setup,
         config,
         bindings,
         SandboxInstanceControls {
             shutdown: Box::pin(wait_for_control_shutdown_signal()),
+            suspend,
             readiness,
         },
     ))
@@ -958,6 +968,9 @@ pub struct SandboxInstanceControls {
     /// Completes when the owner asks the instance to stop its workload. It is
     /// first polled once the workload has started.
     pub shutdown: Pin<Box<dyn Future<Output = ()> + Send>>,
+    /// Requests to suspend only this instance. A failed suspension can be
+    /// retried by sending another request. Closing the stream disables it.
+    pub suspend: Pin<Box<dyn futures::Stream<Item = ()> + Send>>,
     /// True while the gateway has accepted this instance's supervision and its
     /// access plane is retained; false otherwise.
     pub readiness: tokio::sync::watch::Sender<bool>,
@@ -1059,9 +1072,9 @@ pub async fn run_sandbox_instance(
     } = bindings;
     let SandboxInstanceControls {
         shutdown: shutdown_requested,
+        mut suspend,
         readiness,
     } = controls;
-    let mut suspend_signal = SuspendSignal::install()?;
     // The current client attachment adapter is SSH; retaining a process's I/O
     // internally does not make it reachable by a foreground client.
     if await_main_process_attachment && (!cfg!(unix) || ssh_socket_path.is_none()) {
@@ -1683,7 +1696,7 @@ pub async fn run_sandbox_instance(
                 }
                 // The agent wait is cancelled while suspending so a fenced
                 // generation's stream failure cannot race the suspension.
-                () = suspend_signal.recv() => {
+                Some(()) = futures::StreamExt::next(&mut suspend) => {
                     // Boxed to keep the startup future's stack frame small.
                     if Box::pin(suspend_on_request(
                         &running,
@@ -1704,7 +1717,7 @@ pub async fn run_sandbox_instance(
             drop(running);
             drop(boundary_access);
             drop(networking);
-            info!(backend = %backend_name, "Isolation boundary suspended; supervisor exiting");
+            info!(backend = %backend_name, "Isolation boundary suspended; supervisor instance exiting");
             return Ok(0);
         };
         if !retain_access {

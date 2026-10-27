@@ -2715,6 +2715,47 @@ impl ComputeRuntime {
         previous: &Sandbox,
         original: Status,
     ) -> Status {
+        // A supervisor can reach Ready before the driver returns. The intent
+        // still identifies a successful resume until its binding is committed.
+        let resuming = persisted_resume_intent(starting).is_some_and(|intent| {
+            sandbox_runtime_generation(starting)
+                .is_ok_and(|generation| intent.generation == generation.as_str())
+        });
+        // Once restoration succeeded, a subsequent STOP may consume the only
+        // remaining state even if its response is lost. Persist that the
+        // reference was consumed before attempting cleanup, so recovery never
+        // retries restoration or rolls back to Suspended after an ambiguous STOP.
+        let starting = if resuming {
+            let consumed = match self
+                .store
+                .update_message_cas::<Sandbox, _>(
+                    starting.object_id(),
+                    sandbox_resource_version(starting),
+                    |current| {
+                        if let Some(metadata) = current.metadata.as_mut() {
+                            metadata.annotations.remove(RESUME_INTENT_ANNOTATION);
+                        }
+                    },
+                )
+                .await
+            {
+                Ok(consumed) => consumed,
+                Err(error) => {
+                    return Status::new(
+                        original.code(),
+                        format!(
+                            "{}; could not record successful resume; cleanup deferred: {error}",
+                            original.message()
+                        ),
+                    );
+                }
+            };
+            self.sandbox_index.update_from_sandbox(&consumed);
+            self.sandbox_watch_bus.notify(consumed.object_id());
+            consumed
+        } else {
+            starting.clone()
+        };
         let sandbox_id = starting.object_id().to_string();
         let sandbox_name = starting.object_name().to_string();
         let request_id = sandbox_id.clone();
@@ -2722,7 +2763,7 @@ impl ComputeRuntime {
         // A newer operation or timeout must reject it without touching compute.
         let stop_result = self
             .await_provisioning_operation(
-                starting,
+                &starting,
                 self.driver.call_owned(
                     openshell_otel::rpc::STOP_SANDBOX,
                     Some(&sandbox_id),
@@ -2759,7 +2800,25 @@ impl ComputeRuntime {
         };
 
         let _sandbox_guard = self.lock_sandbox_for_lifecycle(lifecycle_guard).await;
-        if self.restore_lifecycle_snapshot(&settled, previous).await {
+        // A successful resume consumed the retained state. STOP discards
+        // the restored workload, so rolling back to Suspended would advertise
+        // a snapshot that no longer exists. Keep this attempt's generation
+        // and credentials and record the confirmed stopped runtime instead.
+        let mut rollback = previous.clone();
+        if resuming {
+            rollback = (*settled).clone();
+            apply_lifecycle_phase(
+                &mut rollback,
+                SandboxPhase::Stopped,
+                "ResumeRolledBack",
+                "Resumed workload stopped after its runtime binding could not be committed",
+                self.image_preparation_timeout_seconds,
+            );
+        }
+        if self.restore_lifecycle_snapshot(&settled, &rollback).await {
+            if resuming && let Err(error) = self.cleanup_stopped_sandbox_sessions(&rollback).await {
+                warn!(sandbox_id, %error, "Failed to clean up stopped sandbox after start compensation");
+            }
             original
         } else {
             Status::new(

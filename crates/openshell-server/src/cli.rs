@@ -594,6 +594,14 @@ fn prepare_server_config_with_drivers(
         .service_routing
         .validate(&config.name)
         .map_err(|error| miette::miette!("invalid service routing configuration: {error}"))?;
+    config.supervisor_app_listener = file
+        .as_ref()
+        .map(|f| f.openshell.supervisor.app_listener.clone())
+        .unwrap_or_default();
+    config
+        .supervisor_app_listener
+        .validate()
+        .map_err(|e| miette::miette!(e))?;
     if let Some(sources) = file
         .as_ref()
         .and_then(|file| file.openshell.gateway.provider_profile_sources.clone())

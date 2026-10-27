@@ -532,10 +532,13 @@ function Invoke-Lint([string] $RustTarget) {
 
 function Invoke-CedarChecks([string] $RustTarget) {
     Assert-GatewayExcludesCedarCrates $RustTarget
+    # `-p openshell-gateway` takes features of its direct dependencies only;
+    # openshell-server's prebuilt-z3 enables the prover's.
+    $gatewayZ3Features = if ($Z3ServerFeatures) { "--features openshell-server/prebuilt-z3" } else { "" }
     # Release Dev enables Cedar; check it still compiles with the MXC driver.
     Invoke-VsCargo `
         -RustTarget $RustTarget `
-        -CargoArgs "cargo check -p openshell-gateway --target $RustTarget --features compute-driver-mxc,cedar $Z3ServerFeatures" `
+        -CargoArgs "cargo check -p openshell-gateway --target $RustTarget --features compute-driver-mxc,cedar $gatewayZ3Features" `
         -LogName "build-$RustTarget-check-cedar.log"
 }
 

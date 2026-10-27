@@ -36,40 +36,15 @@ use tokio::net::UnixListener;
 use tracing::warn;
 
 const NO_LOGIN_SHELL_ENV: (&str, &str) = ("OPENSHELL_NO_LOGIN_SHELL", "1");
-const MAIN_DETACH_PREFIX: u8 = 0x10;
-const MAIN_DETACH_KEY: u8 = 0x11;
-const MAIN_DETACH_EOF: u8 = 0x04;
 const SSH_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 const SSH_PEER_TIMEOUT: Duration = Duration::from_mins(1);
 
+mod detach;
 mod peer_stream;
 
 #[cfg(test)]
 #[path = "ssh/reconnect_tests.rs"]
 mod reconnect_tests;
-
-fn filter_main_detach_sequence(prefix_pending: &mut bool, data: &[u8]) -> (Vec<u8>, bool) {
-    let mut forward = Vec::with_capacity(data.len() + usize::from(*prefix_pending));
-    for &byte in data {
-        if *prefix_pending {
-            if byte == MAIN_DETACH_KEY {
-                *prefix_pending = false;
-                return (forward, true);
-            }
-            forward.push(MAIN_DETACH_PREFIX);
-            *prefix_pending = false;
-        }
-        if byte == MAIN_DETACH_EOF {
-            return (forward, true);
-        }
-        if byte == MAIN_DETACH_PREFIX {
-            *prefix_pending = true;
-        } else {
-            forward.push(byte);
-        }
-    }
-    (forward, false)
-}
 
 /// Perform SSH server initialization: generate a host key, build the config,
 /// and bind the Unix socket listener. Extracted so that startup errors can be
@@ -393,7 +368,7 @@ struct ChannelState {
     /// A writable attachment denied stdin may retry on later input. Explicit
     /// viewers and channels that sent EOF must never acquire a new lease.
     main_input_pending: bool,
-    main_detach_prefix_pending: bool,
+    main_detach: detach::DetachFilter,
     main_output_task: Option<tokio::task::AbortHandle>,
     /// What a PTY client's terminal has received from a TTY main process.
     main_terminal: Option<Arc<tokio::sync::Mutex<TerminalState>>>,
@@ -822,7 +797,7 @@ impl russh::server::Handler for SshHandler {
             };
             state.main_input_pending = warning.is_some();
             state.input_sender = input;
-            state.main_detach_prefix_pending = false;
+            state.main_detach = detach::DetachFilter::default();
             let terminal_delivery = main_session.clone();
             let handle = session.handle();
             session.channel_success(channel)?;
@@ -1002,18 +977,17 @@ impl russh::server::Handler for SshHandler {
                 .await;
             return Ok(());
         }
-        let denied_prefix = state.main_input_pending && state.main_detach_prefix_pending;
-        let (mut forward, detach) = if state.main_attached {
-            filter_main_detach_sequence(&mut state.main_detach_prefix_pending, data)
-        } else {
-            (data.to_vec(), false)
-        };
         // Remember a denied viewer's prefix only to recognize split detach
         // sequences. It must not become process input when a later frame wins
         // the lease: that earlier keystroke was sent without write ownership.
-        if denied_prefix && forward.first() == Some(&MAIN_DETACH_PREFIX) {
-            forward.remove(0);
+        if state.main_input_pending {
+            state.main_detach.forget_prefix_input();
         }
+        let (forward, detach) = if state.main_attached {
+            state.main_detach.filter(data)
+        } else {
+            (data.to_vec(), false)
+        };
         // A reconnect can precede detection of the old connection's failure.
         // Retry only on new input, using the same exclusive acquisition as a
         // fresh attachment. Detach keys retain their read-only behavior.
@@ -1069,7 +1043,7 @@ impl russh::server::Handler for SshHandler {
             }
             state.input_sender.take();
             state.main_input_pending = false;
-            state.main_detach_prefix_pending = false;
+            state.main_detach = detach::DetachFilter::default();
         } else {
             warn!("channel_eof on unknown channel {channel:?}");
         }
@@ -1455,7 +1429,7 @@ impl SshHandler {
             }
             state.input_sender.take();
             state.main_input_pending = false;
-            state.main_detach_prefix_pending = false;
+            state.main_detach = detach::DetachFilter::default();
             if let Some(task) = state.main_output_task.take() {
                 task.abort();
             }
@@ -2011,7 +1985,7 @@ mod tests {
 
     #[tokio::test]
     async fn main_attachment_read_only_ctrl_d_detaches_without_releasing_owner_lease() {
-        assert_read_only_attachment(false, "\n", MAIN_DETACH_EOF).await;
+        assert_read_only_attachment(false, "\n", 0x04).await;
     }
 
     async fn assert_read_only_attachment(terminal: bool, line_ending: &str, detach_key: u8) {
@@ -2213,24 +2187,6 @@ mod tests {
         ));
         channel.data(&b"\x04"[..]).await.unwrap();
         assert_eq!(main_output_until_close(&mut channel).await, b"");
-    }
-
-    #[test]
-    fn main_detach_filter_preserves_prefix_before_ctrl_d() {
-        let mut prefix_pending = false;
-        assert_eq!(
-            filter_main_detach_sequence(&mut prefix_pending, b"\x10"),
-            (Vec::new(), false)
-        );
-        assert_eq!(
-            filter_main_detach_sequence(&mut prefix_pending, b"\x04ignored"),
-            (vec![0x10], true)
-        );
-        assert!(!prefix_pending);
-        assert_eq!(
-            filter_main_detach_sequence(&mut prefix_pending, b"\x10\x11"),
-            (Vec::new(), true)
-        );
     }
 
     #[tokio::test]

@@ -412,6 +412,10 @@ impl SuspendSignal {
         Ok(Self)
     }
 
+    #[expect(
+        clippy::needless_pass_by_ref_mut,
+        reason = "matches the Unix receiver, which polls its signal stream"
+    )]
     async fn recv(&mut self) {
         std::future::pending::<()>().await;
     }

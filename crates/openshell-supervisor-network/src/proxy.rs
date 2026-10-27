@@ -1279,7 +1279,7 @@ impl Drop for TransparentTcpHandle {
 ///
 /// `None` means the decision and the mapping name no common endpoint, so the
 /// transparent TCP listener refuses the connection.
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", all(test, feature = "cedar")))]
 pub(crate) fn correlated_endpoint(
     matched_endpoints: &[crate::opa::MatchedEndpoint],
     mapping: &MappingLookup,

@@ -188,12 +188,15 @@ impl LocalBoundaryExec {
         crate::process::strip_proxy_env_std(&mut command);
         // Point OTel SDKs at the supervisor's trace relay after the creation
         // request's environment and the provider variables, matching the main
-        // process. An endpoint in the creation request, the image, or this
-        // exec's `spec.env` suppresses it, and any other `spec.env` value
-        // applied below still wins for this exec only.
+        // process. An endpoint in the creation request or this exec's
+        // `spec.env` suppresses it, and any other `spec.env` value applied
+        // below still wins for this exec only. The environment was cleared
+        // above, so an endpoint in the image `ENV` never reaches this child
+        // and does not suppress the default.
         crate::child_env::apply_otlp_relay_env(
             &mut command,
             self.otlp_relay_active,
+            crate::child_env::ChildEnvironment::Cleared,
             &self.user_environment,
             &spec.env,
         );

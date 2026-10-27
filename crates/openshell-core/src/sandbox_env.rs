@@ -324,6 +324,20 @@ pub const OTEL_EXPORTER_OTLP_PROTOCOL: &str = "OTEL_EXPORTER_OTLP_PROTOCOL";
 /// has chosen where traces go, so the relay default is left out.
 pub const OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: &str = "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT";
 
+/// Standard OpenTelemetry environment variable for OTLP exporter compression.
+///
+/// Set to `none` alongside [`OTEL_EXPORTER_OTLP_ENDPOINT`], because the
+/// relay refuses compressed bodies.
+pub const OTEL_EXPORTER_OTLP_COMPRESSION: &str = "OTEL_EXPORTER_OTLP_COMPRESSION";
+
+/// Signal-specific compression variable, also set to `none` with the relay
+/// default.
+///
+/// SDKs prefer it over [`OTEL_EXPORTER_OTLP_COMPRESSION`], so a `gzip` value
+/// from the image or the creation request would otherwise still compress
+/// every trace export.
+pub const OTEL_EXPORTER_OTLP_TRACES_COMPRESSION: &str = "OTEL_EXPORTER_OTLP_TRACES_COMPRESSION";
+
 /// Reserved destination agent processes export OTLP to.
 ///
 /// This address is never routed. A workload `connect()` to any non-loopback

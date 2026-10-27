@@ -318,7 +318,13 @@ fn compose_canonical_process_environment(
             cmd.env(key, value);
         }
     }
-    child_env::apply_otlp_relay_env(cmd, otlp_relay_active, user_environment, &[]);
+    child_env::apply_otlp_relay_env(
+        cmd,
+        otlp_relay_active,
+        child_env::ChildEnvironment::Inherited,
+        user_environment,
+        &[],
+    );
 }
 
 #[cfg(unix)]
@@ -569,9 +575,9 @@ impl ProcessHandle {
                 .stderr(Stdio::piped());
         }
 
-        // Strip supervisor-only identity material from the entrypoint's
-        // inherited environment. The entrypoint drops to the sandbox user
-        // before `exec`; without this strip, sandbox code could recover
+        // Build the entrypoint's environment. It also strips supervisor-only
+        // identity material: the entrypoint drops to the sandbox user before
+        // `exec`, and without the strip sandbox code could recover
         // supervisor credentials from its inherited environment.
         compose_canonical_process_environment(
             &mut cmd,
@@ -725,8 +731,8 @@ impl ProcessHandle {
                 .stderr(Stdio::piped());
         }
 
-        // Strip supervisor-only identity material from the entrypoint's
-        // inherited environment.
+        // Build the entrypoint's environment, without supervisor-only
+        // identity material.
         compose_canonical_process_environment(
             &mut cmd,
             policy,
@@ -1370,10 +1376,10 @@ mod tests {
     #[test]
     fn canonical_process_sees_relay_endpoint_and_never_the_collector() {
         use openshell_core::sandbox_env::{
-            OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_EXPORTER_OTLP_PROTOCOL,
+            OTEL_EXPORTER_OTLP_COMPRESSION, OTEL_EXPORTER_OTLP_ENDPOINT,
+            OTEL_EXPORTER_OTLP_PROTOCOL, OTEL_EXPORTER_OTLP_TRACES_COMPRESSION,
             OTEL_EXPORTER_OTLP_TRACES_ENDPOINT, OTLP_RELAY_ENDPOINT,
         };
-        const OTEL_EXPORTER_OTLP_TRACES_COMPRESSION: &str = "OTEL_EXPORTER_OTLP_TRACES_COMPRESSION";
         const COLLECTOR_HOST: &str = "collector.invalid";
         if run_in_isolated_child(
             "OPENSHELL_TEST_RELAY_ENV_CHILD",
@@ -1436,12 +1442,26 @@ mod tests {
         };
 
         // Relay active, no endpoint in the creation request: only the
-        // generic default is set, and a provider cannot redirect traces.
+        // generic default is set, compression is disabled, and a provider
+        // cannot redirect traces.
         let variables = probe(
-            HashMap::from([(OTEL_EXPORTER_OTLP_PROTOCOL.into(), "grpc".into())]),
+            HashMap::from([
+                (OTEL_EXPORTER_OTLP_PROTOCOL.into(), "grpc".into()),
+                (OTEL_EXPORTER_OTLP_TRACES_COMPRESSION.into(), "gzip".into()),
+            ]),
             provider_redirect(),
             true,
         );
+        for key in [
+            OTEL_EXPORTER_OTLP_COMPRESSION,
+            OTEL_EXPORTER_OTLP_TRACES_COMPRESSION,
+        ] {
+            assert_eq!(
+                get(&variables, key).as_deref(),
+                Some("none"),
+                "the relay refuses compressed bodies, so {key} is disabled: {variables:?}"
+            );
+        }
         assert_eq!(
             get(&variables, OTEL_EXPORTER_OTLP_ENDPOINT).as_deref(),
             Some(OTLP_RELAY_ENDPOINT),
@@ -1509,6 +1529,95 @@ mod tests {
             !variables.values().any(|value| value.contains("192.0.0.8")),
             "the relay address must not appear: {variables:?}"
         );
+    }
+
+    /// Both TLS environment modes keep their precedence in the composed
+    /// environment while the relay default is applied. In `Override`, the
+    /// `OpenShell` trust files win over the caller and the provider. In
+    /// `FillMissing`, a caller's TLS value wins over the provider and only the
+    /// variables the caller left unset point at `OpenShell` trust.
+    #[cfg(unix)]
+    #[test]
+    fn canonical_process_keeps_tls_mode_precedence_with_the_relay() {
+        use openshell_core::sandbox_env::{OTEL_EXPORTER_OTLP_ENDPOINT, OTLP_RELAY_ENDPOINT};
+        if run_in_isolated_child(
+            "OPENSHELL_TEST_TLS_MODE_ENV_CHILD",
+            "process::tests::canonical_process_keeps_tls_mode_precedence_with_the_relay",
+            &[],
+        ) {
+            return;
+        }
+        let current_user = User::from_uid(nix::unistd::geteuid()).unwrap().unwrap();
+        let policy = policy_with_process(ProcessPolicy {
+            run_as_user: Some(current_user.name),
+            run_as_group: None,
+        });
+        let workspace = ResolvedWorkspace::default();
+        let ca_paths = (
+            PathBuf::from("/etc/openshell-tls/ca.pem"),
+            PathBuf::from("/etc/openshell-tls/ca-bundle.pem"),
+        );
+        let openshell_trust: HashMap<&str, String> =
+            child_env::tls_env_vars(&ca_paths.0, &ca_paths.1)
+                .into_iter()
+                .collect();
+        let declared = HashMap::from([("SSL_CERT_FILE".to_string(), "/caller.pem".to_string())]);
+        let provider_env = HashMap::from([
+            ("SSL_CERT_FILE".to_string(), "/provider.pem".to_string()),
+            (
+                "REQUESTS_CA_BUNDLE".to_string(),
+                "/provider.pem".to_string(),
+            ),
+        ]);
+        let probe = |mode: child_env::TlsEnvironmentMode| {
+            let mut cmd = Command::new("/usr/bin/env");
+            cmd.stdout(StdStdio::piped());
+            compose_canonical_process_environment(
+                &mut cmd,
+                &policy,
+                &workspace,
+                false,
+                &declared,
+                &provider_env,
+                Some(&ca_paths),
+                mode,
+                true,
+            );
+            let variables = probe_environment(cmd);
+            assert_eq!(
+                variables
+                    .get(OTEL_EXPORTER_OTLP_ENDPOINT)
+                    .map(String::as_str),
+                Some(OTLP_RELAY_ENDPOINT),
+                "the relay default applies in {mode:?}: {variables:?}"
+            );
+            variables
+        };
+
+        let variables = probe(child_env::TlsEnvironmentMode::Override);
+        for (key, value) in &openshell_trust {
+            assert_eq!(
+                variables.get(*key),
+                Some(value),
+                "OpenShell trust wins for {key} in Override: {variables:?}"
+            );
+        }
+
+        let variables = probe(child_env::TlsEnvironmentMode::FillMissing);
+        assert_eq!(
+            variables.get("SSL_CERT_FILE").map(String::as_str),
+            Some("/caller.pem"),
+            "the caller's value wins over the provider in FillMissing: {variables:?}"
+        );
+        for (key, value) in &openshell_trust {
+            if *key != "SSL_CERT_FILE" {
+                assert_eq!(
+                    variables.get(*key),
+                    Some(value),
+                    "OpenShell trust fills {key} in FillMissing: {variables:?}"
+                );
+            }
+        }
     }
 
     /// An endpoint in the image `ENV`, which reaches the canonical process

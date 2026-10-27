@@ -6,8 +6,8 @@ use std::hash::BuildHasher;
 use std::path::Path;
 
 use openshell_core::sandbox_env::{
-    OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_EXPORTER_OTLP_PROTOCOL, OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
-    OTLP_RELAY_ENDPOINT,
+    OTEL_EXPORTER_OTLP_COMPRESSION, OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_EXPORTER_OTLP_PROTOCOL,
+    OTEL_EXPORTER_OTLP_TRACES_COMPRESSION, OTEL_EXPORTER_OTLP_TRACES_ENDPOINT, OTLP_RELAY_ENDPOINT,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,14 +56,31 @@ const OTLP_ENDPOINT_VARS: [&str; 2] = [
 /// OpenTelemetry exporter variables that point agent SDKs at the
 /// supervisor's OTLP relay.
 ///
-/// Only the generic variables are set. Signal-specific variables take
-/// precedence over them in every SDK, so an endpoint the workload sets later
-/// at any layer, generic or traces-specific, wins over this default.
-pub fn otlp_relay_env_vars() -> [(&'static str, &'static str); 2] {
+/// Only the generic endpoint and protocol are set. Signal-specific variables
+/// take precedence over them in every SDK, so an endpoint the workload sets
+/// later at any layer, generic or traces-specific, wins over this default.
+/// Compression is disabled for both the generic and the traces-specific
+/// variable because the relay refuses compressed bodies, and a `gzip` value
+/// from the image or the creation request would otherwise make every export
+/// fail.
+pub fn otlp_relay_env_vars() -> [(&'static str, &'static str); 4] {
     [
         (OTEL_EXPORTER_OTLP_ENDPOINT, OTLP_RELAY_ENDPOINT),
         (OTEL_EXPORTER_OTLP_PROTOCOL, "http/protobuf"),
+        (OTEL_EXPORTER_OTLP_COMPRESSION, "none"),
+        (OTEL_EXPORTER_OTLP_TRACES_COMPRESSION, "none"),
     ]
+}
+
+/// Whether a child process starts from the sandbox's own environment, which
+/// carries the image `ENV`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChildEnvironment {
+    /// The child inherits the sandbox environment, like the main process.
+    Inherited,
+    /// The child starts from a cleared environment, like a boundary exec, so
+    /// an endpoint in the image `ENV` never reaches it.
+    Cleared,
 }
 
 /// Whether one layer of the workload environment names an OTLP endpoint,
@@ -97,17 +114,21 @@ fn relay_default_applies<S: BuildHasher>(
 /// Nothing is injected while the relay is inactive, or when the creation
 /// request (`user_environment`), the image, or `exec_environment` names an
 /// endpoint: the agent then exports where it was told to, subject to the
-/// sandbox's network policy and outside relay attribution. When the default
-/// is injected, a traces-specific endpoint can only have come from a
-/// provider, and is removed so a provider cannot redirect traces.
+/// sandbox's network policy and outside relay attribution. The image only
+/// counts for a child that inherits the sandbox environment; a child started
+/// from a cleared environment never sees the image's endpoint, so the relay
+/// default still applies to it. When the default is injected, a
+/// traces-specific endpoint can only have come from a provider, and is
+/// removed so a provider cannot redirect traces.
 pub fn apply_otlp_relay_env<S: BuildHasher>(
     cmd: &mut impl EnvTarget,
     relay_active: bool,
+    child_environment: ChildEnvironment,
     user_environment: &HashMap<String, String, S>,
     exec_environment: &[(String, String)],
 ) {
     if !relay_default_applies(relay_active, user_environment, exec_environment, |key| {
-        std::env::var_os(key).is_some()
+        child_environment == ChildEnvironment::Inherited && std::env::var_os(key).is_some()
     }) {
         return;
     }
@@ -208,7 +229,58 @@ mod tests {
             [
                 ("OTEL_EXPORTER_OTLP_ENDPOINT", "http://192.0.0.8:4318"),
                 ("OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf"),
+                ("OTEL_EXPORTER_OTLP_COMPRESSION", "none"),
+                ("OTEL_EXPORTER_OTLP_TRACES_COMPRESSION", "none"),
             ]
+        );
+    }
+
+    #[derive(Default)]
+    struct RecordedEnv {
+        set: HashMap<String, String>,
+        removed: Vec<String>,
+    }
+
+    impl EnvTarget for RecordedEnv {
+        fn set_var(&mut self, key: &str, value: &str) {
+            self.set.insert(key.to_string(), value.to_string());
+        }
+
+        fn remove_var(&mut self, key: &str) {
+            self.removed.push(key.to_string());
+        }
+    }
+
+    /// A child started from a cleared environment never sees the image
+    /// `ENV`, so only the creation request and the exec environment can
+    /// suppress the default, independent of the harness environment.
+    #[test]
+    fn cleared_child_ignores_the_inherited_environment() {
+        let none: HashMap<String, String> = HashMap::new();
+        let mut env = RecordedEnv::default();
+        apply_otlp_relay_env(&mut env, true, ChildEnvironment::Cleared, &none, &[]);
+        assert_eq!(
+            env.set
+                .get("OTEL_EXPORTER_OTLP_ENDPOINT")
+                .map(String::as_str),
+            Some("http://192.0.0.8:4318")
+        );
+        assert_eq!(env.removed, ["OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"]);
+
+        let mut env = RecordedEnv::default();
+        apply_otlp_relay_env(
+            &mut env,
+            true,
+            ChildEnvironment::Cleared,
+            &none,
+            &[(
+                "OTEL_EXPORTER_OTLP_ENDPOINT".to_string(),
+                "http://collector.example:4318".to_string(),
+            )],
+        );
+        assert!(
+            env.set.is_empty() && env.removed.is_empty(),
+            "an exec endpoint still suppresses the default"
         );
     }
 

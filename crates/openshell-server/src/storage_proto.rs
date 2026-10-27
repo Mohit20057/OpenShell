@@ -166,8 +166,10 @@ mod tests {
     // public-only capability fields; durable schemas remain unchanged.
     // SandboxResponse and UpdateConfigResponse return policy warnings in the
     // new public-only PolicyWarning message; durable schemas remain unchanged.
+    // Supervisor middleware binding policy and selectors are public-only. An
+    // absent policy preserves dynamic discovery; older supervisors ignore both fields.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "31ca0a9b74df8b30a8b61cd6824daf689cd2dd062c70b28dbbab96a3fc74227d";
+        "34bcb819b3346d1c32a7c40e0a7e675a4aeab4fdc90d084b470c0408a1b401b9";
     const DURABLE_SCHEMA_SHA256: &str =
         "36ee37f13c85532dd659e6ad839d5c0b0c1ffd7778e3226b6d793c406d1e621d";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
@@ -705,7 +707,7 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (330, 29),
+                (330, 31),
                 (96, 22),
                 (84, 22),
                 PUBLIC_RPC_SCHEMA_SHA256,

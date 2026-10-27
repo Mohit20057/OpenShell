@@ -168,10 +168,15 @@ mod tests {
     // new public-only PolicyWarning message; durable schemas remain unchanged.
     // Supervisor middleware binding policy and selectors are public-only. An
     // absent policy preserves dynamic discovery; older supervisors ignore both fields.
+    // Suspend/resume adds two public request messages without durable request
+    // admission, the restart_if_restore_fails resume option, and the SUSPENDING
+    // and SUSPENDED values to the shared
+    // SandboxPhase enum. Stored rows never carried those values, so prior
+    // payloads decode unchanged.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "9d463fed7be633271842ecfd50e1b11548db826aee5718a81e97b8c1eebc9ea7";
+        "b6786baeae2cc577c11fd48837d37b3cf038f662569639a4fdd207ecfd310e8b";
     const DURABLE_SCHEMA_SHA256: &str =
-        "36ee37f13c85532dd659e6ad839d5c0b0c1ffd7778e3226b6d793c406d1e621d";
+        "64e9d327f7220b0c63151995f922ea81ed8c2b6bd38720096def578dfc01c060";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
         "f97da31f52d0508a34392ad5e1e14ff1d13bbc5384ce6b232fd0dc29e8d3ca7c";
     // Encoded with the schema that omitted stable_placeholder. Keep these
@@ -636,7 +641,7 @@ mod tests {
         }
         assert_eq!(
             compiled_method_count,
-            103 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+            106 + PROVIDER_READINESS_RPC_SIGNATURES.len()
                 + PEER_OWNER_RPC_SIGNATURES.len()
                 + PEER_CONFIG_RPC_SIGNATURES.len()
                 + isolation_methods.len()
@@ -646,7 +651,7 @@ mod tests {
         );
         assert_eq!(
             methods.len(),
-            78 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+            80 + PROVIDER_READINESS_RPC_SIGNATURES.len()
                 + PEER_OWNER_RPC_SIGNATURES.len()
                 + PEER_CONFIG_RPC_SIGNATURES.len(),
             "inventory every public gateway RPC"
@@ -656,7 +661,7 @@ mod tests {
                 .iter()
                 .filter(|method| method.starts_with("openshell.v1.OpenShell/"))
                 .count(),
-            78 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+            80 + PROVIDER_READINESS_RPC_SIGNATURES.len()
                 + PEER_OWNER_RPC_SIGNATURES.len()
                 + PEER_CONFIG_RPC_SIGNATURES.len()
         );
@@ -707,7 +712,7 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (330, 31),
+                (332, 31),
                 (96, 22),
                 (84, 22),
                 PUBLIC_RPC_SCHEMA_SHA256,

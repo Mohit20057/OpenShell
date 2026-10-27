@@ -5680,6 +5680,7 @@ mod tests {
                     sandbox_id: "grant-sandbox".to_string(),
                     source: SandboxIdentitySource::BootstrapJwt {
                         issuer: SECRET.to_string(),
+                        auth_epoch: None,
                     },
                     trust_domain: None,
                 }));

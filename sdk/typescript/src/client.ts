@@ -105,7 +105,9 @@ export type SandboxPhaseName =
   | 'stopping'
   | 'stopped'
   | 'starting'
-  | 'completed';
+  | 'completed'
+  | 'suspending'
+  | 'suspended';
 
 /** Restart behavior after the canonical main process exits. */
 export type SandboxRestartPolicyName = 'never' | 'on-failure' | 'always';
@@ -579,6 +581,8 @@ export const PHASE_NAMES: Record<SandboxPhase, SandboxPhaseName> = {
   [SandboxPhase.STOPPED]: 'stopped',
   [SandboxPhase.STARTING]: 'starting',
   [SandboxPhase.COMPLETED]: 'completed',
+  [SandboxPhase.SUSPENDING]: 'suspending',
+  [SandboxPhase.SUSPENDED]: 'suspended',
 };
 export const STATUS_NAMES: Record<ServiceStatus, HealthStatus> = {
   [ServiceStatus.UNSPECIFIED]: 'unspecified',
@@ -1354,6 +1358,9 @@ export class SandboxClient {
       if (ref.phase === 'ready' || ref.phase === 'completed') return ref;
       if (ref.phase === 'stopped') throw new SdkError('connect', `sandbox '${name}' stopped before becoming ready`);
       if (ref.phase === 'error') throw new SdkError('connect', `sandbox '${name}' entered error phase`);
+      if (ref.phase === 'suspending' || ref.phase === 'suspended') {
+        throw new SdkError('connect', `sandbox '${name}' is suspended; resume it before waiting for ready`);
+      }
       if (Date.now() >= deadline) throw new SdkError('connect', `timed out waiting for sandbox '${name}'`);
       await waitSleep(delay, deadline, signal);
       delay = Math.min(delay * 2, 2000);

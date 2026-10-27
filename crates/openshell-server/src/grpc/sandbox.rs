@@ -34,11 +34,11 @@ use openshell_core::proto::{
     ExecSandboxStdout, GetSandboxRequest, GetSandboxTemplateRequest, ListSandboxProvidersRequest,
     ListSandboxProvidersResponse, ListSandboxTemplatesRequest, ListSandboxTemplatesResponse,
     ListSandboxesRequest, ListSandboxesResponse, Provider, ProviderMutationKind,
-    ResourceRequirements, RevokeSshSessionRequest, RevokeSshSessionResponse, SandboxResources,
-    SandboxResponse, SandboxSpec, SandboxStreamEvent, SandboxTemplateResponse,
+    ResourceRequirements, ResumeSandboxRequest, RevokeSshSessionRequest, RevokeSshSessionResponse,
+    SandboxResources, SandboxResponse, SandboxSpec, SandboxStreamEvent, SandboxTemplateResponse,
     SandboxWorkloadTemplate, SandboxWorkloadTemplateProvenance, SshRelayTarget,
-    StartSandboxRequest, StopSandboxRequest, TcpForwardFrame, TcpForwardInit, TcpRelayTarget,
-    WatchSandboxRequest, relay_open, tcp_forward_init,
+    StartSandboxRequest, StopSandboxRequest, SuspendSandboxRequest, TcpForwardFrame,
+    TcpForwardInit, TcpRelayTarget, WatchSandboxRequest, relay_open, tcp_forward_init,
 };
 use openshell_core::proto::{
     BeginRootfsTarStagingRequest, BeginRootfsTarStagingResponse, Sandbox, SandboxPhase,
@@ -1854,6 +1854,109 @@ async fn handle_start_sandbox_inner(
     }))
 }
 
+pub(super) async fn handle_suspend_sandbox(
+    state: &Arc<ServerState>,
+    request: Request<SuspendSandboxRequest>,
+) -> Result<Response<SandboxResponse>, Status> {
+    let result = handle_suspend_sandbox_inner(state, request).await;
+    openshell_core::telemetry::emit_lifecycle(
+        LifecycleResource::Sandbox,
+        LifecycleOperation::Suspend,
+        if result.is_ok() {
+            TelemetryOutcome::Success
+        } else {
+            TelemetryOutcome::Failure
+        },
+    );
+    result
+}
+
+async fn handle_suspend_sandbox_inner(
+    state: &Arc<ServerState>,
+    request: Request<SuspendSandboxRequest>,
+) -> Result<Response<SandboxResponse>, Status> {
+    let principal = super::extract_principal(&request)?;
+    let req = request.into_inner();
+    let resolved = resolve_and_authorize_sandbox_name(
+        state,
+        &principal,
+        &req.name,
+        crate::auth::workspace_authz::selected_workspace_name(req.workspace_scope.as_ref())?,
+        MinWorkspaceRole::User,
+    )
+    .await?;
+    let workspace = resolved.object_workspace();
+    let name = resolved.object_name();
+    let sandbox = state.compute.suspend_sandbox(workspace, name).await?;
+    info!(sandbox_name = %name, "SuspendSandbox request completed successfully");
+    Ok(Response::new(SandboxResponse {
+        sandbox: Some(sandbox),
+        service_urls: HashMap::new(),
+        policy_warnings: Vec::new(),
+    }))
+}
+
+pub(super) async fn handle_resume_sandbox(
+    state: &Arc<ServerState>,
+    request: Request<ResumeSandboxRequest>,
+) -> Result<Response<SandboxResponse>, Status> {
+    let result = handle_resume_sandbox_inner(state, request).await;
+    openshell_core::telemetry::emit_lifecycle(
+        LifecycleResource::Sandbox,
+        LifecycleOperation::Resume,
+        if result.is_ok() {
+            TelemetryOutcome::Success
+        } else {
+            TelemetryOutcome::Failure
+        },
+    );
+    result
+}
+
+async fn handle_resume_sandbox_inner(
+    state: &Arc<ServerState>,
+    request: Request<ResumeSandboxRequest>,
+) -> Result<Response<SandboxResponse>, Status> {
+    let principal = super::extract_principal(&request)?;
+    let req = request.into_inner();
+    let resolved = resolve_and_authorize_sandbox_name(
+        state,
+        &principal,
+        &req.name,
+        crate::auth::workspace_authz::selected_workspace_name(req.workspace_scope.as_ref())?,
+        MinWorkspaceRole::User,
+    )
+    .await?;
+    if let Some(policy) = resolved.spec.as_ref().and_then(|spec| spec.policy.as_ref()) {
+        require_cedar_policy_support(policy)?;
+        require_policy_enforceable_by_driver(state.compute.driver_enforces_policy(), policy)?;
+    }
+    let workspace = resolved.object_workspace().to_string();
+    let name = resolved.object_name().to_string();
+    let mut sandbox = state
+        .compute
+        .resume_sandbox_authenticated(
+            &workspace,
+            &name,
+            req.restart_if_restore_fails,
+            state.sandbox_session_jwt_authority.as_deref(),
+        )
+        .await?;
+    let remote_authority =
+        crate::supervisor_session::remote_supervisor_owner(state, sandbox.object_id())
+            .await?
+            .is_some();
+    state
+        .supervisor_sessions
+        .project_endpoint_status(&mut sandbox, remote_authority);
+    info!(sandbox_name = %name, "ResumeSandbox request completed successfully");
+    Ok(Response::new(SandboxResponse {
+        sandbox: Some(sandbox),
+        service_urls: HashMap::new(),
+        policy_warnings: Vec::new(),
+    }))
+}
+
 pub async fn mint_persisted_authentication(
     state: &ServerState,
     sandbox: &Sandbox,
@@ -2513,7 +2616,11 @@ pub(super) async fn handle_watch_sandbox(
 fn is_watch_terminal(phase: SandboxPhase) -> bool {
     matches!(
         phase,
-        SandboxPhase::Ready | SandboxPhase::Completed | SandboxPhase::Stopped | SandboxPhase::Error
+        SandboxPhase::Ready
+            | SandboxPhase::Completed
+            | SandboxPhase::Stopped
+            | SandboxPhase::Suspended
+            | SandboxPhase::Error
     )
 }
 
@@ -4304,6 +4411,28 @@ mod tests {
         assert!(driver.calls().is_empty(), "{:?}", driver.calls());
     }
 
+    /// Resuming starts the workload again, so it applies the start checks.
+    #[cfg(not(feature = "cedar"))]
+    #[tokio::test]
+    async fn resume_rejects_a_stored_cedar_sandbox_without_cedar_support() {
+        let (state, driver) = test_server_state_with_fake_driver(false).await;
+        put_stopped_cedar_sandbox(&state, "stored-cedar").await;
+
+        let error = handle_resume_sandbox(
+            &state,
+            authed_request(ResumeSandboxRequest {
+                name: "stored-cedar".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect_err("Cedar is unsupported");
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error:?}");
+        assert!(error.message().contains("without Cedar"), "{error:?}");
+        assert!(driver.calls().is_empty(), "{:?}", driver.calls());
+    }
+
     #[cfg(feature = "cedar")]
     #[tokio::test]
     async fn create_returns_cedar_load_time_warnings() {
@@ -4449,6 +4578,7 @@ mod tests {
             SandboxPhase::Ready,
             SandboxPhase::Completed,
             SandboxPhase::Stopped,
+            SandboxPhase::Suspended,
             SandboxPhase::Error,
         ] {
             assert!(is_watch_terminal(phase), "{phase:?} should stop the watch");
@@ -4457,6 +4587,7 @@ mod tests {
             SandboxPhase::Provisioning,
             SandboxPhase::Starting,
             SandboxPhase::Stopping,
+            SandboxPhase::Suspending,
             SandboxPhase::Deleting,
             SandboxPhase::Unknown,
         ] {

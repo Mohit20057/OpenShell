@@ -49,7 +49,8 @@ OpenShell repositories
 ├── openshell-windows               MSI installer and MXC driver
 ├── openshell-desktop               macOS App Sandbox, Podman, Docker
 ├── openshell-kubernetes            Helm chart, Kubernetes driver, operator
-└── openshell-providers-<provider>  One repository per provider integration
+├── openshell-providers-<provider>  One repository per provider integration
+└── openshell-awesome               Curated OpenShell resources and examples
 ```
 
 This gives maintainers a focused area to own while keeping the shared contracts

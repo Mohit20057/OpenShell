@@ -179,7 +179,7 @@ mod tests {
     fn operator_routes_survive_compute_protocol_and_supervisor_json() {
         for endpoint in [
             SandboxTransport::Unix {
-                socket_path: std::env::temp_dir().join("backend.sock"),
+                socket_path: "/run/backend.sock".into(),
             },
             SandboxTransport::Tcp {
                 authority: "backend.example:443".into(),

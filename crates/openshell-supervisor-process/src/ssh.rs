@@ -16,6 +16,7 @@ mod upload_tests;
 use openshell_sandbox_backend::test_support as rpc_test;
 
 use crate::main_session::{MainOutput, MainSession};
+use crate::terminal_state::TerminalState;
 #[cfg(unix)]
 use libc;
 use miette::{IntoDiagnostic, Result};
@@ -394,6 +395,8 @@ struct ChannelState {
     main_input_pending: bool,
     main_detach_prefix_pending: bool,
     main_output_task: Option<tokio::task::AbortHandle>,
+    /// What a PTY client's terminal has received from a TTY main process.
+    main_terminal: Option<Arc<tokio::sync::Mutex<TerminalState>>>,
 }
 
 enum InputSender {
@@ -790,16 +793,22 @@ impl russh::server::Handler for SshHandler {
                 .get_mut(&channel)
                 .expect("main channel existence checked above");
             state.main_attached = true;
-            if let Some(pty) = state.pty_request.take() {
-                main_session
-                    .resize(
-                        pty.col_width,
-                        pty.row_height,
-                        pty.pixel_width,
-                        pty.pixel_height,
-                    )
-                    .await;
+            // Subscribe before resizing so the program's redraw follows the
+            // replay of what it drew earlier.
+            let (mut output, replay) = main_session.subscribe_terminal();
+            let pty = state.pty_request.take();
+            if let Some(pty) = pty.as_ref() {
+                let main_session = main_session.clone();
+                let (columns, rows) = (pty.col_width, pty.row_height);
+                tokio::spawn(async move {
+                    main_session.resize_for_attachment(columns, rows).await;
+                });
             }
+            // Replayed TTY output was written for the terminals attached at the
+            // time. A PTY client needs it adapted; see `TerminalState`.
+            let client_terminal = (pty.is_some() && main_session.terminal())
+                .then(|| Arc::new(tokio::sync::Mutex::new(replay.start)));
+            state.main_terminal.clone_from(&client_terminal);
             let (input, warning) = if state.main_read_only {
                 (None, None)
             } else {
@@ -814,7 +823,6 @@ impl russh::server::Handler for SshHandler {
             state.main_input_pending = warning.is_some();
             state.input_sender = input;
             state.main_detach_prefix_pending = false;
-            let mut output = main_session.subscribe();
             let terminal_delivery = main_session.clone();
             let handle = session.handle();
             session.channel_success(channel)?;
@@ -828,18 +836,55 @@ impl russh::server::Handler for SshHandler {
                     .await;
             }
             let output_task = tokio::spawn(async move {
+                let mut replaying = client_terminal.is_some();
+                if let Some(terminal) = client_terminal.as_ref() {
+                    let restore = terminal.lock().await.restore_sequence();
+                    send_terminal_bytes(&handle, channel, restore).await;
+                }
                 loop {
+                    if replaying && output.position() >= replay.end {
+                        replaying = false;
+                        if let Some(terminal) = client_terminal.as_ref() {
+                            let mut terminal = terminal.lock().await;
+                            let finish = terminal.finish_replay();
+                            send_terminal_bytes(&handle, channel, finish).await;
+                        }
+                    }
                     match output.recv().await {
                         Ok(MainOutput::Exit(code)) => {
                             terminal_delivery.wait_for_terminal_reported().await;
+                            if let Some(terminal) = client_terminal.as_ref() {
+                                let reset = terminal.lock().await.reset_sequence();
+                                send_terminal_bytes(&handle, channel, reset).await;
+                            }
                             let _ =
                                 send_main_output(&handle, channel, MainOutput::Exit(code)).await;
                             break;
+                        }
+                        Ok(MainOutput::Stdout(data)) if client_terminal.is_some() => {
+                            let terminal = client_terminal.as_ref().expect("checked above");
+                            // Hold the lock while sending so a detach reset
+                            // cannot overtake this output.
+                            let mut terminal = terminal.lock().await;
+                            if replaying {
+                                let mut filtered = Vec::with_capacity(data.len());
+                                terminal.advance(&data, Some(&mut filtered));
+                                send_terminal_bytes(&handle, channel, filtered).await;
+                            } else {
+                                terminal.advance(&data, None);
+                                let _ =
+                                    send_main_output(&handle, channel, MainOutput::Stdout(data))
+                                        .await;
+                            }
                         }
                         Ok(event) => {
                             let _ = send_main_output(&handle, channel, event).await;
                         }
                         Err(error) => {
+                            if let Some(terminal) = client_terminal.as_ref() {
+                                let reset = terminal.lock().await.reset_sequence();
+                                send_terminal_bytes(&handle, channel, reset).await;
+                            }
                             let _ = handle
                                 .extended_data(
                                     channel,
@@ -1394,7 +1439,9 @@ impl SshHandler {
         handle: Handle,
         error: Option<&str>,
     ) {
+        let mut terminal = None;
         if let Some(state) = self.channels.get_mut(&channel) {
+            terminal = state.main_terminal.take();
             if state.main_attached {
                 if let Some(main_session) = self.main_session.as_ref() {
                     main_session.end_terminal_attachment();
@@ -1413,6 +1460,12 @@ impl SshHandler {
                 task.abort();
             }
         }
+        // The aborted output task releases the lock once any send in flight
+        // completes, so the reset reaches the client after the last output.
+        if let Some(terminal) = terminal {
+            let reset = terminal.lock().await.reset_sequence();
+            send_terminal_bytes(&handle, channel, reset).await;
+        }
         if let Some(error) = error {
             let _ = handle
                 .extended_data(
@@ -1425,6 +1478,12 @@ impl SshHandler {
         let _ = handle.eof(channel).await;
         let _ = handle.exit_status_request(channel, 0).await;
         let _ = handle.close(channel).await;
+    }
+}
+
+async fn send_terminal_bytes(handle: &Handle, channel: ChannelId, data: Vec<u8>) {
+    if !data.is_empty() {
+        let _ = handle.data(channel, bytes::Bytes::from(data)).await;
     }
 }
 
@@ -2078,6 +2137,82 @@ mod tests {
             .acquire_input()
             .expect("detaching must release the input lease");
         main_session.release_input(owner);
+    }
+
+    async fn main_output_until_close(channel: &mut russh::Channel<russh::client::Msg>) -> Vec<u8> {
+        let mut output = Vec::new();
+        loop {
+            match next_main_event(channel).await {
+                russh::ChannelMsg::Data { data } => output.extend_from_slice(&data),
+                russh::ChannelMsg::Close => return output,
+                _ => {}
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn main_terminal_attachment_adapts_replay_and_resets_on_detach() {
+        let (main_session, _input) = MainSession::inert_terminal();
+        main_session
+            .publish_test_output(b"\x1b[?1049h\x1b[1;24r\x1b[6nscreen\x1b]11;?\x07\x1b[?2004h");
+        let client = main_test_client(Some(main_session.clone())).await;
+        let mut channel = client.channel_open_session().await.unwrap();
+        channel
+            .request_pty(true, "xterm-256color", 100, 30, 0, 0, &[])
+            .await
+            .unwrap();
+        assert!(matches!(
+            next_main_event(&mut channel).await,
+            russh::ChannelMsg::Success
+        ));
+        channel
+            .request_subsystem(true, "openshell-main")
+            .await
+            .unwrap();
+        assert!(matches!(
+            next_main_event(&mut channel).await,
+            russh::ChannelMsg::Success
+        ));
+        let mut replayed = Vec::new();
+        let expected: &[u8] = b"\x1b[?1049h\x1b[1;24rscreen\x1b[?2004h\x1b7\x1b[r\x1b8";
+        while replayed.len() < expected.len() {
+            match next_main_event(&mut channel).await {
+                russh::ChannelMsg::Data { data } => replayed.extend_from_slice(&data),
+                event => panic!("expected replayed output, got {event:?}"),
+            }
+        }
+        // Queries are dropped and the stale scroll region is reset.
+        assert_eq!(replayed, expected);
+
+        main_session.publish_test_output(b"live\x1b[6n");
+        channel.data(&b"\x10\x11"[..]).await.unwrap();
+        assert_eq!(
+            main_output_until_close(&mut channel).await,
+            b"live\x1b[6n\x1b[m\x1b[?2004l\x1b[?1049l"
+        );
+        assert!(!main_session.finished());
+    }
+
+    #[tokio::test]
+    async fn main_terminal_attachment_without_pty_replays_raw_output() {
+        let (main_session, _input) = MainSession::inert_terminal();
+        main_session.publish_test_output(b"\x1b[?1049h\x1b[6nscreen");
+        let client = main_test_client(Some(main_session)).await;
+        let mut channel = client.channel_open_session().await.unwrap();
+        channel
+            .request_subsystem(true, "openshell-main")
+            .await
+            .unwrap();
+        assert!(matches!(
+            next_main_event(&mut channel).await,
+            russh::ChannelMsg::Success
+        ));
+        assert!(matches!(
+            next_main_event(&mut channel).await,
+            russh::ChannelMsg::Data { data } if data == b"\x1b[?1049h\x1b[6nscreen"[..]
+        ));
+        channel.data(&b"\x04"[..]).await.unwrap();
+        assert_eq!(main_output_until_close(&mut channel).await, b"");
     }
 
     #[test]

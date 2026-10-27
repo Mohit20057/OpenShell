@@ -509,7 +509,7 @@ when { context.method == "GET" };
 - Policy templates are not supported.
 - A policy cannot nest brackets more than 64 deep or chain more than 1,024 operators in one policy. Replace a long `||` chain with a set literal such as `["a", "b"].contains(context.path)`, or split the policy.
 - A request whose path, query key or value, method, or other inspected field is longer than 16 KiB is denied.
-- A request whose repeated query values have more than 1024 combinations, or more than 16,384 divided by the number of policies, is denied, because each combination evaluates every policy. With 201 policies, the limit is 81 combinations.
+- A request whose repeated query values have more than 4,096 combinations, or more than 16,384 divided by the number of policies, is denied, because each combination evaluates every policy. With 201 policies, the limit is 81 combinations.
 
 ## Next Steps
 

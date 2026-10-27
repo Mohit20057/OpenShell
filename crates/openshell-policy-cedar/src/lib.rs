@@ -50,12 +50,10 @@ use limits::SourceShape;
 /// Most evaluations one `HttpRequest` gets for the combinations of its
 /// repeated query values.
 ///
-/// Each combination rebuilds the request, which costs about as much as
-/// evaluating several policies, so even a small policy set gets no more than
-/// this. A policy set of more than 16 policies gets fewer; see
+/// A policy set of more than 4 policies gets fewer; see
 /// [`MAX_QUERY_POLICY_EVALUATIONS`]. A request over the cap is not
 /// evaluated; see [`CedarEngineError::TooManyQueryCombinations`].
-pub const MAX_QUERY_COMBINATIONS: usize = 1024;
+pub const MAX_QUERY_COMBINATIONS: usize = 4096;
 
 /// Most policy evaluations one `HttpRequest` gets for the combinations of
 /// its repeated query values: the combinations times the policies of the

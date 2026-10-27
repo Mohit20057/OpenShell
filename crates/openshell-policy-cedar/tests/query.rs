@@ -205,22 +205,22 @@ fn combinations_over_the_cap_are_not_evaluated() {
         "permit",
         &format!("{} && {}", tag_like("a", "*"), tag_like("b", "*")),
     ));
-    // 32 * 32 combinations are evaluated; 33 * 32 are over the cap.
-    let values: Vec<String> = (0..33).map(|value| value.to_string()).collect();
+    // 64 * 64 combinations are evaluated; 65 * 64 are over the cap.
+    let values: Vec<String> = (0..65).map(|value| value.to_string()).collect();
     let values: Vec<&str> = values.iter().map(String::as_str).collect();
-    assert_eq!(MAX_QUERY_COMBINATIONS, 1024);
+    assert_eq!(MAX_QUERY_COMBINATIONS, 4096);
     assert!(allows(
         &engine,
-        &[("a", &values[..32]), ("b", &values[..32])]
+        &[("a", &values[..64]), ("b", &values[..64])]
     ));
     let error = engine
-        .evaluate_l7(&request(&[("a", &values), ("b", &values[..32])]))
+        .evaluate_l7(&request(&[("a", &values), ("b", &values[..64])]))
         .unwrap_err();
     assert!(
         matches!(
             error,
             CedarEngineError::TooManyQueryCombinations {
-                combinations: 1056,
+                combinations: 4160,
                 limit: MAX_QUERY_COMBINATIONS,
             }
         ),

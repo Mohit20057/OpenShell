@@ -192,7 +192,7 @@ Its Lean specification and proofs are in `ai-openshell/cedar-spec`.
   comparison (all policies). Only keys the relevant policies name literally
   enter the entity, so other keys' values do not multiply evaluations, unless
   a policy computes a key. Each combination evaluates every policy, so more
-  than `MAX_QUERY_COMBINATIONS` (1024) combinations, or more than
+  than `MAX_QUERY_COMBINATIONS` (4096) combinations, or more than
   `MAX_QUERY_POLICY_EVALUATIONS` (16,384) divided by the number of deciding
   policies, is an error, which the supervisor turns into a denial with that
   reason. Audit paths use the same combined decision.

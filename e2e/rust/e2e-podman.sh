@@ -18,12 +18,6 @@ RUN_WITH_GATEWAY_COMMAND="__openshell_run_podman_e2e"
 # shellcheck source=e2e/support/conformance.sh
 source "${ROOT}/e2e/support/conformance.sh"
 
-# Enable OTLP export in the generated gateway config so the otlp_relay test
-# can bind a collector stub on this port. Containers reach the host through
-# host.containers.internal. Set the variable to an empty string to disable
-# export and run the relay's inert case instead.
-export OPENSHELL_E2E_OTLP_ENDPOINT="${OPENSHELL_E2E_OTLP_ENDPOINT-http://host.containers.internal:4317}"
-
 # Keep required branch CI on the Podman targets that are known to pass. The
 # unfiltered e2e:podman task remains available while the omitted targets are
 # stabilized and can be added here.
@@ -105,6 +99,16 @@ fi
 # An empty selector runs the full Podman suite, including provider_token_exchange.
 if [ "${#SELECTED_TESTS[@]}" -eq 0 ] || [[ " ${SELECTED_TESTS[*]} " == *" provider_token_exchange "* ]]; then
   export OPENSHELL_E2E_SPIFFE_FIXTURE="${OPENSHELL_E2E_SPIFFE_FIXTURE:-1}"
+fi
+
+# When the selection includes otlp_relay, enable OTLP export in the generated
+# gateway config so the test can bind a collector stub on this port. All
+# selected tests share the gateway, so they run with the relay enabled too.
+# Containers reach the host through host.containers.internal. Set the
+# variable to an empty string to disable export and run the relay's inert
+# case instead.
+if [ "${#SELECTED_TESTS[@]}" -eq 0 ] || [[ " ${SELECTED_TESTS[*]} " == *" otlp_relay "* ]]; then
+  export OPENSHELL_E2E_OTLP_ENDPOINT="${OPENSHELL_E2E_OTLP_ENDPOINT-http://host.containers.internal:4317}"
 fi
 
 if [ -n "${OPENSHELL_GATEWAY_ENDPOINT:-}" ] && [ -z "${OPENSHELL_BIN:-}" ]; then

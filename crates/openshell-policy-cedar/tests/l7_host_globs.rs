@@ -7,6 +7,7 @@
 
 use openshell_policy_cedar::{
     CedarEngine, CedarEngineError, Decision, HttpRequestInput, L7Enforcement, L7Protocol,
+    NetworkConnectRequest,
 };
 
 fn engine(policy: &str) -> CedarEngine {
@@ -142,6 +143,62 @@ fn a_forbid_with_a_host_glob_inspects_too() {
         engine.l7_protocol("api.example.com", 443),
         Some(L7Protocol::Rest)
     );
+}
+
+#[test]
+fn a_host_with_an_empty_label_is_denied_without_evaluation() {
+    // Cedar's delimited `*` and `**` match empty labels, but the host matcher
+    // that selects inspection does not, so the forbid would never see these.
+    let engine = engine(&format!(
+        r#"permit (principal, action == Sandbox::Action::"NetworkConnect", resource)
+when {{ resource.host like("*.example.com", ".") && resource.port == 443 }};
+permit (principal, action == Sandbox::Action::"NetworkConnect", resource)
+when {{ resource.host like("**.example.org", ".") && resource.port == 443 }};
+{}"#,
+        glob_policy("", "forbid", WILDCARD_443, r#"context.method == "DELETE""#)
+    ));
+    let connect = |host: &str| {
+        engine
+            .authorize_network(&NetworkConnectRequest {
+                user: "sandbox".to_string(),
+                group: "sandbox".to_string(),
+                host: host.to_string(),
+                port: 443,
+                binary_path: "/usr/bin/curl".to_string(),
+                ancestors: Vec::new(),
+                binary_aliases: Vec::new(),
+                binary_globs: Vec::new(),
+                destination_ip: None,
+            })
+            .expect("request evaluates")
+            .decision
+    };
+    for host in [
+        ".example.com",
+        ".example.com.",
+        "api.example.com..",
+        "a..example.org",
+        ".example.org",
+        "",
+    ] {
+        assert!(inspected(&engine, host).is_empty(), "{host:?}");
+        assert_eq!(
+            connect(host),
+            Decision::Deny {
+                matched_policies: Vec::new()
+            },
+            "{host:?}"
+        );
+        let evaluation = engine
+            .evaluate_l7(&request(host, "DELETE", "/", ""))
+            .expect("request evaluates");
+        assert!(!evaluation.is_allow(), "{host:?}");
+    }
+    // A single trailing dot is still the absolute form of the host.
+    for host in ["api.example.com", "api.example.com.", "a.b.example.org"] {
+        assert!(connect(host).is_allow(), "{host:?}");
+    }
+    assert!(!inspected(&engine, "api.example.com.").is_empty());
 }
 
 #[test]

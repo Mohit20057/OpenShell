@@ -387,8 +387,9 @@ pub enum CedarEngineError {
     /// A request's repeated query keys have more value combinations than
     /// Cedar evaluates for one request.
     ///
-    /// Each combination is a separate Cedar evaluation, so the count is
-    /// capped and a request over it is denied.
+    /// Each combination is a separate Cedar evaluation of every policy, so
+    /// the count is capped, lower for a larger policy set, and a request
+    /// over it is denied.
     #[error(
         "request query parameters have {combinations} value combinations, more than the \
          {limit} Cedar evaluates for one request"
@@ -397,7 +398,10 @@ pub enum CedarEngineError {
     TooManyQueryCombinations {
         /// The number of combinations, saturating at `usize::MAX`.
         combinations: usize,
-        /// The cap, [`crate::MAX_QUERY_COMBINATIONS`].
+        /// The cap for the evaluated policy set:
+        /// [`crate::MAX_QUERY_COMBINATIONS`], or
+        /// [`crate::MAX_QUERY_POLICY_EVALUATIONS`] divided by its number of
+        /// policies when that is smaller, and at least 1.
         limit: usize,
     },
 

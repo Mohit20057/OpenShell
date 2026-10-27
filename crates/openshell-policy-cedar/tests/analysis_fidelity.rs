@@ -5,8 +5,8 @@
 //! a policy set enforces: staged policies never change inspection, audit
 //! warnings consider every entry that can route a request, forbids cannot
 //! deny before resolution because the address is absent, identity
-//! attributes that requests do not carry are rejected, and host overlap
-//! analysis stays bounded.
+//! attributes that requests do not carry and tests of which process the
+//! principal is are rejected, and host overlap analysis stays bounded.
 
 use std::time::{Duration, Instant};
 
@@ -369,6 +369,40 @@ fn a_staged_policy_is_compared_on_every_entry_that_selects_its_host() {
     assert_eq!(other.staged, None, "the staged forbid names another host");
 }
 
+#[test]
+fn a_staged_glob_is_compared_on_an_exact_entry_that_declares_the_routed_path() {
+    // The exact entry declares the path requests to api.github.com are
+    // routed to, so its inspection, not the glob's, decides them.
+    let exact = http_policy(
+        r#"@path("/repos/**")"#,
+        "permit",
+        "api.github.com",
+        r#"context.method == "GET""#,
+    );
+    let staged = glob_policy(
+        r#"@enforcement("staged") @id("no-hooks")"#,
+        "forbid",
+        "*.github.com",
+        r#"context.path like("/repos/*/*/hooks", "/")"#,
+    );
+    let hooks = request("api.github.com", "GET", "/repos/a/b/hooks", "/repos/**");
+    for base in [
+        exact.clone(),
+        format!(
+            "{exact}{}",
+            glob_policy("", "permit", "*.github.com", r#"context.method == "POST""#)
+        ),
+    ] {
+        let with = assert_staged_changes_nothing(&base, &staged, std::slice::from_ref(&hooks));
+        let evaluation = with.evaluate_l7(&hooks).unwrap();
+        assert!(evaluation.is_allow(), "a staged forbid never denies");
+        assert!(
+            evaluation.staged.is_some_and(|staged| !staged.is_allow()),
+            "the staged glob is compared through the exact entry: {base}"
+        );
+    }
+}
+
 // ── Audit warnings over every entry that can route a request (F5) ─────────
 
 #[test]
@@ -519,7 +553,7 @@ fn forbids_whose_address_reads_are_guarded_load_and_deny_only_once_resolved() {
     }
 }
 
-// ── Process identity (F14) ────────────────────────────────────────────────
+// ── Process identity (F14) and principal constraints ──────────────────────
 
 #[test]
 fn policies_reading_principal_user_or_group_are_rejected() {
@@ -566,6 +600,64 @@ when { principal has user && principal has group };"#,
         r#"permit (principal, action == Sandbox::Action::"NetworkConnect",
         resource == Sandbox::NetworkEndpoint::"pypi.org:443")
 when { { user: context.binary_path }.user == "/usr/bin/curl" };"#,
+    );
+}
+
+#[test]
+fn policies_testing_which_process_the_principal_is_are_rejected() {
+    for policy in [
+        // Scope constraints.
+        r#"forbid (principal == Sandbox::Process::"curl",
+        action == Sandbox::Action::"NetworkConnect", resource);"#,
+        r#"forbid (principal == Sandbox::Process::"current",
+        action == Sandbox::Action::"NetworkConnect", resource);"#,
+        r#"forbid (principal in Sandbox::Process::"curl",
+        action == Sandbox::Action::"HttpRequest", resource);"#,
+        r#"forbid (principal in Sandbox::Group::"sandbox",
+        action == Sandbox::Action::"NetworkConnect", resource);"#,
+        r#"forbid (principal is Sandbox::Process in Sandbox::Process::"curl",
+        action == Sandbox::Action::"NetworkConnect", resource);"#,
+        // Conditions.
+        r#"forbid (principal, action == Sandbox::Action::"NetworkConnect", resource)
+when { principal == Sandbox::Process::"curl" };"#,
+        r#"forbid (principal, action == Sandbox::Action::"NetworkConnect", resource)
+unless { principal != Sandbox::Process::"curl" };"#,
+        r#"forbid (principal, action == Sandbox::Action::"NetworkConnect", resource)
+when { principal in Sandbox::Group::"sandbox" };"#,
+        r#"forbid (principal, action == Sandbox::Action::"NetworkConnect", resource)
+when { principal in [Sandbox::Process::"a", Sandbox::Process::"b"] };"#,
+        r#"forbid (principal, action == Sandbox::Action::"NetworkConnect", resource)
+when { principal == resource };"#,
+        r#"forbid (principal, action == Sandbox::Action::"NetworkConnect", resource)
+when { [Sandbox::Process::"curl"].contains(principal) };"#,
+        r#"forbid (principal, action == Sandbox::Action::"NetworkConnect", resource)
+when { principal is Sandbox::Process in Sandbox::Process::"curl" };"#,
+        r#"forbid (principal, action == Sandbox::Action::"NetworkConnect", resource)
+when { principal is Sandbox::User };"#,
+        // Operands that evaluate to the principal.
+        r#"forbid (principal, action == Sandbox::Action::"NetworkConnect", resource)
+when { (if context.binary_path == "/usr/bin/curl" then principal else principal)
+    == Sandbox::Process::"curl" };"#,
+        r#"forbid (principal, action == Sandbox::Action::"NetworkConnect", resource)
+when { { p: principal } == { p: Sandbox::Process::"curl" } };"#,
+    ] {
+        let error = rejection(policy);
+        assert!(
+            matches!(&error, CedarEngineError::UnsupportedPolicy { reason, .. }
+                if reason.contains("tests which process the principal is")),
+            "{policy}: {error}"
+        );
+    }
+}
+
+#[test]
+fn an_unconstrained_principal_still_loads() {
+    engine(
+        r#"permit (principal is Sandbox::Process, action == Sandbox::Action::"NetworkConnect",
+        resource == Sandbox::NetworkEndpoint::"pypi.org:443")
+when { principal is Sandbox::Process && principal has user };
+forbid (principal, action == Sandbox::Action::"NetworkConnect", resource)
+when { context.binary_path == "/usr/bin/nc" };"#,
     );
 }
 

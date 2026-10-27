@@ -94,7 +94,7 @@ Each `endpoint_settings` entry selects endpoints the way a YAML endpoint does: `
 
 | Field | Applies to |
 |---|---|
-| `tls: skip` | Endpoints the Cedar policy does not inspect. An entry that sets it on an endpoint with `HttpRequest` policies is rejected, and a provider's `tls: skip` is ignored there, so the policy still decides each request. Cannot be combined with `path`. |
+| `tls: skip` | Endpoints the Cedar policy does not inspect, such as one whose client pins the server certificate or presents a client certificate, which inspection breaks. An entry that sets it on an endpoint with `HttpRequest` policies is rejected, and a provider's `tls: skip` is ignored there, so the policy still decides each request. Cannot be combined with `path`. |
 | `allow_encoded_slash` | Inspected requests. |
 | `json_rpc.max_body_bytes`, `mcp.max_body_bytes` | JSON-RPC and MCP endpoints. |
 | `mcp.versions`, `mcp.strict_tool_names` | MCP endpoints. Without `mcp.versions`, an MCP endpoint uses the YAML default revision. |
@@ -106,7 +106,7 @@ An entry with a `path` applies to requests whose path it matches, and an entry w
 
 ## Policy Model
 
-Every policy is evaluated against a fixed schema in the `Sandbox` namespace. The principal is always a `Sandbox::Process`. Sandbox identity attributes are not yet available to policies: every request carries the same placeholder `user` and `group`, so OpenShell rejects a policy that reads `principal.user` or `principal.group`.
+Every policy is evaluated against a fixed schema in the `Sandbox` namespace. The principal is always a `Sandbox::Process`. Sandbox identity attributes are not yet available to policies: every request carries the same placeholder `user` and `group`, so OpenShell rejects a policy that reads `principal.user` or `principal.group`. Every request is also evaluated as the same placeholder process, so OpenShell rejects a policy that tests which process the principal is, such as `principal == Sandbox::Process::"..."` or `principal in ...` in its scope or conditions. Write `principal` or `principal is Sandbox::Process`.
 
 | Action | Resource | Context fields | Decides |
 |---|---|---|---|
@@ -302,7 +302,7 @@ when {
 };
 ```
 
-Any other way of naming the host, such as an undelimited `like`, a wildcard top-level domain, two hosts joined with `||`, or a glob without a port, is rejected. The request's `NetworkEndpoint` is the actual host and port, so the glob condition decides the request as written.
+Any other way of naming the host, such as an undelimited `like`, a wildcard top-level domain, two hosts joined with `||`, or a glob without a port, is rejected. The request's `NetworkEndpoint` is the actual host and port, so the glob condition decides the request as written. OpenShell denies a connection or request to a host with an empty label, such as `.example.com` or `a..example.com`, because no wildcard host inspects it.
 
 A host matched by an exact endpoint and a wildcard host, or by two wildcard hosts, is inspected with the paths of all of them, and each request is routed to the most specific matching path, as for YAML endpoints sharing a host and port. Two such endpoints must inspect equally specific paths that can match the same request with the same protocol and enforcement, as YAML rejects overlapping endpoints that disagree. Comparing hosts has a fixed work budget, so a policy with hundreds of long, similar wildcard hosts on one port is rejected; wildcard hosts with different last labels are never compared. [Endpoint settings](#add-middleware-and-endpoint-settings) select wildcard-inspected hosts the same way they select any host.
 
@@ -375,7 +375,7 @@ forbid (
 when { context.query.hasTag("force") && context.query.getTag("force") == "true" };
 ```
 
-When a key repeats, as in `?tag=foo-a&tag=foo-b`, OpenShell evaluates the request once for each combination of values. It allows the request only if no evaluation is denied and one `permit` allows every evaluation. This matches YAML: a permit must accept every value of each key it reads, and a `forbid` applies when each key it reads has one matching value. Write each YAML allow rule as its own `permit`, because two rules joined with `||` in one permit can together allow values that neither rule allows alone. OpenShell denies a request with more than 4096 combinations of the keys that deciding policies read. Staged policies have a separate comparison budget; exceeding it or encountering an evaluation error skips the staged comparison and preserves the enforced decision.
+When a key repeats, as in `?tag=foo-a&tag=foo-b`, OpenShell evaluates the request once for each combination of values. It allows the request only if no evaluation is denied and one `permit` allows every evaluation. This matches YAML: a permit must accept every value of each key it reads, and a `forbid` applies when each key it reads has one matching value. Write each YAML allow rule as its own `permit`, because two rules joined with `||` in one permit can together allow values that neither rule allows alone. OpenShell denies a request with too many combinations of the keys that deciding policies read; see [Limitations](#limitations). Staged policies have a separate comparison budget; exceeding it or encountering an evaluation error skips the staged comparison and preserves the enforced decision.
 
 ### MCP
 
@@ -509,6 +509,7 @@ when { context.method == "GET" };
 - Policy templates are not supported.
 - A policy cannot nest brackets more than 64 deep or chain more than 1,024 operators in one policy. Replace a long `||` chain with a set literal such as `["a", "b"].contains(context.path)`, or split the policy.
 - A request whose path, query key or value, method, or other inspected field is longer than 16 KiB is denied.
+- A request whose repeated query values have more than 1024 combinations, or more than 16,384 divided by the number of policies, is denied, because each combination evaluates every policy. With 201 policies, the limit is 81 combinations.
 
 ## Next Steps
 

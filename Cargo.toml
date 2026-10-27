@@ -104,7 +104,8 @@ cedar-policy = { git = "https://github.com/ai-openshell/cedar.git", rev = "3cba2
 # Runs Cedar parsing, analysis, and evaluation on a grown stack; Cedar
 # recurses once per expression level and per character of a delimited `like`.
 # Keep the version Cedar uses: its own stack checks read the same
-# thread-local, which a second `stacker` in Cargo.lock would not share.
+# thread-local, which a second `stacker` in Cargo.lock would not share
+# (deny.toml rejects a second version).
 stacker = "0.1.25"
 
 # HTTP client

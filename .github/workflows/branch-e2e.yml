@@ -110,6 +110,7 @@ jobs:
       cargo-version: ${{ needs.version.outputs.cargo }}
       # Match Release Dev, which enables the Cedar policy engine.
       extra-cargo-features: cedar
+      required-crates: cedar-policy openshell-policy-cedar
     secrets:
       CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
 

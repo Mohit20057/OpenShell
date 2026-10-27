@@ -2,13 +2,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Checks for `HttpRequest` query parameters: `context.query` tags, one
-//! evaluation per combination of repeated values, the cap on combinations,
+//! evaluation per combination of repeated values, the caps on combinations,
 //! and how the combined decision interacts with audit and staged policies.
 
 use std::collections::BTreeMap;
 
 use openshell_policy_cedar::{
     CedarEngine, CedarEngineError, Decision, HttpRequestInput, MAX_QUERY_COMBINATIONS,
+    MAX_QUERY_POLICY_EVALUATIONS,
 };
 
 const ENDPOINT: &str = r#"Sandbox::NetworkEndpoint::"api.example.com:443""#;
@@ -204,22 +205,22 @@ fn combinations_over_the_cap_are_not_evaluated() {
         "permit",
         &format!("{} && {}", tag_like("a", "*"), tag_like("b", "*")),
     ));
-    // 64 * 64 combinations are evaluated; 65 * 64 are over the cap.
-    let values: Vec<String> = (0..65).map(|value| value.to_string()).collect();
+    // 32 * 32 combinations are evaluated; 33 * 32 are over the cap.
+    let values: Vec<String> = (0..33).map(|value| value.to_string()).collect();
     let values: Vec<&str> = values.iter().map(String::as_str).collect();
-    assert_eq!(MAX_QUERY_COMBINATIONS, 4096);
+    assert_eq!(MAX_QUERY_COMBINATIONS, 1024);
     assert!(allows(
         &engine,
-        &[("a", &values[..64]), ("b", &values[..64])]
+        &[("a", &values[..32]), ("b", &values[..32])]
     ));
     let error = engine
-        .evaluate_l7(&request(&[("a", &values), ("b", &values[..64])]))
+        .evaluate_l7(&request(&[("a", &values), ("b", &values[..32])]))
         .unwrap_err();
     assert!(
         matches!(
             error,
             CedarEngineError::TooManyQueryCombinations {
-                combinations: 4160,
+                combinations: 1056,
                 limit: MAX_QUERY_COMBINATIONS,
             }
         ),
@@ -241,6 +242,36 @@ fn combinations_over_the_cap_are_not_evaluated() {
             limit: MAX_QUERY_COMBINATIONS,
         }) if combinations == MAX_QUERY_COMBINATIONS + 1
     ));
+}
+
+#[test]
+fn larger_policy_sets_get_fewer_combinations() {
+    // Each combination evaluates every policy, so a set of 201 policies
+    // gets 16,384 / 201 = 81 combinations.
+    let mut policy = http_policy("", "permit", &tag_like("a", "*"));
+    for index in 0..200 {
+        policy.push_str(&http_policy(
+            "",
+            "permit",
+            &format!(r#"context.path == "/{index}""#),
+        ));
+    }
+    let engine = engine(&policy);
+    assert_eq!(MAX_QUERY_POLICY_EVALUATIONS / 201, 81);
+    let values: Vec<String> = (0..82).map(|value| value.to_string()).collect();
+    let values: Vec<&str> = values.iter().map(String::as_str).collect();
+    assert!(allows(&engine, &[("a", &values[..81])]));
+    let error = engine.evaluate_l7(&request(&[("a", &values)])).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            CedarEngineError::TooManyQueryCombinations {
+                combinations: 82,
+                limit: 81,
+            }
+        ),
+        "{error}"
+    );
 }
 
 #[test]

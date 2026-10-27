@@ -128,7 +128,12 @@
 //! - **Process identity.** Every request carries the same placeholder
 //!   `principal.user` and `principal.group`, since the sandbox's run-as
 //!   identity is not yet available to policies, so a policy that reads
-//!   either is rejected rather than evaluated against a constant.
+//!   either is rejected rather than evaluated against a constant. Every
+//!   request is also evaluated as the same placeholder process, so a policy
+//!   that tests which process the principal is, with a scope other than
+//!   `principal` or `principal is Sandbox::Process`, or with `==`, `!=`,
+//!   `in`, a `contains` method, or `is` on it in its conditions, is rejected
+//!   too: it could never match a real process.
 //!
 //! Before any of that, the policy set is validated against the schema in
 //! strict mode, so a typo such as `context.binray_path` is a load error
@@ -813,6 +818,7 @@ pub fn analyze(schema: &Schema, policies: &PolicySet) -> Result<PolicyAnalysis, 
         )?;
         check_delimited_patterns(conditions, &policy_id)?;
         check_principal_identity(conditions, &policy_id)?;
+        check_principal_constraints(policy, conditions, &policy_id)?;
         let scope = ActionScope::of(policy);
         check_has_tests(conditions, policy, &policy_id, &scope, schema, &declared)?;
         let touches_filesystem = (scope.includes(actions::READ_FILE)
@@ -1440,6 +1446,67 @@ fn check_principal_identity(expr: &Value, policy_id: &str) -> Result<(), CedarEn
             .iter()
             .try_for_each(|value| check_principal_identity(value, policy_id)),
         _ => Ok(()),
+    }
+}
+
+/// Rejects a test of which process the principal is, in the scope or within
+/// `conditions`; see the module docs.
+///
+/// The scope may only be `principal` or `principal is Sandbox::Process`. In
+/// `conditions`, an `==`, `!=`, `in`, or `contains`-family operand, or the
+/// receiver of an `is` other than a bare `is Sandbox::Process`, counts when
+/// it can evaluate to a `Process`, as for [`check_principal_identity`].
+///
+/// # Errors
+///
+/// Returns [`CedarEngineError::UnsupportedPolicy`] for the first such test.
+fn check_principal_constraints(
+    policy: &Policy,
+    conditions: &Value,
+    policy_id: &str,
+) -> Result<(), CedarEngineError> {
+    let unconstrained = match policy.principal_constraint() {
+        PrincipalConstraint::Any => true,
+        PrincipalConstraint::Is(entity_type) => entity_type.to_string() == entity_types::PROCESS,
+        _ => false,
+    };
+    if unconstrained && !tests_principal(conditions) {
+        return Ok(());
+    }
+    Err(CedarEngineError::UnsupportedPolicy {
+        policy_id: policy_id.to_string(),
+        reason: "it tests which process the principal is, but every request is evaluated \
+                 with the same placeholder process, so the test cannot tell processes apart; \
+                 use `principal` or `principal is Sandbox::Process`"
+            .to_string(),
+    })
+}
+
+/// Returns whether `expr` compares a value that may be a `Process` with
+/// `==`, `!=`, `in`, or a `contains` method, or tests its type other than
+/// as a bare `is Sandbox::Process`.
+fn tests_principal(expr: &Value) -> bool {
+    match expr {
+        Value::Object(fields) => fields.iter().any(|(name, value)| {
+            let compares = match name.as_str() {
+                "==" | "!=" | "in" | "contains" | "containsAll" | "containsAny" => {
+                    ["left", "right"]
+                        .iter()
+                        .any(|operand| value.get(operand).is_some_and(may_be_process))
+                }
+                "is" => {
+                    value.get("in").is_some_and(may_be_process)
+                        || value.get("left").is_some_and(may_be_process)
+                            && (value.get("in").is_some()
+                                || value.get("entity_type").and_then(Value::as_str)
+                                    != Some(entity_types::PROCESS))
+                }
+                _ => false,
+            };
+            compares || tests_principal(value)
+        }),
+        Value::Array(values) => values.iter().any(tests_principal),
+        _ => false,
     }
 }
 

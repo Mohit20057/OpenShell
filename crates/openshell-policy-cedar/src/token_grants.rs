@@ -357,7 +357,11 @@ impl TokenGrantRules {
     fn admit(&self, requests: &[HttpRequestInput]) -> Result<BTreeSet<String>, CedarEngineError> {
         let mut admitted: Option<BTreeSet<usize>> = None;
         for request in requests {
-            let query = QueryCombinations::new(&request.query, &self.query_keys)?;
+            let query = QueryCombinations::new(
+                &request.query,
+                &self.query_keys,
+                self.policies.num_of_policies(),
+            )?;
             let context = self.evaluator.l7_context(request);
             // The permits that allowed every combination so far.
             let mut permits: Option<Vec<PolicyId>> = None;

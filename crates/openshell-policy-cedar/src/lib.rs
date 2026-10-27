@@ -50,9 +50,22 @@ use limits::SourceShape;
 /// Most evaluations one `HttpRequest` gets for the combinations of its
 /// repeated query values.
 ///
-/// A request over the cap is not evaluated; see
-/// [`CedarEngineError::TooManyQueryCombinations`].
-pub const MAX_QUERY_COMBINATIONS: usize = 4096;
+/// Each combination rebuilds the request, which costs about as much as
+/// evaluating several policies, so even a small policy set gets no more than
+/// this. A policy set of more than 16 policies gets fewer; see
+/// [`MAX_QUERY_POLICY_EVALUATIONS`]. A request over the cap is not
+/// evaluated; see [`CedarEngineError::TooManyQueryCombinations`].
+pub const MAX_QUERY_COMBINATIONS: usize = 1024;
+
+/// Most policy evaluations one `HttpRequest` gets for the combinations of
+/// its repeated query values: the combinations times the policies of the
+/// evaluated set.
+///
+/// Each combination evaluates every policy, so the combinations are capped
+/// at this divided by the number of policies, or [`MAX_QUERY_COMBINATIONS`]
+/// when that is smaller, and one combination is always evaluated: 81 for a
+/// set of 201 policies.
+pub const MAX_QUERY_POLICY_EVALUATIONS: usize = 16_384;
 
 /// Synthetic id for the single `Process` entity built per request.
 ///
@@ -302,7 +315,6 @@ impl RequestUids {
 ///
 /// Loads a Cedar schema and policy set once, validates and analyzes them,
 /// then evaluates [`NetworkConnectRequest`]s and [`HttpRequestInput`]s against them.
-#[derive(Debug)]
 pub struct CedarEngine {
     evaluator: Evaluator,
     /// Every authored policy, including staged ones.
@@ -322,6 +334,22 @@ pub struct CedarEngine {
     analysis: PolicyAnalysis,
     /// The shape of the policy text, which sizes the stack evaluation needs.
     shape: SourceShape,
+}
+
+// Summarizes the engine: a derived `Debug` would recurse once per expression
+// level of every policy, outside the stack `limits::with_stack` grows for it.
+impl std::fmt::Debug for CedarEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CedarEngine")
+            .field("policies", &self.policies.policies().count())
+            .field(
+                "deciding_policies",
+                &self.deciding_policies.policies().count(),
+            )
+            .field("l7_endpoints", &self.analysis.l7_endpoints.len())
+            .field("shape", &self.shape)
+            .finish_non_exhaustive()
+    }
 }
 
 /// The permits a request parsed as GraphQL on one path is decided without:
@@ -557,7 +585,8 @@ impl CedarEngine {
     /// and forbids are evaluated as written with the address absent, so a
     /// forbid's other conditions still deny and its guarded address
     /// conditions are false. With `destination_ip` every enforced policy
-    /// decides the request for that address.
+    /// decides the request for that address. A host with an empty DNS
+    /// label, such as `a..example.com`, is denied without evaluation.
     ///
     /// # Errors
     ///
@@ -570,6 +599,16 @@ impl CedarEngine {
         request: &NetworkConnectRequest,
     ) -> Result<NetworkEvaluation, CedarEngineError> {
         let longest = limits::check_network_request(request)?;
+        if has_empty_label(&request.host) {
+            return Ok(NetworkEvaluation {
+                decision: Decision::Deny {
+                    matched_policies: Vec::new(),
+                },
+                address_conditions: Vec::new(),
+                unconstrained_permit: false,
+                names_endpoint: false,
+            });
+        }
         limits::with_stack(self.shape.eval_stack(longest), || {
             self.authorize_network_unchecked(request)
         })
@@ -666,14 +705,16 @@ impl CedarEngine {
     /// attached to other paths of the endpoint that neither read a
     /// `graphql_*` field nor test `resource.protocol`, as a YAML GraphQL
     /// endpoint is authoritative for the requests it parses. Forbids always
-    /// apply.
+    /// apply. A host with an empty DNS label is denied without evaluation,
+    /// as in [`Self::authorize_network`].
     ///
     /// # Errors
     ///
     /// Returns [`CedarEngineError::RequestFieldTooLong`] if a request string
     /// is over [`MAX_REQUEST_FIELD_BYTES`],
     /// [`CedarEngineError::TooManyQueryCombinations`] if the query has more
-    /// than [`MAX_QUERY_COMBINATIONS`] value combinations, and another
+    /// value combinations than [`MAX_QUERY_COMBINATIONS`] or, for a larger
+    /// policy set, [`MAX_QUERY_POLICY_EVALUATIONS`] allow, and another
     /// [`CedarEngineError`] if the request cannot be represented in the
     /// loaded schema, or if Cedar reports an error while evaluating any
     /// deciding policy. Errors in the staged comparison are logged without
@@ -683,6 +724,14 @@ impl CedarEngine {
         request: &HttpRequestInput,
     ) -> Result<L7Evaluation, CedarEngineError> {
         let longest = limits::check_http_request(request)?;
+        if has_empty_label(&request.host) {
+            return Ok(L7Evaluation {
+                decision: Decision::Deny {
+                    matched_policies: Vec::new(),
+                },
+                staged: None,
+            });
+        }
         limits::with_stack(self.shape.eval_stack(longest), || {
             self.evaluate_l7_unchecked(request)
         })
@@ -694,7 +743,11 @@ impl CedarEngine {
     ) -> Result<L7Evaluation, CedarEngineError> {
         let endpoint = self.l7_endpoint_at(&request.host, request.port, &request.endpoint_path);
         let protocol = endpoint.map_or("", |endpoint| endpoint.protocol.as_str());
-        let query = QueryCombinations::new(&request.query, &self.analysis.query_keys)?;
+        let query = QueryCombinations::new(
+            &request.query,
+            &self.analysis.query_keys,
+            self.deciding_policies.num_of_policies(),
+        )?;
         // Any entry selecting the host that declares the routed path works:
         // its exclusion set covers every entry that can select the host.
         let graphql = request
@@ -725,20 +778,20 @@ impl CedarEngine {
         // by default, so a set of only staged `forbid`s denies every request
         // whether or not one of them matched.
         let staged = if endpoint.is_some_and(|endpoint| endpoint.staged) {
-            QueryCombinations::new(&request.query, &self.analysis.staged_query_keys)
-                .and_then(|query| {
-                    self.decide_l7(&self.policies, request, protocol, &query, &excluded)
-                })
-                .map_or_else(
-                    |_| {
-                        // Never include authored expressions or request query values.
-                        tracing::debug!(
-                            "staged Cedar evaluation failed; retaining enforced decision"
-                        );
-                        None
-                    },
-                    |staged| (staged.is_allow() != decision.is_allow()).then_some(staged),
-                )
+            QueryCombinations::new(
+                &request.query,
+                &self.analysis.staged_query_keys,
+                self.policies.num_of_policies(),
+            )
+            .and_then(|query| self.decide_l7(&self.policies, request, protocol, &query, &excluded))
+            .map_or_else(
+                |_| {
+                    // Never include authored expressions or request query values.
+                    tracing::debug!("staged Cedar evaluation failed; retaining enforced decision");
+                    None
+                },
+                |staged| (staged.is_allow() != decision.is_allow()).then_some(staged),
+            )
         } else {
             None
         };
@@ -1128,15 +1181,18 @@ pub(crate) struct QueryCombinations<'a> {
 }
 
 impl<'a> QueryCombinations<'a> {
-    /// Selects the keys of `query` that `readable` includes.
+    /// Selects the keys of `query` that `readable` includes, for a set of
+    /// `policies` policies.
     ///
     /// # Errors
     ///
     /// Returns [`CedarEngineError::TooManyQueryCombinations`] when there are
-    /// more than [`MAX_QUERY_COMBINATIONS`] combinations.
+    /// more combinations than [`MAX_QUERY_COMBINATIONS`] or, for a larger
+    /// set, [`MAX_QUERY_POLICY_EVALUATIONS`] allow.
     pub(crate) fn new(
         query: &'a BTreeMap<String, Vec<String>>,
         readable: &QueryKeys,
+        policies: usize,
     ) -> Result<Self, CedarEngineError> {
         let keys: Vec<_> = query
             .iter()
@@ -1146,10 +1202,12 @@ impl<'a> QueryCombinations<'a> {
         let count = keys.iter().fold(1_usize, |count, (_, values)| {
             count.saturating_mul(values.len())
         });
-        if count > MAX_QUERY_COMBINATIONS {
+        let limit =
+            (MAX_QUERY_POLICY_EVALUATIONS / policies.max(1)).clamp(1, MAX_QUERY_COMBINATIONS);
+        if count > limit {
             return Err(CedarEngineError::TooManyQueryCombinations {
                 combinations: count,
-                limit: MAX_QUERY_COMBINATIONS,
+                limit,
             });
         }
         Ok(Self { keys, count })
@@ -1196,6 +1254,20 @@ fn string_set(values: &[String]) -> RestrictedExpression {
 #[must_use]
 pub fn normalize_host(host: &str) -> String {
     host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase()
+}
+
+/// Returns whether `host`, after [`normalize_host`] strips one trailing
+/// `.`, has an empty DNS label, as in `.example.com` or `a..example.com`.
+///
+/// Cedar's delimited `*` and `**` match empty labels, while the host
+/// matcher that selects inspection rejects such hosts, so a request to one
+/// is denied without evaluation: a host glob permit would otherwise allow a
+/// connection that no `HttpRequest` policy inspects.
+fn has_empty_label(host: &str) -> bool {
+    host.strip_suffix('.')
+        .unwrap_or(host)
+        .split('.')
+        .any(str::is_empty)
 }
 
 fn entity_type(type_name: &str) -> Result<EntityTypeName, CedarEngineError> {
@@ -1286,7 +1358,11 @@ mod tests {
     ) -> Result<L7Evaluation, CedarEngineError> {
         let endpoint = engine.l7_endpoint_at(&request.host, request.port, &request.endpoint_path);
         let protocol = endpoint.map_or("", |endpoint| endpoint.protocol.as_str());
-        let query = QueryCombinations::new(&request.query, &engine.analysis.query_keys)?;
+        let query = QueryCombinations::new(
+            &request.query,
+            &engine.analysis.query_keys,
+            engine.deciding_policies.num_of_policies(),
+        )?;
         let sets = request
             .graphql_request
             .then(|| {
@@ -1303,11 +1379,15 @@ mod tests {
         });
         let decision = engine.decide_l7(deciding, request, protocol, &query, &|_| false)?;
         let staged = if endpoint.is_some_and(|endpoint| endpoint.staged) {
-            QueryCombinations::new(&request.query, &engine.analysis.staged_query_keys)
-                .and_then(|query| engine.decide_l7(all, request, protocol, &query, &|_| false))
-                .map_or(None, |staged| {
-                    (staged.is_allow() != decision.is_allow()).then_some(staged)
-                })
+            QueryCombinations::new(
+                &request.query,
+                &engine.analysis.staged_query_keys,
+                engine.policies.num_of_policies(),
+            )
+            .and_then(|query| engine.decide_l7(all, request, protocol, &query, &|_| false))
+            .map_or(None, |staged| {
+                (staged.is_allow() != decision.is_allow()).then_some(staged)
+            })
         } else {
             None
         };

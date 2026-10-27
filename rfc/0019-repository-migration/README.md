@@ -32,7 +32,7 @@ with their own expertise, test infrastructure, and release responsibilities.
 Organize OpenShell around a core repository and focused ecosystem repositories.
 The `openshell` core owns the runtime, CLI, Rust SDK, shared interfaces, and
 Kubernetes integration. Go, Python, and TypeScript each get an SDK repository.
-Packages and Homebrew own installation and distribution; Windows and desktop
+The packages repository owns installation and distribution; Windows and desktop
 repositories own their platform integrations. Each provider gets a repository
 for its integration and tests. A `console` repository holds the frontend.
 
@@ -47,8 +47,7 @@ OpenShell repositories
 ├── sdk-go                Go SDK
 ├── sdk-python            Python SDK
 ├── sdk-typescript        TypeScript SDK
-├── packages              install.sh, RPM, DEB, snap
-├── homebrew              Homebrew tap and formula
+├── packages              install.sh, RPM, DEB, snap, Homebrew tap and formula
 ├── windows               MSI installer and MXC driver
 ├── desktop               Desktop drivers: macOS App Sandbox, Podman, Docker, VM
 ├── console               OpenShell frontend
@@ -106,8 +105,7 @@ so separate repositories do not depend on manual copying to stay in sync.
 
 | Repository | Owns and publishes |
 | --- | --- |
-| `packages` | The one-line `install.sh` installation path; publishes RPM, DEB, and snap packages. |
-| `homebrew` | The Homebrew tap; publishes the `openshell.rb` formula. |
+| `packages` | The one-line `install.sh` installation path and Homebrew tap; publishes RPM, DEB, and snap packages and the `openshell.rb` formula. |
 
 ### Windows: `windows`
 
@@ -149,23 +147,21 @@ Migrate in the following order, preserving history where practical:
    Keep the Rust SDK and shared Rust interfaces in core. Establish the pinned
    protobuf inputs, SDK release automation, and compatibility tests before
    retiring the existing SDK paths. Document any package or import path changes.
-2. **Packages.** Move `install.sh` and RPM, DEB, and snap packaging into
-   `packages`. Validate installation and removal using artifacts from
-   a pinned core release.
-3. **Homebrew.** Move the tap and `openshell.rb` formula into
-   `homebrew`. Validate formula installation against published core
-   binaries.
-4. **Windows.** Move the MSI installer and MXC driver into `windows`.
+2. **Packages.** Move `install.sh`, RPM, DEB, and snap packaging, and the Homebrew
+   tap and `openshell.rb` formula into `packages`. Validate installation and
+   removal using artifacts from a pinned core release, including formula
+   installation against published core binaries.
+3. **Windows.** Move the MSI installer and MXC driver into `windows`.
    Establish builds, installer checks, and driver compatibility tests against
    core.
-5. **Core.** Consolidate `openshell` around the CLI, gateway, supervisor, Linux
+4. **Core.** Consolidate `openshell` around the CLI, gateway, supervisor, Linux
    sandbox runtime, prover, Rust SDK, shared Rust interfaces, host compute driver,
    and Kubernetes integration. Keep the Helm chart, Kubernetes driver, operator,
    chart publication, and deployment tests in core. Update core builds and
    releases to consume the extracted components where needed, and validate that
    the released pieces work together. Provider integrations remain in place
    until the next phase.
-6. **Providers.** Break out provider integrations one at a time into
+5. **Providers.** Break out provider integrations one at a time into
    `providers-<provider>`, with maintainers, releases, and test
    infrastructure appropriate to each integration.
 

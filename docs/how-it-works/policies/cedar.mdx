@@ -14,7 +14,7 @@ A sandbox policy can be written in [Cedar](https://www.cedarpolicy.com/) instead
 Cedar's restricted language makes policies easier to analyze, for example to check that a revision grants no more access than the one it replaces. OpenShell accepts only Cedar policy shapes it can enforce exactly as written, and rejects the rest when you submit the policy.
 
 <Note>
-Cedar policies are available only in [development builds](/about/installation#prerelease-and-development-builds). Stable and prerelease gateways and supervisors reject them. Cedar also requires a compute driver whose sandboxes run the OpenShell supervisor: Docker, Podman, Kubernetes, or VM. The Windows MXC driver enforces policy itself, so the gateway rejects Cedar sandboxes on it.
+Cedar policies are available only in [development builds](/about/installation#prerelease-and-development-builds). Stable and prerelease gateways and supervisors reject them. Cedar also requires a compute driver whose sandboxes run the OpenShell supervisor, such as Docker, Podman, Kubernetes, or VM. OpenShell tests Cedar end to end on the Docker driver. The Windows MXC driver enforces policy itself, so the gateway rejects Cedar sandboxes on it.
 </Note>
 
 ## Apply a Cedar Policy
@@ -94,7 +94,7 @@ Each `endpoint_settings` entry selects endpoints the way a YAML endpoint does: `
 
 | Field | Applies to |
 |---|---|
-| `tls: skip` | Every connection to the endpoint, inspected or not. Cannot be combined with `path`. |
+| `tls: skip` | Endpoints the Cedar policy does not inspect. An entry that sets it on an endpoint with `HttpRequest` policies is rejected, and a provider's `tls: skip` is ignored there, so the policy still decides each request. Cannot be combined with `path`. |
 | `allow_encoded_slash` | Inspected requests. |
 | `json_rpc.max_body_bytes`, `mcp.max_body_bytes` | JSON-RPC and MCP endpoints. |
 | `mcp.versions`, `mcp.strict_tool_names` | MCP endpoints. Without `mcp.versions`, an MCP endpoint uses the YAML default revision. |
@@ -106,7 +106,7 @@ An entry with a `path` applies to requests whose path it matches, and an entry w
 
 ## Policy Model
 
-Every policy is evaluated against a fixed schema in the `Sandbox` namespace. The principal is always a `Sandbox::Process`.
+Every policy is evaluated against a fixed schema in the `Sandbox` namespace. The principal is always a `Sandbox::Process`. Sandbox identity attributes are not yet available to policies: every request carries the same placeholder `user` and `group`, so OpenShell rejects a policy that reads `principal.user` or `principal.group`.
 
 | Action | Resource | Context fields | Decides |
 |---|---|---|---|
@@ -253,7 +253,9 @@ When the operator sets `proxy_connect_by_hostname`, the upstream proxy resolves 
 
 A permit must write its address condition as a top-level `when` conjunct: `context has destination_ip`, or `isInRange` tests joined with `||`. Conditions in that form intersect. OpenShell rejects a permit that reads `destination_ip` in any other form, a range that overlaps loopback, link-local, or unspecified addresses, and any policy that reads `destination_ip` without exactly the `NetworkConnect` action in its scope.
 
-A `forbid` may read `destination_ip` in any form, guarded by `context has destination_ip` as validation requires, and takes part in both decisions as written. Before the host resolves, the address is absent and the guard is false, so only the forbid's other conditions can deny; after it resolves, the forbid applies again to each address. A forbid such as `when { context.binary_path == "/usr/bin/curl" || (context has destination_ip && context.destination_ip.isInRange(ip("10.0.0.0/8"))) }` therefore denies `curl` at connect time, which matters with `proxy_connect_by_hostname`, and denies private addresses for every other binary once the host resolves. Write a forbid that only restricts addresses with `when`: an `unless` body that reads the address is false before resolution, so such a forbid denies every connection it covers at connect time.
+A `forbid` takes part in both decisions as written. Before the host resolves, the address is absent and the `context has destination_ip` guard is false, so only the forbid's other conditions can deny; after it resolves, the forbid applies again to each address. A forbid such as `when { context.binary_path == "/usr/bin/curl" || (context has destination_ip && context.destination_ip.isInRange(ip("10.0.0.0/8"))) }` therefore denies `curl` at connect time, which matters with `proxy_connect_by_hostname`, and denies private addresses for every other binary once the host resolves.
+
+A forbid may read `destination_ip` only in `when` conditions, inside `&&` chains that include `context has destination_ip` and are joined to the rest of the condition only by `&&` and `||`, or anywhere once a `when` condition has the guard as a top-level `&&` conjunct. OpenShell rejects other forms, such as an `unless` body or a negated guard, because the absent address would make the forbid deny every connection it covers at connect time. To deny addresses outside a range, write `when { context has destination_ip && !context.destination_ip.isInRange(ip("10.0.0.0/8")) }`.
 
 ## Native TCP
 
@@ -279,7 +281,7 @@ As in YAML, OpenShell rejects a native TCP endpoint that:
 
 ## Request Rules
 
-The proxy decides at connect time whether to inspect a connection request by request. It inspects every endpoint that an `HttpRequest` policy names, whether the policy is a `permit` or a `forbid`. An `HttpRequest` policy that names no endpoint is rejected, because the proxy could not tell which connections it applies to.
+The proxy decides at connect time whether to inspect a connection request by request. It inspects every endpoint that an `HttpRequest` policy names, whether the policy is a `permit` or a `forbid`, unless the policy is [staged](#audit-mode). An `HttpRequest` policy that names no endpoint is rejected, because the proxy could not tell which connections it applies to.
 
 Cedar denies by default. Once any `HttpRequest` policy names an endpoint, each request to that endpoint needs a matching `permit`.
 
@@ -302,7 +304,7 @@ when {
 
 Any other way of naming the host, such as an undelimited `like`, a wildcard top-level domain, two hosts joined with `||`, or a glob without a port, is rejected. The request's `NetworkEndpoint` is the actual host and port, so the glob condition decides the request as written.
 
-A host matched by an exact endpoint and a wildcard host, or by two wildcard hosts, is inspected with the paths of all of them, and each request is routed to the most specific matching path, as for YAML endpoints sharing a host and port. Two such endpoints must inspect equally specific paths that can match the same request with the same protocol and enforcement, as YAML rejects overlapping endpoints that disagree. [Endpoint settings](#add-middleware-and-endpoint-settings) select wildcard-inspected hosts the same way they select any host.
+A host matched by an exact endpoint and a wildcard host, or by two wildcard hosts, is inspected with the paths of all of them, and each request is routed to the most specific matching path, as for YAML endpoints sharing a host and port. Two such endpoints must inspect equally specific paths that can match the same request with the same protocol and enforcement, as YAML rejects overlapping endpoints that disagree. Comparing hosts has a fixed work budget, so a policy with hundreds of long, similar wildcard hosts on one port is rejected; wildcard hosts with different last labels are never compared. [Endpoint settings](#add-middleware-and-endpoint-settings) select wildcard-inspected hosts the same way they select any host.
 
 Endpoints are parsed as REST by default. Add `@protocol("json-rpc")`, `@protocol("mcp")`, `@protocol("graphql")`, `@protocol("websocket")`, or `@protocol("websocket-graphql")` to an `HttpRequest` policy to inspect that protocol instead. All policies that declare a protocol for one endpoint path must agree. `@protocol("sql")` is rejected, because OpenShell does not inspect SQL traffic.
 
@@ -454,9 +456,9 @@ A permit that allows a `WEBSOCKET_TEXT` message on a `websocket-graphql` path wi
 
 Add `@enforcement("audit")` to an `HttpRequest` policy to make it an audit policy, the Cedar form of a YAML `enforcement: audit` endpoint. The policy's action scope must be exactly `HttpRequest`.
 
-When every deciding `HttpRequest` policy for an endpoint path is an audit policy, that path runs in audit mode: OpenShell logs a request its policies deny with decision `audit` and forwards it. Policies with `@path` set the mode of their path, and policies without it set the mode of the path-less endpoint. Audit policies still decide requests like enforced ones, on every path of their endpoint: as YAML applies the rules of every matching endpoint, an audit policy's `forbid` blocks a request routed to an enforced path of the same `host:port`, and its `permit` allows one. The routed path's mode alone decides whether a denial blocks, even when the denying policy is an enforced one attached to another path. OpenShell warns when it loads or validates a policy with an audit path beside enforced policies.
+When every deciding `HttpRequest` policy for an endpoint path is an audit policy, that path runs in audit mode: OpenShell logs a request its policies deny with decision `audit` and forwards it. Policies with `@path` set the mode of their path, and policies without it set the mode of the path-less endpoint. Audit policies still decide requests like enforced ones, on every path of their endpoint: as YAML applies the rules of every matching endpoint, an audit policy's `forbid` blocks a request routed to an enforced path of the same `host:port`, and its `permit` allows one. The routed path's mode alone decides whether a denial blocks, even when the denying policy is an enforced one attached to another path, or to another endpoint that selects the same host, such as a wildcard host. OpenShell warns when it loads or validates a policy with an audit path beside enforced policies of the same host and port or of such an endpoint.
 
-Add `@enforcement("staged")` to try a policy without changing anything. A staged policy never changes a path's mode and never takes part in a decision. OpenShell logs each request whose decision it would change, with `cedar_audit:staged_deny` or `cedar_audit:staged_allow` and the policies that would decide it. Use a staged `forbid` to see what a new restriction would block before you enforce it:
+Add `@enforcement("staged")` to try a policy without changing anything. A staged policy never changes a path's mode and never takes part in a decision. OpenShell logs each request whose decision it would change, with `cedar_audit:staged_deny` or `cedar_audit:staged_allow` and the policies that would decide it. Only deciding policies make an endpoint inspected or declare its paths and protocols, so a staged policy is evaluated on the requests that deciding `HttpRequest` policies inspect, as they parse and route them. OpenShell warns when a staged policy names an endpoint that no deciding `HttpRequest` policy inspects, because it is never evaluated, and when it declares a `@path` or `@protocol` that no deciding policy declares for its endpoint. Use a staged `forbid` to see what a new restriction would block before you enforce it:
 
 ```cedar
 @enforcement("staged")
@@ -505,6 +507,8 @@ when { context.method == "GET" };
 - Global policies must be YAML.
 - Incremental `openshell policy update` merges are not available for Cedar policies. Use `openshell policy set` with the full policy.
 - Policy templates are not supported.
+- A policy cannot nest brackets more than 64 deep or chain more than 1,024 operators in one policy. Replace a long `||` chain with a set literal such as `["a", "b"].contains(context.path)`, or split the policy.
+- A request whose path, query key or value, method, or other inspected field is longer than 16 KiB is denied.
 
 ## Next Steps
 

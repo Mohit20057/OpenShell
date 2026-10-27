@@ -7,7 +7,8 @@
 //! staged policies never change a path's mode or a decision.
 
 use openshell_policy_cedar::{
-    CedarEngine, CedarEngineError, Decision, HttpRequestInput, L7Enforcement, L7Protocol,
+    AnalysisWarning, CedarEngine, CedarEngineError, Decision, HttpRequestInput, L7Enforcement,
+    L7Protocol,
 };
 
 const ENDPOINT: &str = r#"Sandbox::NetworkEndpoint::"api.github.com:443""#;
@@ -197,29 +198,35 @@ fn staged_permit_logs_without_allowing() {
 
 #[test]
 fn staged_policies_never_change_a_paths_mode() {
-    // A path declared only by a staged policy is enforced, and a staged
+    // A path declared only by a staged policy is not inspected, and a staged
     // policy beside audit policies leaves the path in audit mode.
     let staged_only = format!(
         "{}{}",
         http_policy("", "permit", GET_REPOS),
         http_policy(
-            &format!(r#"{STAGED} @path("/admin/**")"#),
+            &format!(r#"{STAGED} @path("/admin/**") @id("no-admin")"#),
             "forbid",
             r#"context.path like("/admin/**", "/")"#
         ),
     );
     let staged_only = engine(&staged_only);
     assert_eq!(
-        staged_only
-            .l7_endpoint_at("api.github.com", 443, "/admin/**")
-            .unwrap()
-            .enforcement,
-        L7Enforcement::Enforce
+        staged_only.l7_endpoint_at("api.github.com", 443, "/admin/**"),
+        None
     );
-    assert_eq!(staged_only.warnings(), []);
-    let mut admin = request("GET", "/admin/users");
-    admin.endpoint_path = "/admin/**".to_string();
-    let evaluation = staged_only.evaluate_l7(&admin).unwrap();
+    assert_eq!(
+        staged_only.warnings(),
+        [AnalysisWarning::StagedPolicyInspectionIgnored {
+            policy_id: "no-admin".to_string(),
+            endpoint: "api.github.com:443".to_string(),
+            path: "/admin/**".to_string(),
+            protocol: None,
+        }]
+    );
+    // Routed to the path-less endpoint, the staged forbid is still compared.
+    let evaluation = staged_only
+        .evaluate_l7(&request("GET", "/admin/users"))
+        .unwrap();
     assert!(!evaluation.is_allow(), "the enforced permit does not match");
     assert_eq!(
         evaluation.staged, None,

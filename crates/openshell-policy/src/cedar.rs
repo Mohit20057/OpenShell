@@ -12,7 +12,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::hash::BuildHasher;
 
 use miette::Result;
-use openshell_core::proto::{FilesystemPolicy, NetworkPolicyRule, SandboxPolicy};
+use openshell_core::proto::{
+    FilesystemPolicy, NetworkEndpoint, NetworkPolicyRule, NetworkTlsMode, SandboxPolicy,
+};
 use openshell_policy_cedar::{
     CedarEngine, ProviderEndpoint, ProviderPolicy, RuleMatcher, TokenGrantRules, ValueMatcher,
 };
@@ -28,11 +30,13 @@ fn load(cedar_policy_source: &str) -> std::result::Result<CedarEngine, PolicyVio
     })
 }
 
-/// Checks that the Cedar engine accepts `cedar_policy_source` and that its
-/// Landlock grants pass the same path checks as YAML `filesystem` paths,
+/// Checks that the Cedar engine accepts `cedar_policy_source`, that its
+/// Landlock grants pass the same path checks as YAML `filesystem` paths, and
+/// that no `endpoint_settings` entry skips TLS on an endpoint it inspects,
 /// returning its load-time warnings.
 pub(crate) fn validate(
     cedar_policy_source: &str,
+    endpoint_settings: &[NetworkEndpoint],
     violations: &mut Vec<PolicyViolation>,
 ) -> Vec<String> {
     match load(cedar_policy_source) {
@@ -43,6 +47,7 @@ pub(crate) fn validate(
             {
                 violations.extend(errors);
             }
+            violations.extend(tls_skip_on_inspected_endpoints(&engine, endpoint_settings));
             engine.warnings().iter().map(ToString::to_string).collect()
         }
         Err(violation) => {
@@ -50,6 +55,40 @@ pub(crate) fn validate(
             Vec::new()
         }
     }
+}
+
+/// Rejects `endpoint_settings` entries with `tls: skip` that select an
+/// endpoint `HttpRequest` policies inspect: the proxy relays a skipped
+/// connection without terminating TLS, so those policies would never run.
+fn tls_skip_on_inspected_endpoints(
+    engine: &CedarEngine,
+    endpoint_settings: &[NetworkEndpoint],
+) -> Vec<PolicyViolation> {
+    endpoint_settings
+        .iter()
+        .enumerate()
+        .filter(|(_, setting)| setting.tls == NetworkTlsMode::Skip as i32)
+        .filter_map(|(index, setting)| {
+            let ports = crate::effective_endpoint_ports(setting);
+            let (host, port, _, _) =
+                engine.configured_l7_endpoints().find(|(host, port, ..)| {
+                    ports.contains(&u32::from(*port))
+                    // An unparseable host is rejected elsewhere; count it as
+                    // overlapping so the check fails closed.
+                    && openshell_core::host_pattern::host_patterns_overlap(&setting.host, host)
+                        .unwrap_or(true)
+                })?;
+            Some(PolicyViolation::InvalidEndpointSetting {
+                index,
+                host: setting.host.clone(),
+                reason: format!(
+                    "tls: skip relays connections without inspection, but HttpRequest \
+                     policies inspect {host}:{port}; remove tls: skip, or narrow its host or \
+                     ports so it does not select an inspected endpoint"
+                ),
+            })
+        })
+        .collect()
 }
 
 /// The Landlock grants a Cedar policy authorizes. A Cedar policy has no

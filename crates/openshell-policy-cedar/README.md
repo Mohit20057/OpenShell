@@ -300,13 +300,38 @@ Its Lean specification and proofs are in `ai-openshell/cedar-spec`.
   `websocket-graphql` path, permits attached to other paths of the endpoint
   that neither read a `graphql_*` field nor test `resource.protocol` are left
   out of the decision, as a YAML GraphQL endpoint is authoritative for the
-  requests it parses. The policy sets without them are built once per such
-  path at load.
+  requests it parses. Each such path records the permits it leaves out, and
+  one evaluation on the full policy set ignores their results.
 - Cedar-derived Landlock grants pass the same path checks as YAML paths and get
   the same baseline enrichment, under the same condition: YAML adds the
   baseline only to a policy with network rules, and the supervisor adds it to
   a Cedar policy only when `CedarEngine::has_network_permits` is true.
 
+Cedar parses, converts, and evaluates policies recursively, and its delimited
+`like` recurses once per character. The crate bounds both before Cedar runs:
+policy text is limited to `MAX_POLICY_SOURCE_BYTES`, bracket nesting to
+`MAX_POLICY_NESTING`, and each policy's expression depth to
+`MAX_POLICY_EXPRESSION_DEPTH`, checked by a non-recursive scan; request strings
+longer than `MAX_REQUEST_FIELD_BYTES` are denied without evaluation. Loading
+and evaluation run on a stack grown with `stacker` to fit those bounds.
+
 `cedar-policy` enables `serde_json`'s `preserve_order` feature in every binary
 that links it. Code that relies on sorted JSON object keys must sort them
 explicitly.
+
+## Cedar dependency pin
+
+The workspace `Cargo.toml` pins `cedar-policy` to the `ai-openshell/cedar` git
+repository at a fixed commit. The fork's `main` is its default branch, and the
+pinned commit tracks upstream `cedar-policy` 4.13.0 (see `Cargo.lock`). Every
+build resolves that commit, including stable builds that do not compile Cedar,
+because Cargo fetches git sources while resolving the lockfile. The commit
+must stay reachable. The fork has no tags and `main` has no branch protection,
+so the fork's maintainers should tag the pinned commit or cover it with a
+branch ruleset that blocks force pushes and deletion.
+
+RustSec and `cargo-deny` advisories for the crates.io `cedar-policy` crates do
+not match a git source, so a vulnerability in the upstream version the fork is
+based on would not be reported for this pin. Before bumping the pin, and
+periodically, check the advisories for upstream `cedar-policy` and
+`cedar-policy-core` at the version the fork is based on.

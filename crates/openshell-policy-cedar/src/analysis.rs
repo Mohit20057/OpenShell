@@ -32,7 +32,10 @@
 //!   proxy could not route would otherwise be silently skipped. Entries that
 //!   can select one host (an exact host and the globs matching it, or
 //!   overlapping globs) must inspect equally specific overlapping paths the
-//!   same way, as YAML rejects such ambiguous endpoints. A `@path`
+//!   same way, as YAML rejects such ambiguous endpoints. Hosts are compared
+//!   pairwise within one port, and only where their last labels allow a
+//!   common host; a set whose comparisons exceed a fixed work budget, such
+//!   as hundreds of long, similar globs, is rejected. A `@path`
 //!   annotation attaches a policy to one request path pattern of its
 //!   endpoint, so one `host:port` can be inspected with a different protocol
 //!   and enforcement per path, as YAML endpoints sharing a `host:port` are.
@@ -47,10 +50,15 @@
 //!   decides whether a denial blocks; so, as in YAML, the routed path's mode
 //!   decides whether a denial blocks, even a denial by an enforced policy
 //!   attached to another path of the same `host:port`. Such an audit path
-//!   beside enforced policies is reported as an [`AnalysisWarning`]. An
-//!   `@enforcement("staged")` annotation marks a policy as staged: it never
-//!   changes a path's mode and never takes part in a decision; requests whose
-//!   decision it would change are logged. A permit attached to a
+//!   beside enforced policies of any entry that can select one of its hosts
+//!   is reported as an [`AnalysisWarning`]. An `@enforcement("staged")`
+//!   annotation marks a policy as staged: it never changes a path's mode and
+//!   never takes part in a decision; requests whose decision it would change
+//!   are logged. Only deciding policies make an endpoint or path inspected
+//!   and declare its protocol: a staged policy is compared on requests
+//!   routed to the entries that can select its host, and one that no
+//!   deciding policy routes requests to, or whose `@path` or `@protocol` no
+//!   deciding policy declares, is reported as a warning. A permit attached to a
 //!   `websocket-graphql` path that could allow a client message without a
 //!   GraphQL condition is rejected, as YAML rejects a generic
 //!   `WEBSOCKET_TEXT` rule there. For a request parsed as GraphQL, on a
@@ -91,11 +99,17 @@
 //!   link-local, or unspecified addresses are rejected, as YAML rejects such
 //!   `allowed_ips`. A connection is first decided without
 //!   `destination_ip`, with each such permit's address conjuncts removed,
-//!   then again for each resolved address with every policy. A `forbid` may
-//!   read `destination_ip` in any form and takes part in both decisions as
-//!   written: strict validation requires a `context has destination_ip`
-//!   guard, which is false before resolution, so only its other conditions
-//!   can deny then, and its address conditions apply per address after.
+//!   then again for each resolved address with every policy. A `forbid`
+//!   takes part in both decisions as written, so it may read
+//!   `destination_ip` only where the address being absent cannot make it
+//!   apply: in `when` conditions, within `&&` chains that have a `context
+//!   has destination_ip` conjunct and are joined to the rest of the
+//!   condition only by `&&` and `||`, or anywhere once a `when` condition
+//!   has that guard as a top-level conjunct. The guard is false before resolution,
+//!   so only the forbid's other conditions can deny then, and a forbid that
+//!   denies before resolution denies every address after. An `unless` body
+//!   or a negated guard that reads the address would hold before resolution
+//!   and deny every connection the forbid covers, so it is rejected.
 //! - **Binary aliases.** `context.binary_aliases` holds the binary paths
 //!   policies name that are symlinks in the sandbox resolving to the calling
 //!   binary or an ancestor, the way YAML expands a symlinked binary path. The
@@ -111,6 +125,10 @@
 //! - **Delimited patterns.** A delimited `like` pattern with `**` next to a
 //!   character other than the delimiter is rejected: YAML reads such a `**`
 //!   as `*`, within one segment, while Cedar's crosses segments.
+//! - **Process identity.** Every request carries the same placeholder
+//!   `principal.user` and `principal.group`, since the sandbox's run-as
+//!   identity is not yet available to policies, so a policy that reads
+//!   either is rejected rather than evaluated against a constant.
 //!
 //! Before any of that, the policy set is validated against the schema in
 //! strict mode, so a typo such as `context.binray_path` is a load error
@@ -353,16 +371,23 @@ pub fn is_staged(policy: &Policy) -> bool {
     policy.annotation(ENFORCEMENT_ANNOTATION) == Some(EnforcementAnnotation::STAGED)
 }
 
-/// `HttpRequest` policies seen for one inspected `host:port` while analyzing,
-/// by `@path`.
+/// Deciding `HttpRequest` policies seen for one inspected `host:port` while
+/// analyzing, by `@path`.
 #[derive(Default)]
 struct DeclaredEndpoint {
     paths: BTreeMap<String, DeclaredPath>,
 }
 
 impl DeclaredEndpoint {
+    /// Returns whether an enforced policy is attached to some path.
+    fn has_enforced_policies(&self) -> bool {
+        self.paths.values().any(|path| path.enforced_policies > 0)
+    }
+
     /// Returns the inspection of each path, each decided by its own
-    /// policies, and warns of an audit path beside enforced policies.
+    /// policies, and warns of an audit path when `enforced_nearby`: this
+    /// entry, or another that can select one of its hosts, has enforced
+    /// policies.
     ///
     /// # Errors
     ///
@@ -373,10 +398,9 @@ impl DeclaredEndpoint {
         self,
         host: &str,
         port: u16,
+        enforced_nearby: bool,
         warnings: &mut Vec<AnalysisWarning>,
     ) -> Result<BTreeMap<String, L7Endpoint>, CedarEngineError> {
-        let endpoint_enforced = self.paths.values().any(|path| path.enforced_policies > 0);
-        let staged = self.paths.values().any(|path| path.staged_policies > 0);
         self.paths
             .into_iter()
             .map(|(path, declared)| {
@@ -386,8 +410,8 @@ impl DeclaredEndpoint {
                         path,
                     });
                 }
-                let endpoint = declared.finish(staged);
-                if endpoint.enforcement == L7Enforcement::Audit && endpoint_enforced {
+                let endpoint = declared.finish();
+                if endpoint.enforcement == L7Enforcement::Audit && enforced_nearby {
                     warnings.push(AnalysisWarning::AuditPathOnEnforcedEndpoint {
                         endpoint: format!("{host}:{port}"),
                         path: path.clone(),
@@ -399,20 +423,21 @@ impl DeclaredEndpoint {
     }
 }
 
-/// `HttpRequest` policies seen for one inspected endpoint path.
+/// Deciding `HttpRequest` policies seen for one inspected endpoint path.
 #[derive(Default)]
 struct DeclaredPath {
     protocol: Option<L7Protocol>,
     enforced_policies: usize,
     audit_policies: usize,
-    staged_policies: usize,
     /// Permits whose conditions can hold for a `WEBSOCKET_TEXT` request
     /// through no condition on a `graphql_*` field, in policy order.
     generic_permits: Vec<String>,
 }
 
 impl DeclaredPath {
-    fn finish(self, staged: bool) -> L7Endpoint {
+    /// Returns the path's inspection; [`L7Endpoint::staged`] is set later,
+    /// from the staged policies that can apply to the path's requests.
+    fn finish(self) -> L7Endpoint {
         let audit_only = self.audit_policies > 0 && self.enforced_policies == 0;
         L7Endpoint {
             protocol: self.protocol.unwrap_or_default(),
@@ -421,7 +446,7 @@ impl DeclaredPath {
             } else {
                 L7Enforcement::Enforce
             },
-            staged,
+            staged: false,
         }
     }
 
@@ -443,21 +468,77 @@ impl DeclaredPath {
 #[non_exhaustive]
 pub enum AnalysisWarning {
     /// Every deciding `HttpRequest` policy attached to one `@path` is audit
-    /// while the same `host:port` has enforced `HttpRequest` policies on
-    /// other paths or without `@path`. Requests routed to the path are logged
-    /// and forwarded even when an enforced policy denies them, as YAML audits
-    /// a request routed to an `enforcement: audit` endpoint.
+    /// while the same `host:port`, or an endpoint whose host can be the same
+    /// on that port (an exact host and a glob matching it, or overlapping
+    /// globs), has enforced `HttpRequest` policies on other paths or without
+    /// `@path`. Requests routed to the path are logged and forwarded even
+    /// when an enforced policy denies them, as YAML audits a request routed
+    /// to an `enforcement: audit` endpoint.
     AuditPathOnEnforcedEndpoint {
-        /// The endpoint, as `"host:port"`.
+        /// The endpoint, as `"host:port"`; the host may be a glob.
         endpoint: String,
         /// The audit-only `@path`; empty for the path-less endpoint.
         path: String,
+    },
+    /// A staged `HttpRequest` policy names an endpoint that no deciding
+    /// `HttpRequest` policy inspects. Staged policies never make an endpoint
+    /// inspected, so it is never evaluated.
+    StagedPolicyNotEvaluated {
+        /// The `@id` annotation of the policy, or its Cedar-assigned id.
+        policy_id: String,
+        /// The endpoint it names, as `"host:port"`; the host may be a glob.
+        endpoint: String,
+    },
+    /// A staged `HttpRequest` policy declares an `@path` or `@protocol` that
+    /// no deciding policy declares for its endpoint. Staged policies never
+    /// change inspection, so it is compared only on requests routed to the
+    /// paths deciding policies declare, parsed with their protocol.
+    StagedPolicyInspectionIgnored {
+        /// The `@id` annotation of the policy, or its Cedar-assigned id.
+        policy_id: String,
+        /// The endpoint it names, as `"host:port"`; the host may be a glob.
+        endpoint: String,
+        /// Its `@path`; empty without one.
+        path: String,
+        /// Its `@protocol`, if any.
+        protocol: Option<L7Protocol>,
     },
 }
 
 impl fmt::Display for AnalysisWarning {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::StagedPolicyNotEvaluated {
+                policy_id,
+                endpoint,
+            } => write!(
+                f,
+                "staged policy {policy_id:?} names {endpoint}, which no deciding HttpRequest \
+                 policy inspects; staged policies never make an endpoint inspected, so it is \
+                 never evaluated until a deciding HttpRequest policy names the endpoint"
+            ),
+            Self::StagedPolicyInspectionIgnored {
+                policy_id,
+                endpoint,
+                path,
+                protocol,
+            } => {
+                let mut declared = Vec::new();
+                if !path.is_empty() {
+                    declared.push(format!("@path({path:?})"));
+                }
+                if let Some(protocol) = protocol {
+                    declared.push(format!("@protocol({:?})", protocol.as_str()));
+                }
+                write!(
+                    f,
+                    "staged policy {policy_id:?} declares {} on {endpoint}, which no deciding \
+                     HttpRequest policy declares; staged policies never change inspection, so \
+                     it is compared only on requests routed to the paths deciding policies \
+                     declare, parsed with their protocol",
+                    declared.join(" ")
+                )
+            }
             Self::AuditPathOnEnforcedEndpoint { endpoint, path } => {
                 let path = if path.is_empty() {
                     "the path-less endpoint".to_string()
@@ -482,6 +563,16 @@ struct HostlessPermit {
     policy_id: String,
     /// The port its conditions require, if exactly one is named.
     port: Option<u16>,
+}
+
+/// A staged `HttpRequest` policy, which never changes inspection.
+struct StagedHttpPolicy {
+    policy_id: String,
+    endpoint: (String, u16),
+    /// Its `@path`, if any.
+    path: Option<String>,
+    /// Its `@protocol`, if any.
+    protocol: Option<L7Protocol>,
 }
 
 /// Everything derived from an authored policy set at load time.
@@ -687,6 +778,7 @@ pub fn analyze(schema: &Schema, policies: &PolicySet) -> Result<PolicyAnalysis, 
     let mut network_permits = HashMap::new();
     let mut unresolved = HashMap::new();
     let mut l7_declared: BTreeMap<(String, u16), DeclaredEndpoint> = BTreeMap::new();
+    let mut staged_http = Vec::new();
     let mut hostless_permits = Vec::new();
     let mut query_keys = QueryKeys::default();
     let mut staged_query_keys = QueryKeys::default();
@@ -720,6 +812,7 @@ pub fn analyze(schema: &Schema, policies: &PolicySet) -> Result<PolicyAnalysis, 
             &mut binary_glob_patterns,
         )?;
         check_delimited_patterns(conditions, &policy_id)?;
+        check_principal_identity(conditions, &policy_id)?;
         let scope = ActionScope::of(policy);
         check_has_tests(conditions, policy, &policy_id, &scope, schema, &declared)?;
         let touches_filesystem = (scope.includes(actions::READ_FILE)
@@ -838,10 +931,10 @@ pub fn analyze(schema: &Schema, policies: &PolicySet) -> Result<PolicyAnalysis, 
                 })?,
             };
             let endpoint = format!("{}:{}", key.0, key.1);
-            let path = path_annotation
+            let explicit_path = path_annotation
                 .map(|path| validate_path(&policy_id, path))
-                .transpose()?
-                .unwrap_or_default();
+                .transpose()?;
+            let path = explicit_path.clone().unwrap_or_default();
             let protocol = protocol_annotation
                 .map(|value| {
                     L7Protocol::from_annotation(value).ok_or_else(|| {
@@ -852,32 +945,51 @@ pub fn analyze(schema: &Schema, policies: &PolicySet) -> Result<PolicyAnalysis, 
                     })
                 })
                 .transpose()?;
-            let declared = l7_declared
-                .entry(key.clone())
-                .or_default()
-                .paths
-                .entry(path.clone())
-                .or_default();
-            match (declared.protocol, protocol) {
-                (Some(first), Some(second)) if first != second => {
-                    return Err(CedarEngineError::ConflictingL7Protocol {
-                        endpoint: format!("{endpoint}{path}"),
-                        first: first.to_string(),
-                        second: second.to_string(),
+            // A staged policy never changes inspection: only deciding
+            // policies make an endpoint or path inspected or declare its
+            // protocol.
+            let declared = match enforcement {
+                EnforcementAnnotation::Staged => {
+                    staged_http.push(StagedHttpPolicy {
+                        policy_id: policy_id.clone(),
+                        endpoint: key.clone(),
+                        path: explicit_path,
+                        protocol,
                     });
+                    None
                 }
-                (None, Some(protocol)) => declared.protocol = Some(protocol),
-                _ => {}
-            }
-            match enforcement {
-                EnforcementAnnotation::Enforce => declared.enforced_policies += 1,
-                EnforcementAnnotation::Audit => declared.audit_policies += 1,
-                EnforcementAnnotation::Staged => declared.staged_policies += 1,
-            }
+                EnforcementAnnotation::Enforce | EnforcementAnnotation::Audit => {
+                    let declared = l7_declared
+                        .entry(key.clone())
+                        .or_default()
+                        .paths
+                        .entry(path.clone())
+                        .or_default();
+                    match (declared.protocol, protocol) {
+                        (Some(first), Some(second)) if first != second => {
+                            return Err(CedarEngineError::ConflictingL7Protocol {
+                                endpoint: format!("{endpoint}{path}"),
+                                first: first.to_string(),
+                                second: second.to_string(),
+                            });
+                        }
+                        (None, Some(protocol)) => declared.protocol = Some(protocol),
+                        _ => {}
+                    }
+                    if enforcement == EnforcementAnnotation::Audit {
+                        declared.audit_policies += 1;
+                    } else {
+                        declared.enforced_policies += 1;
+                    }
+                    Some(declared)
+                }
+            };
             if policy.effect() == Effect::Permit {
                 let reads_graphql =
                     reads_context_attr(conditions, |attr| attr.starts_with(GRAPHQL_FIELD_PREFIX));
-                if permits_method_without_graphql(&json, WEBSOCKET_TEXT_METHOD) {
+                if let Some(declared) = declared
+                    && permits_method_without_graphql(&json, WEBSOCKET_TEXT_METHOD)
+                {
                     declared.generic_permits.push(policy_id.clone());
                 }
                 http_permits.insert(
@@ -946,13 +1058,35 @@ pub fn analyze(schema: &Schema, policies: &PolicySet) -> Result<PolicyAnalysis, 
             },
         )
         .collect();
-    check_tcp_endpoints(&dns_endpoints, l7_declared.keys(), &hostless_permits)?;
+    let mut overlaps = HostOverlaps::new();
+    check_tcp_endpoints(
+        &dns_endpoints,
+        l7_declared.keys(),
+        &hostless_permits,
+        &mut overlaps,
+    )?;
+
+    // Entries that can select one host are routed together, so the audit
+    // warning, the ambiguity check, and staged comparison consider them
+    // together.
+    let index = HostIndex::new(l7_declared.keys());
+    let overlapping = index.overlapping_pairs(&mut overlaps)?;
+    let enforced: Vec<bool> = l7_declared
+        .values()
+        .map(DeclaredEndpoint::has_enforced_policies)
+        .collect();
+    let mut enforced_nearby = enforced.clone();
+    for &(first, second) in &overlapping {
+        enforced_nearby[first] |= enforced[second];
+        enforced_nearby[second] |= enforced[first];
+    }
 
     let mut l7_endpoints = BTreeMap::new();
     let mut l7_host_patterns = Vec::new();
     let mut warnings = Vec::new();
-    for ((host, port), declared) in l7_declared {
-        let paths = declared.finish(&host, port, &mut warnings)?;
+    for (((host, port), declared), enforced_nearby) in l7_declared.into_iter().zip(enforced_nearby)
+    {
+        let paths = declared.finish(&host, port, enforced_nearby, &mut warnings)?;
         check_unambiguous_paths(&host, port, &paths)?;
         if host.contains('*') {
             // `host_glob` only produces patterns the YAML matcher compiles.
@@ -969,7 +1103,13 @@ pub fn analyze(schema: &Schema, policies: &PolicySet) -> Result<PolicyAnalysis, 
         }
         l7_endpoints.insert((host, port), paths);
     }
-    check_unambiguous_hosts(&l7_endpoints)?;
+    check_unambiguous_hosts(&l7_endpoints, &overlapping)?;
+    mark_staged(
+        &mut l7_endpoints,
+        &staged_http,
+        &mut overlaps,
+        &mut warnings,
+    )?;
 
     Ok(PolicyAnalysis {
         filesystem: FilesystemGrants {
@@ -1261,6 +1401,66 @@ fn check_delimited_patterns(expr: &Value, policy_id: &str) -> Result<(), CedarEn
     }
 }
 
+/// Rejects a read of `principal.user` or `principal.group` within `expr`;
+/// see the module docs.
+///
+/// A `user` or `group` read counts whenever its receiver can evaluate to a
+/// `Process`, that is, contains `principal` or a `Process` entity literal,
+/// so `(if c then principal else principal).user` and `{ p: principal }.p.user`
+/// are rejected too.
+///
+/// # Errors
+///
+/// Returns [`CedarEngineError::UnsupportedPolicy`] for the first such read.
+fn check_principal_identity(expr: &Value, policy_id: &str) -> Result<(), CedarEngineError> {
+    match expr {
+        Value::Object(fields) => {
+            for (name, value) in fields {
+                if name == "."
+                    && value.get("left").is_some_and(may_be_process)
+                    && let Some(attr @ ("user" | "group")) =
+                        value.get("attr").and_then(Value::as_str)
+                {
+                    return Err(CedarEngineError::UnsupportedPolicy {
+                        policy_id: policy_id.to_string(),
+                        reason: format!(
+                            "it reads `principal.{attr}`, but sandbox identity attributes are \
+                             not yet available to policies: every request carries the same \
+                             placeholder user and group, so the condition cannot tell \
+                             processes apart; remove it (the sandbox's run-as user and group \
+                             are enforced by the runtime, not by policy)"
+                        ),
+                    });
+                }
+                check_principal_identity(value, policy_id)?;
+            }
+            Ok(())
+        }
+        Value::Array(values) => values
+            .iter()
+            .try_for_each(|value| check_principal_identity(value, policy_id)),
+        _ => Ok(()),
+    }
+}
+
+/// Returns whether `expr` contains `principal` or a `Process` entity
+/// literal, so it may evaluate to a `Process`.
+fn may_be_process(expr: &Value) -> bool {
+    match expr {
+        Value::Object(fields) => {
+            fields.get("Var").and_then(Value::as_str) == Some("principal")
+                || fields
+                    .get("__entity")
+                    .and_then(|entity| entity.get("type"))
+                    .and_then(Value::as_str)
+                    == Some(entity_types::PROCESS)
+                || fields.values().any(may_be_process)
+        }
+        Value::Array(values) => values.iter().any(may_be_process),
+        _ => false,
+    }
+}
+
 /// Returns the pattern's text when a `MultiWildcard` in `elements` is next
 /// to anything other than `delimiter` or the pattern's ends.
 ///
@@ -1530,7 +1730,8 @@ fn context_attr(access: &Value) -> Option<&str> {
 enum DestinationIpUse {
     /// It does not.
     None,
-    /// A `forbid` reads it, in any form. It takes part in every decision as
+    /// A `forbid` reads it only in guarded `when` chains (see
+    /// [`address_reads_guarded`]). It takes part in every decision as
     /// written: before resolution with the address absent, so its guarded
     /// address conditions are false, and once per resolved address after.
     Forbid,
@@ -1576,6 +1777,33 @@ fn destination_ip_use(
         ));
     }
     if policy.effect() == Effect::Forbid {
+        // A top-level `when` guard makes the whole policy false while the
+        // address is absent, whatever its other conditions read.
+        let whole_policy_guarded = when_conjuncts(&json)
+            .is_some_and(|conjuncts| conjuncts.into_iter().any(is_destination_ip_guard));
+        let guarded = whole_policy_guarded
+            || conditions.iter().all(|condition| {
+                let body = condition.get("body").unwrap_or(&Value::Null);
+                if condition.get("kind").and_then(Value::as_str) == Some("when") {
+                    address_reads_guarded(body)
+                } else {
+                    !reads_destination_ip(body)
+                }
+            });
+        if !guarded {
+            return Err(invalid(
+                "a forbid may read destination_ip only in `when` conditions, within `&&` \
+                 chains that include `context has destination_ip` and are joined to the rest \
+                 of the condition only by `&&` and `||`, or anywhere once a `when` condition \
+                 has `context has destination_ip` as a top-level `&&` conjunct; otherwise the \
+                 address being absent before the host resolves makes the forbid deny every \
+                 connection it covers. \
+                 To deny addresses outside a range, write `when { context has destination_ip \
+                 && !context.destination_ip.isInRange(ip(\"10.0.0.0/8\")) }` instead of \
+                 `unless { context has destination_ip && \
+                 context.destination_ip.isInRange(ip(\"10.0.0.0/8\")) }`",
+            ));
+        }
         return Ok(DestinationIpUse::Forbid);
     }
 
@@ -1672,6 +1900,40 @@ fn reads_destination_ip(expr: &Value) -> bool {
         Value::Array(values) => values.iter().any(reads_destination_ip),
         _ => false,
     }
+}
+
+/// True if every read of `destination_ip` within `expr` lies in an `&&`
+/// chain with a `context has destination_ip` conjunct, reached from `expr`
+/// only through `&&` and `||`.
+///
+/// Such a chain is false while the address is absent, and `&&` and `||`
+/// preserve that only adding the address can make `expr` true, so a forbid
+/// whose `when` bodies have this form holds before resolution only if it
+/// holds for every address after.
+fn address_reads_guarded(expr: &Value) -> bool {
+    if !reads_destination_ip(expr) {
+        return true;
+    }
+    let mut conjuncts = Vec::new();
+    collect_conjuncts(expr, &mut conjuncts);
+    if conjuncts
+        .iter()
+        .any(|conjunct| is_destination_ip_guard(conjunct))
+    {
+        return true;
+    }
+    if let Some(or) = expr.get("||") {
+        return match (or.get("left"), or.get("right")) {
+            (Some(left), Some(right)) => {
+                address_reads_guarded(left) && address_reads_guarded(right)
+            }
+            _ => false,
+        };
+    }
+    conjuncts.len() > 1
+        && conjuncts
+            .iter()
+            .all(|conjunct| address_reads_guarded(conjunct))
 }
 
 /// True if `expr` is `context has destination_ip`.
@@ -1825,11 +2087,14 @@ fn check_tcp_host(policy_id: &str, host: &str) -> Result<(), CedarEngineError> {
 ///
 /// # Errors
 ///
-/// Returns [`CedarEngineError::ConflictingTransport`] for the first overlap.
+/// Returns [`CedarEngineError::ConflictingTransport`] for the first overlap,
+/// or [`CedarEngineError::HostOverlapBudgetExceeded`] if the checks exceed
+/// the budget.
 fn check_tcp_endpoints<'a>(
     endpoints: &[AuthorizedNetworkEndpoint],
     inspected: impl Iterator<Item = &'a (String, u16)> + Clone,
     hostless_permits: &[HostlessPermit],
+    overlaps: &mut HostOverlaps,
 ) -> Result<(), CedarEngineError> {
     let conflict = |tcp_host: &str, other_host: &str, port: u16, reason: &str| {
         CedarEngineError::ConflictingTransport {
@@ -1865,7 +2130,7 @@ fn check_tcp_endpoints<'a>(
             }
         }
         for (host, port) in inspected.clone() {
-            if tcp.ports.contains(port) && host_patterns_overlap(&tcp.host, host) {
+            if tcp.ports.contains(port) && overlaps.check(&tcp.host, host)? {
                 return Err(conflict(
                     &tcp.host,
                     host,
@@ -1880,7 +2145,7 @@ fn check_tcp_endpoints<'a>(
         {
             let shared = tcp.ports.iter().find(|port| other.ports.contains(port));
             if let Some(port) = shared
-                && host_patterns_overlap(&tcp.host, &other.host)
+                && overlaps.check(&tcp.host, &other.host)?
             {
                 return Err(conflict(
                     &tcp.host,
@@ -1931,6 +2196,193 @@ pub fn host_patterns_overlap(left: &str, right: &str) -> bool {
     if left.len() > MAX_DNS_NAME_LEN || right.len() > MAX_DNS_NAME_LEN {
         return true;
     }
+    strip_common_literals(left, right).is_some_and(|(left, right)| globs_overlap(left, right))
+}
+
+/// Most units of work host overlap checks may take for one policy set: one
+/// per compared pair, plus one per state of the pairwise match.
+///
+/// Comparing two 253-byte globs takes about 64,000 units, so the budget
+/// covers about a thousand such pairs, or millions of short or distinct
+/// ones, in well under a second, while a set of hundreds of long, similar
+/// globs on one port is rejected instead of taking minutes.
+const MAX_HOST_OVERLAP_WORK: u64 = 1 << 26;
+
+/// Host overlap checks for one policy set, within [`MAX_HOST_OVERLAP_WORK`].
+struct HostOverlaps {
+    remaining: u64,
+}
+
+impl HostOverlaps {
+    fn new() -> Self {
+        Self {
+            remaining: MAX_HOST_OVERLAP_WORK,
+        }
+    }
+
+    fn charge(&mut self, work: usize) -> Result<(), CedarEngineError> {
+        let work = u64::try_from(work).unwrap_or(u64::MAX);
+        self.remaining = self.remaining.checked_sub(work).ok_or(
+            CedarEngineError::HostOverlapBudgetExceeded {
+                limit: MAX_HOST_OVERLAP_WORK,
+            },
+        )?;
+        Ok(())
+    }
+
+    /// Returns whether some host matches both host patterns, as
+    /// [`host_patterns_overlap`] does, charging the work it takes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CedarEngineError::HostOverlapBudgetExceeded`] once the
+    /// checks of this policy set exceed [`MAX_HOST_OVERLAP_WORK`].
+    fn check(&mut self, left: &str, right: &str) -> Result<bool, CedarEngineError> {
+        if !left.contains('*') && !right.contains('*') {
+            return Ok(left == right);
+        }
+        self.charge(1)?;
+        if left.len() > MAX_DNS_NAME_LEN || right.len() > MAX_DNS_NAME_LEN {
+            return Ok(true);
+        }
+        let Some((left, right)) = strip_common_literals(left, right) else {
+            return Ok(false);
+        };
+        self.charge((left.len() + 1) * (right.len() + 1))?;
+        Ok(globs_overlap(left, right))
+    }
+}
+
+/// The inspected entries of one policy set, grouped so that overlap checks
+/// pair only entries whose hosts can be the same: on one port, and with the
+/// same last label where both last labels are literal.
+struct HostIndex<'a> {
+    keys: Vec<&'a (String, u16)>,
+    ports: BTreeMap<u16, PortEntries<'a>>,
+}
+
+/// The entries of [`HostIndex`] on one port, as indices into its keys.
+#[derive(Default)]
+struct PortEntries<'a> {
+    /// Entries whose last label is literal, by that label.
+    by_last_label: BTreeMap<&'a str, Vec<usize>>,
+    /// Entries whose last label has a `*`.
+    wildcard_last_label: Vec<usize>,
+}
+
+impl<'a> HostIndex<'a> {
+    fn new(keys: impl Iterator<Item = &'a (String, u16)>) -> Self {
+        let keys: Vec<_> = keys.collect();
+        let mut ports: BTreeMap<u16, PortEntries<'a>> = BTreeMap::new();
+        for (index, (host, port)) in keys.iter().enumerate() {
+            let entries = ports.entry(*port).or_default();
+            match literal_last_label(host) {
+                Some(label) => entries.by_last_label.entry(label).or_default().push(index),
+                None => entries.wildcard_last_label.push(index),
+            }
+        }
+        Self { keys, ports }
+    }
+
+    fn host(&self, index: usize) -> &'a str {
+        &self.keys[index].0
+    }
+
+    /// Returns the entries whose hosts may be the same as one `host`
+    /// matches on `port`, in no particular order.
+    fn candidates(&self, host: &str, port: u16) -> Vec<usize> {
+        let Some(entries) = self.ports.get(&port) else {
+            return Vec::new();
+        };
+        let mut candidates = entries.wildcard_last_label.clone();
+        match literal_last_label(host) {
+            Some(label) => {
+                candidates.extend(entries.by_last_label.get(label).into_iter().flatten());
+            }
+            None => candidates.extend(entries.by_last_label.values().flatten()),
+        }
+        candidates
+    }
+
+    /// Returns each pair of entries some host matches both of, as indices
+    /// with the lower first, in order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CedarEngineError::HostOverlapBudgetExceeded`] if the checks
+    /// exceed the budget.
+    fn overlapping_pairs(
+        &self,
+        overlaps: &mut HostOverlaps,
+    ) -> Result<Vec<(usize, usize)>, CedarEngineError> {
+        let mut pairs = Vec::new();
+        for (first, (host, port)) in self.keys.iter().enumerate() {
+            for second in self.candidates(host, *port) {
+                let other = self.host(second);
+                // Distinct exact hosts never select one host.
+                if second <= first || (!host.contains('*') && !other.contains('*')) {
+                    continue;
+                }
+                if overlaps.check(host, other)? {
+                    pairs.push((first, second));
+                }
+            }
+        }
+        pairs.sort_unstable();
+        Ok(pairs)
+    }
+}
+
+/// Returns the last `.`-separated label of a host pattern, if it has no `*`.
+///
+/// A pattern's text after its last `*` ends every host it matches, so when
+/// its last label is literal, every host it matches has that last label.
+/// Two such patterns with different last labels match no common host.
+fn literal_last_label(host: &str) -> Option<&str> {
+    let label = host.rsplit('.').next().unwrap_or(host);
+    (!label.contains('*')).then_some(label)
+}
+
+/// Removes the literal text both host patterns start and end with.
+///
+/// A pattern's text before its first `*` starts every host it matches, and
+/// its text after its last `*` ends it. So when neither pattern's literal
+/// start is a start of the other's, or likewise for their ends, no host
+/// matches both and `None` is returned. Otherwise both start (or end) with
+/// the shorter, and the patterns without it match a common host exactly
+/// when the originals do.
+fn strip_common_literals<'a>(left: &'a str, right: &'a str) -> Option<(&'a str, &'a str)> {
+    let prefix = |pattern: &'a str| &pattern[..pattern.find('*').unwrap_or(pattern.len())];
+    let (left_prefix, right_prefix) = (prefix(left), prefix(right));
+    let common = left_prefix.len().min(right_prefix.len());
+    if left_prefix.as_bytes()[..common] != right_prefix.as_bytes()[..common] {
+        return None;
+    }
+    // Equal bytes ending a run of whole characters in one pattern end whole
+    // characters in the other too; `get` keeps a mistake from panicking.
+    let (Some(left), Some(right)) = (left.get(common..), right.get(common..)) else {
+        return Some((left, right));
+    };
+    let suffix = |pattern: &'a str| &pattern[pattern.rfind('*').map_or(0, |star| star + 1)..];
+    let (left_suffix, right_suffix) = (suffix(left), suffix(right));
+    let common = left_suffix.len().min(right_suffix.len());
+    if left_suffix.as_bytes()[left_suffix.len() - common..]
+        != right_suffix.as_bytes()[right_suffix.len() - common..]
+    {
+        return None;
+    }
+    match (
+        left.get(..left.len() - common),
+        right.get(..right.len() - common),
+    ) {
+        (Some(left), Some(right)) => Some((left, right)),
+        _ => Some((left, right)),
+    }
+}
+
+/// Returns whether some host matches both host patterns, by walking both
+/// at once.
+fn globs_overlap(left: &str, right: &str) -> bool {
     let (left, right) = (host_tokens(left), host_tokens(right));
     let accepts = |token: HostToken, c: char| match token {
         HostToken::Literal(literal) => literal == c,
@@ -2060,29 +2512,100 @@ fn ambiguous_path_pair<'a>(
 /// require it of one entry. YAML rejects endpoints whose hosts and ports
 /// overlap with the same conflict.
 ///
+/// `overlapping` lists the pairs of entries, as indices in key order, that
+/// can select one host.
+///
 /// # Errors
 ///
 /// Returns [`CedarEngineError::AmbiguousL7Hosts`] for the first such pair.
 fn check_unambiguous_hosts(
     endpoints: &BTreeMap<(String, u16), BTreeMap<String, L7Endpoint>>,
+    overlapping: &[(usize, usize)],
 ) -> Result<(), CedarEngineError> {
-    for (index, ((first_host, port), first_paths)) in endpoints.iter().enumerate() {
-        for ((second_host, second_port), second_paths) in endpoints.iter().skip(index + 1) {
-            if port != second_port || !host_patterns_overlap(first_host, second_host) {
+    let entries: Vec<_> = endpoints.iter().collect();
+    for &(first, second) in overlapping {
+        let (((first_host, port), first_paths), ((second_host, _), second_paths)) =
+            (entries[first], entries[second]);
+        let conflict = first_paths.iter().find_map(|first| {
+            second_paths
+                .iter()
+                .find_map(|second| ambiguous_path_pair(first, second))
+        });
+        if let Some((first_path, second_path)) = conflict {
+            return Err(CedarEngineError::AmbiguousL7Hosts {
+                first: format!("{first_host}:{port}"),
+                second: format!("{second_host}:{port}"),
+                first_path: first_path.to_string(),
+                second_path: second_path.to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Marks every path a staged policy can be compared on, and warns of staged
+/// policies that no deciding policy routes requests to, or whose `@path` or
+/// `@protocol` no deciding policy declares.
+///
+/// A staged policy applies to requests for the hosts it names, which are
+/// routed to the entries that can select them, so the comparison runs on
+/// every path of those entries.
+///
+/// # Errors
+///
+/// Returns [`CedarEngineError::HostOverlapBudgetExceeded`] if comparing the
+/// staged policies' hosts with the entries exceeds the budget.
+fn mark_staged(
+    endpoints: &mut BTreeMap<(String, u16), BTreeMap<String, L7Endpoint>>,
+    staged: &[StagedHttpPolicy],
+    overlaps: &mut HostOverlaps,
+    warnings: &mut Vec<AnalysisWarning>,
+) -> Result<(), CedarEngineError> {
+    let mut compared = BTreeSet::new();
+    {
+        let index = HostIndex::new(endpoints.keys());
+        let entries: Vec<_> = endpoints.values().collect();
+        for policy in staged {
+            let (host, port) = &policy.endpoint;
+            let mut selecting = Vec::new();
+            for candidate in index.candidates(host, *port) {
+                if overlaps.check(host, index.host(candidate))? {
+                    selecting.push(candidate);
+                }
+            }
+            let endpoint = format!("{host}:{port}");
+            if selecting.is_empty() {
+                warnings.push(AnalysisWarning::StagedPolicyNotEvaluated {
+                    policy_id: policy.policy_id.clone(),
+                    endpoint,
+                });
                 continue;
             }
-            let conflict = first_paths.iter().find_map(|first| {
-                second_paths
-                    .iter()
-                    .find_map(|second| ambiguous_path_pair(first, second))
-            });
-            if let Some((first_path, second_path)) = conflict {
-                return Err(CedarEngineError::AmbiguousL7Hosts {
-                    first: format!("{first_host}:{port}"),
-                    second: format!("{second_host}:{port}"),
-                    first_path: first_path.to_string(),
-                    second_path: second_path.to_string(),
+            if policy.path.is_some() || policy.protocol.is_some() {
+                let path = policy.path.clone().unwrap_or_default();
+                let declared = selecting.iter().any(|&entry| {
+                    entries[entry].get(&path).is_some_and(|inspection| {
+                        policy
+                            .protocol
+                            .is_none_or(|protocol| inspection.protocol == protocol)
+                    })
                 });
+                if !declared {
+                    warnings.push(AnalysisWarning::StagedPolicyInspectionIgnored {
+                        policy_id: policy.policy_id.clone(),
+                        endpoint,
+                        path,
+                        protocol: policy.protocol,
+                    });
+                }
+            }
+            compared.extend(selecting);
+        }
+    }
+    for (entry, paths) in endpoints.values_mut().enumerate() {
+        if compared.contains(&entry) {
+            for inspection in paths.values_mut() {
+                inspection.staged = true;
             }
         }
     }
@@ -2735,7 +3258,100 @@ pub fn display_id(policy: &Policy) -> String {
 
 #[cfg(test)]
 mod overlap_tests {
-    use super::host_patterns_overlap;
+    use super::{
+        HostIndex, HostOverlaps, MAX_HOST_OVERLAP_WORK, globs_overlap, host_patterns_overlap,
+        literal_last_label,
+    };
+    use crate::CedarEngineError;
+
+    const PATTERNS: &[&str] = &[
+        "api.example.com",
+        "api.example.org",
+        "example.com",
+        "localhost",
+        "*.example.com",
+        "**.example.com",
+        "a*.example.com",
+        "*b.example.com",
+        "api*.example.com",
+        "*i.example.com",
+        "api.*.com",
+        "api.*",
+        "*.*.com",
+        "**.com.example.com",
+        "x*y.example.com",
+        "deep.api.example.com",
+        "*.api.example.com",
+        "api-v2.example.com",
+        "ap*2.example.com",
+    ];
+
+    #[test]
+    fn stripping_literal_ends_agrees_with_the_full_match() {
+        for left in PATTERNS {
+            for right in PATTERNS {
+                let full = if left.contains('*') || right.contains('*') {
+                    globs_overlap(left, right)
+                } else {
+                    left == right
+                };
+                assert_eq!(
+                    host_patterns_overlap(left, right),
+                    full,
+                    "{left} vs {right}"
+                );
+                assert_eq!(
+                    HostOverlaps::new().check(left, right).unwrap(),
+                    full,
+                    "{left} vs {right}"
+                );
+                // Bucketing by last label never separates overlapping hosts.
+                if full
+                    && let (Some(left_label), Some(right_label)) =
+                        (literal_last_label(left), literal_last_label(right))
+                {
+                    assert_eq!(left_label, right_label, "{left} vs {right}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_index_pairs_exactly_the_overlapping_entries() {
+        let keys: Vec<(String, u16)> = PATTERNS
+            .iter()
+            .flat_map(|host| [(host.to_string(), 443), (host.to_string(), 80)])
+            .collect();
+        let index = HostIndex::new(keys.iter());
+        let pairs = index.overlapping_pairs(&mut HostOverlaps::new()).unwrap();
+        let mut expected = Vec::new();
+        for (first, (first_host, first_port)) in keys.iter().enumerate() {
+            for (second, (second_host, second_port)) in keys.iter().enumerate().skip(first + 1) {
+                if first_port == second_port && host_patterns_overlap(first_host, second_host) {
+                    expected.push((first, second));
+                }
+            }
+        }
+        assert_eq!(pairs, expected);
+    }
+
+    #[test]
+    fn the_budget_rejects_once_exhausted() {
+        let long = format!("*a*{}.com", ".*".repeat(100));
+        let mut overlaps = HostOverlaps::new();
+        let error = loop {
+            match overlaps.check(&long, &long) {
+                Ok(overlap) => assert!(overlap),
+                Err(error) => break error,
+            }
+        };
+        assert!(matches!(
+            error,
+            CedarEngineError::HostOverlapBudgetExceeded {
+                limit: MAX_HOST_OVERLAP_WORK
+            }
+        ));
+    }
 
     #[test]
     fn literal_and_glob_boundaries() {

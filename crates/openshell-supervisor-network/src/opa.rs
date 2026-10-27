@@ -23,6 +23,7 @@ use crate::policy_validation::{
     render_repeated_validation_diagnostic,
 };
 use miette::Result;
+use openshell_core::host_pattern::HostSelector;
 use openshell_core::policy::{
     FilesystemPolicy, LandlockCompatibility, LandlockPolicy, ProcessPolicy,
 };
@@ -188,7 +189,8 @@ impl RegoTunnelEvaluator {
     ///
     /// Returns an error if the evaluation fails or the middleware data is malformed.
     pub(crate) fn query_middleware_chain(&self, input: &NetworkInput) -> Result<Vec<ChainEntry>> {
-        query_middleware_chain_locked(&mut *self.lock()?, input)
+        let configs = query_middleware_config_value(&mut *self.lock()?)?;
+        middleware_configs_from_rego(&configs, &input.host)?.select(&input.host)
     }
 
     /// Evaluates one L7 request and returns `(allowed, deny_reason)`.
@@ -201,11 +203,10 @@ impl RegoTunnelEvaluator {
         ctx: &crate::l7::relay::L7EvalContext,
         request: &crate::l7::L7RequestInfo,
     ) -> Result<(bool, String)> {
-        let input = crate::l7::relay::l7_request_policy_input(ctx, request);
+        let input = regorus_input(crate::l7::relay::l7_request_policy_input(ctx, request))?;
 
         let mut engine = self.lock()?;
-
-        set_regorus_input(&mut engine, input)?;
+        engine.set_input(input);
 
         let allowed = engine
             .eval_rule("data.openshell.sandbox.allow_request".into())
@@ -238,33 +239,25 @@ impl RegoTunnelEvaluator {
         ctx: &crate::l7::relay::L7EvalContext,
         request: &crate::l7::L7RequestInfo,
     ) -> Result<std::collections::HashSet<String>> {
-        eval_admitted_token_grant_owners(&mut *self.lock()?, ctx, request)
+        let input = regorus_input(crate::l7::relay::l7_request_policy_input(ctx, request))?;
+        let owners = {
+            let mut engine = self.lock()?;
+            engine.set_input(input);
+            engine
+                .eval_rule("data.openshell.sandbox.allowed_token_grant_owners".into())
+                .map_err(|error| miette::miette!("{error}"))?
+        };
+        let regorus::Value::Array(owners) = owners else {
+            return Err(miette::miette!("invalid credential owner admission result"));
+        };
+        owners
+            .iter()
+            .map(|owner| match owner {
+                regorus::Value::String(owner) => Ok(owner.to_string()),
+                _ => Err(miette::miette!("invalid credential owner identity")),
+            })
+            .collect()
     }
-}
-
-/// Evaluates `allowed_token_grant_owners` for one L7 request.
-fn eval_admitted_token_grant_owners(
-    engine: &mut regorus::Engine,
-    ctx: &crate::l7::relay::L7EvalContext,
-    request: &crate::l7::L7RequestInfo,
-) -> Result<std::collections::HashSet<String>> {
-    set_regorus_input(
-        engine,
-        crate::l7::relay::l7_request_policy_input(ctx, request),
-    )?;
-    let owners = engine
-        .eval_rule("data.openshell.sandbox.allowed_token_grant_owners".into())
-        .map_err(|error| miette::miette!("{error}"))?;
-    let regorus::Value::Array(owners) = owners else {
-        return Err(miette::miette!("invalid credential owner admission result"));
-    };
-    owners
-        .iter()
-        .map(|owner| match owner {
-            regorus::Value::String(owner) => Ok(owner.to_string()),
-            _ => Err(miette::miette!("invalid credential owner identity")),
-        })
-        .collect()
 }
 
 impl OpaEngine {
@@ -505,7 +498,7 @@ impl OpaEngine {
     /// `allow_network` rule, and returns a `PolicyDecision` with the result,
     /// deny reason, and matched policy name.
     pub fn evaluate_network(&self, input: &NetworkInput) -> Result<PolicyDecision> {
-        let input_json = network_input_json(input);
+        let input_value = regorus_input(network_input_json(input))?;
 
         let mut engine = self
             .engine
@@ -525,7 +518,7 @@ impl OpaEngine {
             });
         }
 
-        set_regorus_input(&mut engine, input_json)?;
+        engine.set_input(input_value);
 
         let allowed = engine
             .eval_rule("data.openshell.sandbox.allow_network".into())
@@ -576,7 +569,7 @@ impl OpaEngine {
         #[cfg(test)]
         record_test_opa_query();
 
-        let input_json = network_input_json(input);
+        let input_value = regorus_input(network_input_json(input))?;
 
         let mut engine = self
             .engine
@@ -600,17 +593,22 @@ impl OpaEngine {
             });
         }
 
-        set_regorus_input(&mut engine, input_json)?;
+        engine.set_input(input_value);
 
         let result = engine
             .eval_rule("data.openshell.sandbox.egress_authorization".into())
             .map_err(|e| miette::miette!("{e}"))?;
+        // Regorus values own their data; conversion must not serialize other
+        // requests behind the evaluator lock. The generation was captured above.
+        drop(engine);
         let action_str = get_str(&result, "action").unwrap_or_default();
         let matched_policy = get_str(&result, "matched_policy").filter(|name| !name.is_empty());
         let endpoint_configs = get_field(&result, "endpoint_configs")
             .map_or_else(|| Ok(Vec::new()), |v| list_from_rego(v, "endpoint config"))?;
-        let matched_endpoints = get_field(&result, "matched_endpoints")
-            .map_or_else(|| Ok(Vec::new()), |v| list_from_rego(v, "matched endpoint"))?;
+        let matched_endpoints = get_field(&result, "matched_endpoints").map_or_else(
+            || Ok(Vec::new()),
+            |v| matched_endpoints_from_rego(v, "matched endpoint"),
+        )?;
         let exact_declared_endpoint_host =
             get_bool(&result, "exact_declared_endpoint_host").unwrap_or(false);
 
@@ -663,7 +661,8 @@ impl OpaEngine {
         let value = engine
             .eval_rule("data.openshell.sandbox.policy_dns_eligible_endpoint_records".into())
             .map_err(|error| miette::miette!("{error}"))?;
-        let endpoints = list_from_rego(&value, "policy DNS record")?;
+        drop(engine);
+        let endpoints = matched_endpoints_from_rego(&value, "policy DNS record")?;
 
         Ok(PolicyDnsEligibilitySnapshot {
             endpoints,
@@ -946,8 +945,11 @@ impl OpaEngine {
         &self,
         input: &NetworkInput,
     ) -> Result<(Option<EndpointConfig>, u64)> {
-        let (configs, generation) = self.query_endpoint_configs_with_generation(input)?;
-        Ok((configs.into_iter().next(), generation))
+        let (value, generation) = self.query_endpoint_config_values(input)?;
+        let config = first_rego_value(&value)
+            .map(|value| from_rego(value, "endpoint config"))
+            .transpose()?;
+        Ok((config, generation))
     }
 
     /// Query all matching endpoint configs and return the policy generation used for the query.
@@ -987,7 +989,7 @@ impl OpaEngine {
         #[cfg(test)]
         record_test_opa_query();
 
-        let input_json = network_input_json(input);
+        let input_value = regorus_input(network_input_json(input))?;
 
         let mut engine = self
             .engine
@@ -995,7 +997,7 @@ impl OpaEngine {
             .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
         let generation = self.current_generation();
 
-        set_regorus_input(&mut engine, input_json)?;
+        engine.set_input(input_value);
 
         let val = engine
             .eval_rule("data.openshell.sandbox._matching_endpoint_configs".into())
@@ -1009,26 +1011,31 @@ impl OpaEngine {
     /// L4-only endpoints, which carry no extended L7 config. It is answered by
     /// a dedicated Rego rule so credential gating cannot alter which endpoint
     /// the TLS mode and SSRF allowlist are read from.
+    /// Only credential-guard settings are returned; L7 rules are omitted.
     pub fn query_endpoint_credential_guards(
         &self,
         input: &NetworkInput,
     ) -> Result<Vec<EndpointConfig>> {
-        let input_json = network_input_json(input);
+        let input_value = regorus_input(network_input_json(input))?;
 
         let mut engine = self
             .engine
             .lock()
             .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
 
-        engine
-            .set_input_json(&input_json.to_string())
-            .map_err(|e| miette::miette!("{e}"))?;
+        engine.set_input(input_value);
 
         let val = engine
             .eval_rule("data.openshell.sandbox.endpoint_credential_guards".into())
             .map_err(|e| miette::miette!("{e}"))?;
 
-        list_from_rego(&val, "endpoint credential guard")
+        drop(engine);
+        map_rego_list(&val, |endpoint| {
+            from_rego(
+                &project_rego_fields(endpoint, CREDENTIAL_GUARD_FIELDS),
+                "endpoint credential guard",
+            )
+        })
     }
 
     /// Query the ordered middleware chain for an admitted destination.
@@ -1041,7 +1048,9 @@ impl OpaEngine {
             .lock()
             .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
         let generation = self.current_generation();
-        let chain = query_middleware_chain_locked(&mut engine, input)?;
+        let configs = query_middleware_config_value(&mut engine)?;
+        drop(engine);
+        let chain = middleware_configs_from_rego(&configs, &input.host)?.select(&input.host)?;
         Ok((chain, generation))
     }
 
@@ -1052,10 +1061,10 @@ impl OpaEngine {
     /// match. This is used by the proxy to decide between full SSRF blocking
     /// and allowlist-based IP validation.
     pub fn query_allowed_ips(&self, input: &NetworkInput) -> Result<Vec<String>> {
-        Ok(self
-            .query_endpoint_config(input)?
-            .map(|config| config.allowed_ips)
-            .unwrap_or_default())
+        let (value, _) = self.query_endpoint_config_values(input)?;
+        first_rego_value(&value)
+            .and_then(|endpoint| get_field(endpoint, "allowed_ips"))
+            .map_or_else(|| Ok(Vec::new()), |ips| from_rego(ips, "allowed IPs"))
     }
 
     /// Return true when the matched endpoint is an exact declared hostname.
@@ -1069,14 +1078,14 @@ impl OpaEngine {
         #[cfg(test)]
         record_test_opa_query();
 
-        let input_json = network_input_json(input);
+        let input_value = regorus_input(network_input_json(input))?;
 
         let mut engine = self
             .engine
             .lock()
             .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
 
-        set_regorus_input(&mut engine, input_json)?;
+        engine.set_input(input_value);
 
         let val = engine
             .eval_rule("data.openshell.sandbox.exact_declared_endpoint_host".into())
@@ -1154,24 +1163,31 @@ fn network_input_json(input: &NetworkInput) -> serde_json::Value {
 ///
 /// The explicit fallible conversion preserves evaluator errors because Regorus's infallible
 /// `From<serde_json::Value>` conversion maps failures to [`regorus::Value::Undefined`].
+#[cfg(test)]
 pub(crate) fn set_regorus_input(
     engine: &mut regorus::Engine,
     input: serde_json::Value,
 ) -> Result<()> {
-    let input =
-        serde_json::from_value::<regorus::Value>(input).map_err(|e| miette::miette!("{e}"))?;
-    engine.set_input(input);
+    engine.set_input(regorus_input(input)?);
     Ok(())
 }
 
-fn query_middleware_chain_locked(
-    engine: &mut regorus::Engine,
-    input: &NetworkInput,
-) -> Result<Vec<ChainEntry>> {
-    let configs = engine
+fn regorus_input(input: serde_json::Value) -> Result<regorus::Value> {
+    serde_json::from_value(input).map_err(|e| miette::miette!("{e}"))
+}
+
+fn query_middleware_config_value(engine: &mut regorus::Engine) -> Result<regorus::Value> {
+    engine
         .eval_rule("data.openshell.sandbox.network_middlewares".into())
-        .map_err(|e| miette::miette!("{e}"))?;
-    middleware_configs_from_rego(&configs)?.select(&input.host)
+        .map_err(|e| miette::miette!("{e}"))
+}
+
+fn first_rego_value(value: &regorus::Value) -> Option<&regorus::Value> {
+    match value {
+        regorus::Value::Undefined => None,
+        regorus::Value::Array(values) => values.first(),
+        other => Some(other),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1201,11 +1217,55 @@ fn list_from_rego<T: serde::de::DeserializeOwned>(
     value: &regorus::Value,
     what: &str,
 ) -> Result<Vec<T>> {
+    map_rego_list(value, |value| from_rego(value, what))
+}
+
+fn map_rego_list<T>(
+    value: &regorus::Value,
+    convert: impl Fn(&regorus::Value) -> Result<T>,
+) -> Result<Vec<T>> {
     match value {
         regorus::Value::Undefined => Ok(Vec::new()),
-        regorus::Value::Array(values) => values.iter().map(|v| from_rego(v, what)).collect(),
-        other => Ok(vec![from_rego(other, what)?]),
+        regorus::Value::Array(values) => values.iter().map(convert).collect(),
+        other => Ok(vec![convert(other)?]),
     }
+}
+
+const CREDENTIAL_GUARD_FIELDS: &[&str] = &[
+    "protocol",
+    "tls",
+    "provider_credentialed",
+    "allow_uninspected_credentials",
+];
+
+// Clone only the fields the typed result consumes. Regorus values share their
+// contents, so this never walks the endpoint's L7 rules or other unused data.
+fn project_rego_fields(value: &regorus::Value, keys: &[&str]) -> regorus::Value {
+    let regorus::Value::Object(_) = value else {
+        // Preserve malformed shapes so typed conversion still fails closed.
+        return value.clone();
+    };
+    keys.iter()
+        .filter_map(|key| get_field(value, key).map(|field| ((*key).into(), field.clone())))
+        .collect::<std::collections::BTreeMap<regorus::Value, regorus::Value>>()
+        .into()
+}
+
+fn project_endpoint_record(value: &regorus::Value) -> regorus::Value {
+    let mut record = project_rego_fields(value, &["policy_name", "endpoint_index", "endpoint"]);
+    if let (Some(endpoint), Ok(fields)) = (get_field(value, "endpoint"), record.as_object_mut()) {
+        fields.insert(
+            "endpoint".into(),
+            project_rego_fields(endpoint, &["host", "ports", "protocol", "allowed_ips"]),
+        );
+    }
+    record
+}
+
+fn matched_endpoints_from_rego(value: &regorus::Value, what: &str) -> Result<Vec<MatchedEndpoint>> {
+    map_rego_list(value, |record| {
+        from_rego(&project_endpoint_record(record), what)
+    })
 }
 
 /// One `network_middlewares` entry as the Rego data carries it.
@@ -1221,12 +1281,37 @@ struct RegoMiddlewareConfig {
 
 /// Converts the `network_middlewares` object of the Rego data, keyed by
 /// config name in sorted order.
-fn middleware_configs_from_rego(value: &regorus::Value) -> Result<MiddlewareConfigs> {
+fn middleware_configs_from_rego(value: &regorus::Value, host: &str) -> Result<MiddlewareConfigs> {
     if matches!(value, regorus::Value::Undefined) {
         return Ok(MiddlewareConfigs::default());
     }
+    let regorus::Value::Object(entries) = value else {
+        return Err(miette::miette!(
+            "network_middlewares from Rego has an unexpected shape"
+        ));
+    };
+    // Check selectors before decoding middleware payloads the caller will not use.
+    let mut selected = std::collections::BTreeMap::new();
+    for (name, entry) in entries.iter() {
+        if !matches!(entry, regorus::Value::Object(_)) {
+            return Err(miette::miette!(
+                "network_middlewares from Rego has an unexpected shape"
+            ));
+        }
+        let Some(selector) = get_field(entry, "endpoints")
+            .filter(|selector| !matches!(selector, regorus::Value::Null))
+        else {
+            continue;
+        };
+        let selector: MiddlewareEndpointSelector = from_rego(selector, "network_middlewares")?;
+        let selector = HostSelector::new(&selector.include, &selector.exclude)
+            .map_err(|error| miette::miette!(error))?;
+        if selector.matches(host) {
+            selected.insert(name.clone(), entry.clone());
+        }
+    }
     let entries: std::collections::BTreeMap<String, RegoMiddlewareConfig> =
-        from_rego(value, "network_middlewares")?;
+        from_rego(&selected.into(), "network_middlewares")?;
     let configs = entries
         .into_iter()
         .map(|(policy_key, entry)| {
@@ -11746,5 +11831,88 @@ network_policies:
             ancestors: vec![],
             cmdline_paths: vec![],
         }
+    }
+    #[test]
+    fn dns_and_credential_results_project_only_consumed_endpoint_fields() {
+        let engine = OpaEngine::from_strings(
+            TEST_POLICY,
+            r#"
+network_policies:
+  api:
+    endpoints:
+      - host: api.example.com
+        port: 443
+        protocol: rest
+        allowed_ips: [10.0.0.0/8]
+        provider_credentialed: true
+        allow_uninspected_credentials: true
+        rules:
+          - allow: { method: GET, path: "/v1/**" }
+    binaries: [{ path: /usr/bin/test }]
+"#,
+        )
+        .unwrap();
+        let input = wildcard_input("api.example.com");
+        let expected_records = serde_json::json!([{
+            "policy_name": "api", "endpoint_index": 0,
+            "endpoint": {
+                "host": "api.example.com", "ports": [443],
+                "protocol": "rest", "allowed_ips": ["10.0.0.0/8"]
+            }
+        }]);
+        let mut rego = engine.engine.lock().unwrap();
+        set_regorus_input(&mut rego, network_input_json(&input)).unwrap();
+        for rule in [
+            "_matching_endpoint_records",
+            "policy_dns_eligible_endpoint_records",
+        ] {
+            let records = rego
+                .eval_rule(format!("data.openshell.sandbox.{rule}"))
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(
+                    map_rego_list(&records, |record| Ok(project_endpoint_record(record))).unwrap()
+                )
+                .unwrap(),
+                expected_records,
+                "{rule}"
+            );
+        }
+        let guards = rego
+            .eval_rule("data.openshell.sandbox.endpoint_credential_guards".into())
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(
+                map_rego_list(&guards, |endpoint| Ok(project_rego_fields(
+                    endpoint,
+                    CREDENTIAL_GUARD_FIELDS
+                )))
+                .unwrap()
+            )
+            .unwrap(),
+            serde_json::json!([{
+                "protocol": "rest", "provider_credentialed": true,
+                "allow_uninspected_credentials": true
+            }])
+        );
+        drop(rego);
+
+        let authorization = engine.authorize_egress(&input).unwrap();
+        assert!(matches!(authorization.action, NetworkAction::Allow { .. }));
+        assert_eq!(authorization.endpoint_configs[0].rules.len(), 1);
+        assert_eq!(
+            authorization.matched_endpoints,
+            engine.policy_dns_eligibility_snapshot().unwrap().endpoints
+        );
+        assert_eq!(engine.query_allowed_ips(&input).unwrap(), ["10.0.0.0/8"]);
+        let guards = engine.query_endpoint_credential_guards(&input).unwrap();
+        assert_eq!(guards.len(), 1);
+        assert!(
+            guards[0].rules.is_empty(),
+            "credential gating must not decode L7 rules"
+        );
+        let guard = crate::l7::parse_endpoint_credential_guard(&guards[0]);
+        assert!(guard.provider_credentialed);
+        assert!(!guard.blocks_connect());
     }
 }

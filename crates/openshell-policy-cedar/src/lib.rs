@@ -18,27 +18,34 @@
 
 mod analysis;
 mod error;
+mod limits;
 mod token_grants;
 
 pub use analysis::{AnalysisWarning, L7Endpoint, L7Enforcement, L7Protocol, NetworkTransport};
 pub use error::CedarEngineError;
+pub use limits::{
+    MAX_POLICY_EXPRESSION_DEPTH, MAX_POLICY_NESTING, MAX_POLICY_SOURCE_BYTES,
+    MAX_REQUEST_FIELD_BYTES,
+};
 pub use token_grants::{
     Handling, ProviderEndpoint, ProviderPolicy, RuleLocation, RuleMatcher,
     TOKEN_GRANT_OWNER_ANNOTATION, TokenGrantRules, UntranslatedRule, ValueMatcher,
 };
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::IpAddr;
 use std::str::FromStr;
+use std::sync::Arc;
 
 use cedar_policy::{
-    Authorizer, Context, Entities, Entity, EntityId, EntityTypeName, EntityUid, PolicyId,
-    PolicySet, Request, RestrictedExpression, Schema,
+    AuthorizationError, Authorizer, Context, Entities, Entity, EntityId, EntityTypeName, EntityUid,
+    PolicyId, PolicySet, Request, RestrictedExpression, Schema,
 };
 use openshell_policy_cedar_schema::{actions, context_fields, endpoint_fields, entity_types};
 
-use analysis::{PolicyAnalysis, QueryKeys};
+use analysis::{HttpPermit, PolicyAnalysis, QueryKeys};
 pub use ipnet::IpNet;
+use limits::SourceShape;
 
 /// Most evaluations one `HttpRequest` gets for the combinations of its
 /// repeated query values.
@@ -308,19 +315,42 @@ pub struct CedarEngine {
     /// address absent, their `context has destination_ip` guards are false.
     unresolved_policies: PolicySet,
     /// For each `graphql` or `websocket-graphql` path with permits attached
-    /// to other paths of its endpoint that are not GraphQL-aware, the policy
-    /// sets without those permits, keyed by `(host, port, path)`.
-    graphql_policies: HashMap<(String, u16, String), GraphqlPolicies>,
+    /// to other paths of its endpoint that are not GraphQL-aware, the
+    /// permits its GraphQL requests are decided without, keyed by `(host,
+    /// port, path)`.
+    graphql_exclusions: HashMap<(String, u16, String), GraphqlExclusion>,
     analysis: PolicyAnalysis,
+    /// The shape of the policy text, which sizes the stack evaluation needs.
+    shape: SourceShape,
 }
 
-/// The policy sets that decide a request parsed as GraphQL on one path.
+/// The permits a request parsed as GraphQL on one path is decided without:
+/// the permits of the path's endpoint, or of another entry that can select
+/// a host with it, attached to another path and not aware of GraphQL.
+///
+/// Requests are evaluated against the whole policy set and these permits
+/// are then disregarded, which decides as the set without them would:
+/// forbids are never excluded, and an excluded permit neither allows a
+/// request nor fails it with an evaluation error.
 #[derive(Debug)]
-struct GraphqlPolicies {
-    /// [`CedarEngine::deciding_policies`] without the excluded permits.
-    deciding: PolicySet,
-    /// [`CedarEngine::policies`] without the excluded permits.
-    all: PolicySet,
+struct GraphqlExclusion {
+    /// The hosts of `HttpRequest` permits on [`Self::port`] that overlap the
+    /// path's endpoint host, shared by the paths of one endpoint.
+    hosts: Arc<HashSet<String>>,
+    port: u16,
+    path: String,
+}
+
+impl GraphqlExclusion {
+    /// Returns whether the policy `id` is one of the excluded permits.
+    fn excludes(&self, permits: &HashMap<PolicyId, HttpPermit>, id: &PolicyId) -> bool {
+        permits.get(id).is_some_and(|permit| {
+            permit.endpoint.1 == self.port
+                && self.hosts.contains(&permit.endpoint.0)
+                && permit.path != self.path
+                && !permit.graphql_aware
+        })
+    }
 }
 
 impl CedarEngine {
@@ -330,19 +360,29 @@ impl CedarEngine {
     ///
     /// # Errors
     ///
-    /// Returns [`CedarEngineError`] if the policy set fails to parse, fails
-    /// strict schema validation, or uses a shape this crate cannot enforce
-    /// exactly.
+    /// Returns [`CedarEngineError`] if the policy set is over
+    /// [`MAX_POLICY_SOURCE_BYTES`], [`MAX_POLICY_NESTING`], or
+    /// [`MAX_POLICY_EXPRESSION_DEPTH`], fails to parse, fails strict schema
+    /// validation, or uses a shape this crate cannot enforce exactly.
     pub fn from_policy_str(policy_src: &str) -> Result<Self, CedarEngineError> {
+        // Bounded before parsing, so every recursion below fits the stack
+        // sized from the bound, which is grown when the caller's is smaller.
+        let shape = limits::check_policy_source(policy_src)?;
+        limits::with_stack(shape.load_stack(), || Self::load(policy_src, shape))
+    }
+
+    fn load(policy_src: &str, shape: SourceShape) -> Result<Self, CedarEngineError> {
         let evaluator = Evaluator::new()?;
         let policies = PolicySet::from_str(policy_src)
             .map_err(|e| CedarEngineError::PolicyParse(Box::new(e)))?;
         let analysis = analysis::analyze(&evaluator.schema, &policies)?;
-        let policy_set = |keep: &dyn Fn(&cedar_policy::Policy) -> bool| {
-            PolicySet::from_policies(policies.policies().filter(|policy| keep(policy)).cloned())
-                .map_err(|e| CedarEngineError::PolicySet(Box::new(e)))
-        };
-        let deciding_policies = policy_set(&|policy| !analysis::is_staged(policy))?;
+        let deciding_policies = PolicySet::from_policies(
+            policies
+                .policies()
+                .filter(|policy| !analysis::is_staged(policy))
+                .cloned(),
+        )
+        .map_err(|e| CedarEngineError::PolicySet(Box::new(e)))?;
         let unresolved_policies =
             PolicySet::from_policies(deciding_policies.policies().map(|policy| {
                 analysis
@@ -351,52 +391,15 @@ impl CedarEngine {
                     .map_or_else(|| policy.clone(), Clone::clone)
             }))
             .map_err(|e| CedarEngineError::PolicySet(Box::new(e)))?;
-        let mut graphql_policies = HashMap::new();
-        for ((host, port), paths) in &analysis.l7_endpoints {
-            for (path, endpoint) in paths {
-                if !matches!(
-                    endpoint.protocol,
-                    L7Protocol::Graphql | L7Protocol::WebsocketGraphql
-                ) {
-                    continue;
-                }
-                // Permits of other paths of this endpoint, or of another
-                // entry that can select a host with it, that do not mean to
-                // apply to GraphQL requests. A permit of an entry that does
-                // not select the request's host cannot fire for it, so
-                // leaving it out over-approximates safely.
-                let excluded = |policy: &cedar_policy::Policy| {
-                    analysis
-                        .http_permits
-                        .get(policy.id())
-                        .is_some_and(|permit| {
-                            permit.endpoint.1 == *port
-                                && analysis::host_patterns_overlap(&permit.endpoint.0, host)
-                                && permit.path != *path
-                                && !permit.graphql_aware
-                        })
-                };
-                if !policies.policies().any(excluded) {
-                    continue;
-                }
-                graphql_policies.insert(
-                    (host.clone(), *port, path.clone()),
-                    GraphqlPolicies {
-                        deciding: policy_set(&|policy| {
-                            !analysis::is_staged(policy) && !excluded(policy)
-                        })?,
-                        all: policy_set(&|policy| !excluded(policy))?,
-                    },
-                );
-            }
-        }
+        let graphql_exclusions = graphql_exclusions(&analysis);
         Ok(Self {
             evaluator,
             policies,
             deciding_policies,
             unresolved_policies,
-            graphql_policies,
+            graphql_exclusions,
             analysis,
+            shape,
         })
     }
 
@@ -537,9 +540,7 @@ impl CedarEngine {
     ///
     /// # Errors
     ///
-    /// Returns [`CedarEngineError`] if the request cannot be represented in
-    /// the loaded schema, or if Cedar reports an error while evaluating any
-    /// policy.
+    /// Returns [`CedarEngineError`] as [`Self::authorize_network`] does.
     pub fn evaluate_network(
         &self,
         request: &NetworkConnectRequest,
@@ -560,10 +561,21 @@ impl CedarEngine {
     ///
     /// # Errors
     ///
-    /// Returns [`CedarEngineError`] if the request cannot be represented in
-    /// the loaded schema, or if Cedar reports an error while evaluating any
-    /// policy.
+    /// Returns [`CedarEngineError::RequestFieldTooLong`] if a request string
+    /// is over [`MAX_REQUEST_FIELD_BYTES`], and another [`CedarEngineError`]
+    /// if the request cannot be represented in the loaded schema, or if Cedar
+    /// reports an error while evaluating any policy.
     pub fn authorize_network(
+        &self,
+        request: &NetworkConnectRequest,
+    ) -> Result<NetworkEvaluation, CedarEngineError> {
+        let longest = limits::check_network_request(request)?;
+        limits::with_stack(self.shape.eval_stack(longest), || {
+            self.authorize_network_unchecked(request)
+        })
+    }
+
+    fn authorize_network_unchecked(
         &self,
         request: &NetworkConnectRequest,
     ) -> Result<NetworkEvaluation, CedarEngineError> {
@@ -605,6 +617,7 @@ impl CedarEngine {
             protocol,
             context,
             None,
+            &|_| false,
         )?;
         let mut evaluation = NetworkEvaluation {
             decision: Decision::Deny {
@@ -657,13 +670,25 @@ impl CedarEngine {
     ///
     /// # Errors
     ///
-    /// Returns [`CedarEngineError::TooManyQueryCombinations`] if the query
-    /// has more than [`MAX_QUERY_COMBINATIONS`] value combinations, and
-    /// another [`CedarEngineError`] if the request cannot be represented in
-    /// the loaded schema, or if Cedar reports an error while evaluating any
+    /// Returns [`CedarEngineError::RequestFieldTooLong`] if a request string
+    /// is over [`MAX_REQUEST_FIELD_BYTES`],
+    /// [`CedarEngineError::TooManyQueryCombinations`] if the query has more
+    /// than [`MAX_QUERY_COMBINATIONS`] value combinations, and another
+    /// [`CedarEngineError`] if the request cannot be represented in the
+    /// loaded schema, or if Cedar reports an error while evaluating any
     /// deciding policy. Errors in the staged comparison are logged without
     /// changing the enforced decision.
     pub fn evaluate_l7(
+        &self,
+        request: &HttpRequestInput,
+    ) -> Result<L7Evaluation, CedarEngineError> {
+        let longest = limits::check_http_request(request)?;
+        limits::with_stack(self.shape.eval_stack(longest), || {
+            self.evaluate_l7_unchecked(request)
+        })
+    }
+
+    fn evaluate_l7_unchecked(
         &self,
         request: &HttpRequestInput,
     ) -> Result<L7Evaluation, CedarEngineError> {
@@ -678,7 +703,7 @@ impl CedarEngine {
                 self.analysis
                     .l7_selecting(&normalize_host(&request.host), request.port)
                     .find_map(|(key, _)| {
-                        self.graphql_policies.get(&(
+                        self.graphql_exclusions.get(&(
                             key.to_string(),
                             request.port,
                             request.endpoint_path.clone(),
@@ -686,16 +711,24 @@ impl CedarEngine {
                     })
             })
             .flatten();
-        let (deciding, all) = graphql.map_or((&self.deciding_policies, &self.policies), |sets| {
-            (&sets.deciding, &sets.all)
-        });
-        let decision = self.decide_l7(deciding, request, protocol, &query)?;
+        let excluded = |id: &PolicyId| {
+            graphql.is_some_and(|exclusion| exclusion.excludes(&self.analysis.http_permits, id))
+        };
+        let decision = self.decide_l7(
+            &self.deciding_policies,
+            request,
+            protocol,
+            &query,
+            &excluded,
+        )?;
         // Compare decisions, not the staged set's decision alone: Cedar denies
         // by default, so a set of only staged `forbid`s denies every request
         // whether or not one of them matched.
         let staged = if endpoint.is_some_and(|endpoint| endpoint.staged) {
             QueryCombinations::new(&request.query, &self.analysis.staged_query_keys)
-                .and_then(|query| self.decide_l7(all, request, protocol, &query))
+                .and_then(|query| {
+                    self.decide_l7(&self.policies, request, protocol, &query, &excluded)
+                })
                 .map_or_else(
                     |_| {
                         // Never include authored expressions or request query values.
@@ -712,8 +745,9 @@ impl CedarEngine {
         Ok(L7Evaluation { decision, staged })
     }
 
-    /// Decides one `HttpRequest` with `policies` over every combination of
-    /// its query values; see [`Self::evaluate_l7`].
+    /// Decides one `HttpRequest` with `policies`, without the `excluded`
+    /// permits, over every combination of its query values; see
+    /// [`Self::evaluate_l7`].
     ///
     /// A denied combination denies the request with its determining
     /// policies. When every combination is allowed but no single `permit`
@@ -724,6 +758,7 @@ impl CedarEngine {
         request: &HttpRequestInput,
         protocol: &str,
         query: &QueryCombinations<'_>,
+        excluded: &dyn Fn(&PolicyId) -> bool,
     ) -> Result<Decision, CedarEngineError> {
         let context = self.evaluator.l7_context(request);
         // The permits that allowed every combination so far.
@@ -743,6 +778,7 @@ impl CedarEngine {
                 protocol,
                 context.clone(),
                 Some(query_entity),
+                excluded,
             )?;
             if !outcome.allowed {
                 return Ok(outcome.into_decision(policies));
@@ -765,6 +801,74 @@ impl CedarEngine {
             },
         })
     }
+}
+
+/// Builds [`CedarEngine::graphql_exclusions`].
+///
+/// A GraphQL path excludes the permits of other paths of its endpoint, or of
+/// another entry that can select a host with it, that do not mean to apply
+/// to GraphQL requests. A permit of an entry that does not select the
+/// request's host cannot fire for it, so leaving it out over-approximates
+/// safely. Paths with no permit to exclude get no entry.
+fn graphql_exclusions(
+    analysis: &PolicyAnalysis,
+) -> HashMap<(String, u16, String), GraphqlExclusion> {
+    // The hosts of the `HttpRequest` permits, by port.
+    let mut permit_hosts: BTreeMap<u16, BTreeSet<&str>> = BTreeMap::new();
+    for permit in analysis.http_permits.values() {
+        permit_hosts
+            .entry(permit.endpoint.1)
+            .or_default()
+            .insert(&permit.endpoint.0);
+    }
+    let mut exclusions = HashMap::new();
+    for ((host, port), paths) in &analysis.l7_endpoints {
+        let mut endpoint: Option<(Arc<HashSet<String>>, BTreeSet<&str>)> = None;
+        for (path, inspection) in paths {
+            if !matches!(
+                inspection.protocol,
+                L7Protocol::Graphql | L7Protocol::WebsocketGraphql
+            ) {
+                continue;
+            }
+            // Computed once per endpoint: the overlapping permit hosts, and
+            // the paths of the permits that may be excluded.
+            let (hosts, permit_paths) = endpoint.get_or_insert_with(|| {
+                let hosts: Arc<HashSet<String>> = Arc::new(
+                    permit_hosts
+                        .get(port)
+                        .into_iter()
+                        .flatten()
+                        .filter(|permit_host| analysis::host_patterns_overlap(permit_host, host))
+                        .map(|permit_host| (*permit_host).to_string())
+                        .collect(),
+                );
+                let permit_paths = analysis
+                    .http_permits
+                    .values()
+                    .filter(|permit| {
+                        permit.endpoint.1 == *port
+                            && hosts.contains(&permit.endpoint.0)
+                            && !permit.graphql_aware
+                    })
+                    .map(|permit| permit.path.as_str())
+                    .collect();
+                (hosts, permit_paths)
+            });
+            if permit_paths.iter().all(|permit_path| permit_path == path) {
+                continue;
+            }
+            exclusions.insert(
+                (host.clone(), *port, path.clone()),
+                GraphqlExclusion {
+                    hosts: Arc::clone(hosts),
+                    port: *port,
+                    path: path.clone(),
+                },
+            );
+        }
+    }
+    exclusions
 }
 
 /// The schema, authorizer, and entity ids every evaluation needs.
@@ -859,6 +963,10 @@ impl Evaluator {
     ///
     /// `protocol` is the endpoint's `resource.protocol`: the inspection
     /// protocol of the request's routed path, or `""` when not inspected.
+    ///
+    /// The `excluded` permits are disregarded: they neither allow the
+    /// request nor fail it with an evaluation error, so the outcome is that
+    /// of `policies` without them. Only permits may be excluded.
     #[expect(
         clippy::too_many_arguments,
         reason = "one call per action; the arguments are the request's distinct parts"
@@ -873,6 +981,7 @@ impl Evaluator {
         protocol: &str,
         context: Vec<(&str, RestrictedExpression)>,
         query: Option<Entity>,
+        excluded: &dyn Fn(&PolicyId) -> bool,
     ) -> Result<Outcome, CedarEngineError> {
         let host = normalize_host(host);
         let host_port = format!("{host}:{port}");
@@ -955,6 +1064,9 @@ impl Evaluator {
         let errors: Vec<String> = response
             .diagnostics()
             .errors()
+            .filter(|error| match error {
+                AuthorizationError::PolicyEvaluationError(error) => !excluded(error.policy_id()),
+            })
             .map(ToString::to_string)
             .collect();
         if !errors.is_empty() {
@@ -962,9 +1074,18 @@ impl Evaluator {
                 reason: errors.join("; "),
             });
         }
+        // An allow's reasons are its satisfied permits; with every one of
+        // them excluded, no permit allows the request. A deny's reasons are
+        // forbids, which are never excluded.
+        let reasons: Vec<PolicyId> = response
+            .diagnostics()
+            .reason()
+            .filter(|id| !excluded(id))
+            .cloned()
+            .collect();
         Ok(Outcome {
-            allowed: response.decision() == cedar_policy::Decision::Allow,
-            reasons: response.diagnostics().reason().cloned().collect(),
+            allowed: response.decision() == cedar_policy::Decision::Allow && !reasons.is_empty(),
+            reasons,
         })
     }
 }
@@ -1092,4 +1213,362 @@ fn entity_uid(type_name: &str, id: &str) -> Result<EntityUid, CedarEngineError> 
         entity_type(type_name)?,
         entity_id(id),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fmt::Write as _;
+
+    /// The policy sets earlier versions built for one GraphQL path: copies
+    /// of the engine's sets without the excluded permits.
+    struct CopiedSets {
+        deciding: PolicySet,
+        all: PolicySet,
+    }
+
+    /// Builds the per-path copies as the engine once did.
+    fn copied_sets(engine: &CedarEngine) -> HashMap<(String, u16, String), CopiedSets> {
+        let analysis = &engine.analysis;
+        let policy_set = |keep: &dyn Fn(&cedar_policy::Policy) -> bool| {
+            PolicySet::from_policies(
+                engine
+                    .policies
+                    .policies()
+                    .filter(|policy| keep(policy))
+                    .cloned(),
+            )
+            .unwrap()
+        };
+        let mut sets = HashMap::new();
+        for ((host, port), paths) in &analysis.l7_endpoints {
+            for (path, endpoint) in paths {
+                if !matches!(
+                    endpoint.protocol,
+                    L7Protocol::Graphql | L7Protocol::WebsocketGraphql
+                ) {
+                    continue;
+                }
+                let excluded = |policy: &cedar_policy::Policy| {
+                    analysis
+                        .http_permits
+                        .get(policy.id())
+                        .is_some_and(|permit| {
+                            permit.endpoint.1 == *port
+                                && analysis::host_patterns_overlap(&permit.endpoint.0, host)
+                                && permit.path != *path
+                                && !permit.graphql_aware
+                        })
+                };
+                if !engine.policies.policies().any(excluded) {
+                    continue;
+                }
+                sets.insert(
+                    (host.clone(), *port, path.clone()),
+                    CopiedSets {
+                        deciding: policy_set(&|policy| {
+                            !analysis::is_staged(policy) && !excluded(policy)
+                        }),
+                        all: policy_set(&|policy| !excluded(policy)),
+                    },
+                );
+            }
+        }
+        sets
+    }
+
+    /// Evaluates `request` against the per-path copies, as
+    /// [`CedarEngine::evaluate_l7`] once did.
+    fn evaluate_with_copies(
+        engine: &CedarEngine,
+        copies: &HashMap<(String, u16, String), CopiedSets>,
+        request: &HttpRequestInput,
+    ) -> Result<L7Evaluation, CedarEngineError> {
+        let endpoint = engine.l7_endpoint_at(&request.host, request.port, &request.endpoint_path);
+        let protocol = endpoint.map_or("", |endpoint| endpoint.protocol.as_str());
+        let query = QueryCombinations::new(&request.query, &engine.analysis.query_keys)?;
+        let sets = request
+            .graphql_request
+            .then(|| {
+                engine
+                    .analysis
+                    .l7_selecting(&normalize_host(&request.host), request.port)
+                    .find_map(|(key, _)| {
+                        copies.get(&(key.to_string(), request.port, request.endpoint_path.clone()))
+                    })
+            })
+            .flatten();
+        let (deciding, all) = sets.map_or((&engine.deciding_policies, &engine.policies), |sets| {
+            (&sets.deciding, &sets.all)
+        });
+        let decision = engine.decide_l7(deciding, request, protocol, &query, &|_| false)?;
+        let staged = if endpoint.is_some_and(|endpoint| endpoint.staged) {
+            QueryCombinations::new(&request.query, &engine.analysis.staged_query_keys)
+                .and_then(|query| engine.decide_l7(all, request, protocol, &query, &|_| false))
+                .map_or(None, |staged| {
+                    (staged.is_allow() != decision.is_allow()).then_some(staged)
+                })
+        } else {
+            None
+        };
+        Ok(L7Evaluation { decision, staged })
+    }
+
+    /// An `HttpRequest` policy on `endpoint`.
+    fn http_policy(endpoint: &str, annotations: &str, effect: &str, condition: &str) -> String {
+        format!(
+            r#"{annotations}
+{effect} (principal, action == Sandbox::Action::"HttpRequest", resource == Sandbox::NetworkEndpoint::"{endpoint}")
+when {{ {condition} }};
+"#
+        )
+    }
+
+    const API: &str = "api.example.com:443";
+
+    /// Representative policy sets: several GraphQL paths, REST paths with
+    /// and without GraphQL awareness, audit and staged policies, forbids,
+    /// a host glob entry that selects the GraphQL host, a permit that
+    /// fails to evaluate, and an unrelated host.
+    fn policies() -> Vec<String> {
+        vec![
+            [
+                http_policy(
+                    API,
+                    r#"@path("/**") @id("rest")"#,
+                    "permit",
+                    r#"context.method == "GET" && context.path like("/**", "/")"#,
+                ),
+                http_policy(
+                    API,
+                    r#"@path("/graphql") @protocol("graphql") @id("graphql")"#,
+                    "permit",
+                    r#"context.path == "/graphql" && context.graphql_operation_type == "query""#,
+                ),
+                http_policy(
+                    API,
+                    r#"@path("/**") @id("no-delete")"#,
+                    "forbid",
+                    r#"context.graphql_fields.contains("deleteRepository")"#,
+                ),
+            ]
+            .concat(),
+            [
+                http_policy(
+                    API,
+                    r#"@path("/api/**") @id("api")"#,
+                    "permit",
+                    r#"["GET", "POST", "WEBSOCKET_TEXT"].contains(context.method)"#,
+                ),
+                http_policy(
+                    API,
+                    r#"@path("/api/**") @id("aware")"#,
+                    "permit",
+                    r#"context.method == "POST" && resource.protocol != "sql""#,
+                ),
+                http_policy(
+                    API,
+                    r#"@path("/audit/**") @enforcement("audit") @id("audit")"#,
+                    "permit",
+                    r#"context.method == "POST""#,
+                ),
+                http_policy(
+                    API,
+                    r#"@path("/g1") @protocol("graphql") @id("g1")"#,
+                    "permit",
+                    r#"context.graphql_operation_type == "query""#,
+                ),
+                http_policy(
+                    API,
+                    r#"@path("/g2") @protocol("graphql") @enforcement("audit") @id("g2")"#,
+                    "permit",
+                    r#"context.graphql_operation_type == "mutation""#,
+                ),
+                http_policy(
+                    API,
+                    r#"@path("/ws") @protocol("websocket-graphql") @id("ws")"#,
+                    "permit",
+                    r#"context.method == "GET" || context.graphql_operation_type == "subscription""#,
+                ),
+                http_policy(
+                    API,
+                    r#"@path("/api/**") @enforcement("staged") @id("staged-permit")"#,
+                    "permit",
+                    r#"context.method == "WEBSOCKET_TEXT""#,
+                ),
+                http_policy(
+                    API,
+                    r#"@path("/g1") @enforcement("staged") @id("staged-forbid")"#,
+                    "forbid",
+                    r#"context.graphql_fields.contains("secret")"#,
+                ),
+                http_policy(
+                    API,
+                    r#"@path("/api/**") @id("no-delete")"#,
+                    "forbid",
+                    r#"context.graphql_fields.contains("deleteRepository")"#,
+                ),
+                r#"@path("/glob/**") @id("glob")
+permit (principal, action == Sandbox::Action::"HttpRequest", resource is Sandbox::NetworkEndpoint)
+when { resource.host like("*.example.com", ".") && resource.port == 443 && context.method == "POST" };
+"#
+                .to_string(),
+                http_policy(
+                    "other.com:443",
+                    r#"@path("/**") @id("other")"#,
+                    "permit",
+                    "true",
+                ),
+            ]
+            .concat(),
+            [
+                http_policy(
+                    API,
+                    r#"@path("/**") @id("fails")"#,
+                    "permit",
+                    r#"context.method == "POST" && 9223372036854775807 + 1 > 0"#,
+                ),
+                http_policy(
+                    API,
+                    r#"@path("/graphql") @protocol("graphql") @id("graphql")"#,
+                    "permit",
+                    r#"context.graphql_operation_type == "query""#,
+                ),
+                http_policy(
+                    API,
+                    r#"@path("/graphql") @id("fails-forbid")"#,
+                    "forbid",
+                    r#"context.graphql_operation_type == "subscription" && 9223372036854775807 + 1 > 0"#,
+                ),
+            ]
+            .concat(),
+        ]
+    }
+
+    /// `evaluation` with its matched policies sorted, since Cedar reports
+    /// them in no particular order.
+    fn sorted(evaluation: &L7Evaluation) -> L7Evaluation {
+        let sort = |decision: &Decision| match decision {
+            Decision::Allow { matched_policies } => Decision::Allow {
+                matched_policies: matched_policies
+                    .iter()
+                    .cloned()
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect(),
+            },
+            Decision::Deny { matched_policies } => Decision::Deny {
+                matched_policies: matched_policies
+                    .iter()
+                    .cloned()
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect(),
+            },
+        };
+        L7Evaluation {
+            decision: sort(&evaluation.decision),
+            staged: evaluation.staged.as_ref().map(sort),
+        }
+    }
+
+    /// GraphQL paths share their endpoint's host set instead of holding
+    /// policy set copies, so memory stays linear in the number of paths.
+    #[test]
+    fn graphql_exclusions_share_one_host_set_per_endpoint() {
+        let paths = 50;
+        let mut policy = String::from(
+            r#"@path("/**")
+permit (principal, action == Sandbox::Action::"HttpRequest",
+        resource == Sandbox::NetworkEndpoint::"api.example.com:443")
+when { context.method == "POST" };
+"#,
+        );
+        for index in 0..paths {
+            let _ = write!(
+                policy,
+                r#"@path("/g{index}") @protocol("graphql")
+permit (principal, action == Sandbox::Action::"HttpRequest",
+        resource == Sandbox::NetworkEndpoint::"api.example.com:443")
+when {{ context.graphql_operation_type == "query" }};
+"#
+            );
+        }
+        let engine = CedarEngine::from_policy_str(&policy).expect("policy loads");
+        assert_eq!(engine.graphql_exclusions.len(), paths);
+        let hosts: Vec<_> = engine
+            .graphql_exclusions
+            .values()
+            .map(|exclusion| &exclusion.hosts)
+            .collect();
+        assert!(hosts.iter().all(|set| Arc::ptr_eq(set, hosts[0])));
+        assert_eq!(Arc::strong_count(hosts[0]), paths);
+    }
+
+    #[test]
+    fn graphql_exclusions_decide_as_the_copied_policy_sets() {
+        let mut compared = 0;
+        for policy in policies() {
+            let engine = CedarEngine::from_policy_str(&policy)
+                .unwrap_or_else(|error| panic!("{error}\n{policy}"));
+            let copies = copied_sets(&engine);
+            assert!(!copies.is_empty(), "{policy}");
+            assert_eq!(
+                copies.keys().collect::<HashSet<_>>(),
+                engine.graphql_exclusions.keys().collect::<HashSet<_>>()
+            );
+            for host in ["api.example.com", "x.example.com", "other.com"] {
+                let paths: Vec<String> = engine
+                    .l7_endpoints(host, 443)
+                    .map(|(path, _)| path)
+                    .chain(["/unknown".to_string()])
+                    .collect();
+                for endpoint_path in &paths {
+                    for graphql_request in [true, false] {
+                        for method in ["GET", "POST", "WEBSOCKET_TEXT"] {
+                            for operation in ["query", "mutation", "subscription", ""] {
+                                for fields in [&[][..], &["deleteRepository"], &["secret"]] {
+                                    let request = HttpRequestInput {
+                                        user: "sandbox".to_string(),
+                                        group: "sandbox".to_string(),
+                                        binary_path: "/usr/bin/curl".to_string(),
+                                        host: host.to_string(),
+                                        port: 443,
+                                        method: method.to_string(),
+                                        path: "/graphql".to_string(),
+                                        graphql_operation_type: operation.to_string(),
+                                        graphql_fields: fields
+                                            .iter()
+                                            .map(ToString::to_string)
+                                            .collect(),
+                                        graphql_request,
+                                        endpoint_path: endpoint_path.clone(),
+                                        ..Default::default()
+                                    };
+                                    let expected = evaluate_with_copies(&engine, &copies, &request);
+                                    let actual = engine.evaluate_l7(&request);
+                                    match (&expected, &actual) {
+                                        (Ok(expected), Ok(actual)) => {
+                                            assert_eq!(
+                                                sorted(expected),
+                                                sorted(actual),
+                                                "{request:?}"
+                                            );
+                                        }
+                                        (
+                                            Err(CedarEngineError::Evaluation { .. }),
+                                            Err(CedarEngineError::Evaluation { .. }),
+                                        ) => {}
+                                        _ => panic!("{request:?}: {expected:?} != {actual:?}"),
+                                    }
+                                    compared += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(compared > 1000, "{compared}");
+    }
 }

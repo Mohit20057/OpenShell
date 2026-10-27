@@ -169,7 +169,7 @@ mod tests {
     // Supervisor middleware binding policy and selectors are public-only. An
     // absent policy preserves dynamic discovery; older supervisors ignore both fields.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "34bcb819b3346d1c32a7c40e0a7e675a4aeab4fdc90d084b470c0408a1b401b9";
+        "9d463fed7be633271842ecfd50e1b11548db826aee5718a81e97b8c1eebc9ea7";
     const DURABLE_SCHEMA_SHA256: &str =
         "36ee37f13c85532dd659e6ad839d5c0b0c1ffd7778e3226b6d793c406d1e621d";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =

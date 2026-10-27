@@ -25,6 +25,78 @@ pub enum CedarEngineError {
     #[diagnostic(code(openshell::policy_cedar::policy_set))]
     PolicySet(#[source] Box<cedar_policy::PolicySetError>),
 
+    /// The Cedar policy source is longer than
+    /// [`crate::MAX_POLICY_SOURCE_BYTES`].
+    #[error(
+        "Cedar policy source is {size} bytes, more than the {limit} allowed; split it into \
+         fewer, shorter policies"
+    )]
+    #[diagnostic(code(openshell::policy_cedar::policy_too_large))]
+    PolicyTooLarge {
+        /// The source length in bytes.
+        size: usize,
+        /// The cap, [`crate::MAX_POLICY_SOURCE_BYTES`].
+        limit: usize,
+    },
+
+    /// Brackets in the Cedar policy source nest deeper than
+    /// [`crate::MAX_POLICY_NESTING`].
+    ///
+    /// Checked before parsing, since Cedar's parser recurses once per level.
+    #[error(
+        "Cedar policy brackets nest more than {limit} levels deep at line {line}; remove \
+         redundant parentheses or split the condition into separate policies"
+    )]
+    #[diagnostic(code(openshell::policy_cedar::policy_nesting_too_deep))]
+    PolicyNestingTooDeep {
+        /// The line where the nesting first exceeds the cap.
+        line: usize,
+        /// The cap, [`crate::MAX_POLICY_NESTING`].
+        limit: usize,
+    },
+
+    /// One Cedar policy's expressions can nest deeper than
+    /// [`crate::MAX_POLICY_EXPRESSION_DEPTH`].
+    ///
+    /// Checked before parsing, since Cedar recurses once per expression
+    /// level when it parses, converts, and evaluates a policy.
+    #[error(
+        "the Cedar policy starting at line {line} has an expression depth bound of {depth}, \
+         more than the {limit} allowed; replace long `||` or `&&` chains with a set literal \
+         such as `[\"a\", \"b\"].contains(context.path)`, or split the policy into several \
+         policies"
+    )]
+    #[diagnostic(code(openshell::policy_cedar::policy_expression_too_deep))]
+    PolicyExpressionTooDeep {
+        /// The line where the policy starts.
+        line: usize,
+        /// The policy's depth bound: the operators and brackets its
+        /// expressions can nest.
+        depth: usize,
+        /// The cap, [`crate::MAX_POLICY_EXPRESSION_DEPTH`].
+        limit: usize,
+    },
+
+    /// A request-derived string is longer than
+    /// [`crate::MAX_REQUEST_FIELD_BYTES`], so the request is denied without
+    /// evaluation.
+    ///
+    /// Cedar's delimited `like` recurses once per character of its text, so
+    /// the length is capped to bound the stack evaluation needs.
+    #[error(
+        "request {field} is {length} bytes, more than the {limit} Cedar evaluates; the \
+         request is denied"
+    )]
+    #[diagnostic(code(openshell::policy_cedar::request_field_too_long))]
+    RequestFieldTooLong {
+        /// The request field, such as `path` or `query value`.
+        field: &'static str,
+        /// The field's length in bytes.
+        length: usize,
+        /// The cap, [`crate::MAX_REQUEST_FIELD_BYTES`].
+        limit: usize,
+    },
+
     /// An entity type name used to build a request did not parse (e.g.
     /// `Sandbox::Process`).
     #[error("invalid Cedar entity type name: {0}")]
@@ -338,5 +410,22 @@ pub enum CedarEngineError {
     Evaluation {
         /// Every evaluation error, joined with `"; "`.
         reason: String,
+    },
+
+    /// Checking which host selectors can match one host took more work
+    /// than one policy set may.
+    ///
+    /// Every pair of selectors on one port that can share a host is
+    /// compared, so many long, similar host globs make loading quadratic.
+    #[error(
+        "comparing the policy's host selectors for overlaps exceeds the limit of {limit} steps; \
+         use fewer host globs on one port, or shorter ones, or ones that differ in their \
+         literal start or end (for example `*.example.com` and `*.example.org` are never \
+         compared)"
+    )]
+    #[diagnostic(code(openshell::policy_cedar::host_overlap_budget_exceeded))]
+    HostOverlapBudgetExceeded {
+        /// The budget, in comparison steps.
+        limit: u64,
     },
 }

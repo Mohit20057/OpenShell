@@ -1514,6 +1514,7 @@ pub async fn run_sandbox_instance(
             Some(supervisor_session_updates),
             config_apply_tx,
             config_push_updates,
+            SUPPORTS_CEDAR_POLICY,
             ssh_host_key,
         )
         .instrument(tracing::info_span!(parent: &startup, "supervisor.access.start"))
@@ -1808,7 +1809,8 @@ async fn flush_activity_to_gateway(
 // ============================================================================
 
 /// Whether this supervisor can enforce Cedar policies. It reports this to
-/// the gateway, which withholds Cedar configuration when it is false.
+/// the gateway when fetching configuration and in its session hello, and the
+/// gateway withholds Cedar configuration when it is false.
 const SUPPORTS_CEDAR_POLICY: bool = cfg!(feature = "cedar");
 
 /// Minimum read-only paths required for a proxy-mode sandbox child process to
@@ -6852,17 +6854,36 @@ permit (principal, action == Sandbox::Action::"NetworkConnect",
         assert_eq!(cedar.current_generation(), cedar_generation);
     }
 
-    /// A middleware-only change publishes a new configuration generation but
-    /// keeps Cedar's, so inspected tunnels are not closed.
+    /// Registry reconciliation with unchanged configs keeps the Cedar
+    /// generation, so inspected tunnels stay open; a middleware-only change
+    /// publishes a new configuration generation and advances Cedar's, so
+    /// tunnels close before they run the old chain again, as for YAML.
     #[cfg(feature = "cedar")]
     #[tokio::test]
-    async fn cedar_middleware_only_reload_keeps_the_cedar_generation() {
+    async fn cedar_middleware_only_reload_advances_the_cedar_generation() {
         let cedar = cedar_engine();
         let engine = PolicyEngine::from(Arc::clone(&cedar));
+        let cedar_generation = cedar.current_generation();
+        reload_gateway_configuration_runtime(
+            &engine,
+            Some(&cedar_proto_policy(CEDAR_RELOAD_POLICY)),
+            0,
+            MiddlewareReloadContext {
+                desired_services: &[],
+                authentication: &MiddlewareAuthentication::default(),
+                registry_changed: true,
+                connector: &default_middleware_connector(),
+            },
+            None,
+            || {},
+        )
+        .await
+        .expect("registry reconciliation commits");
+        assert_eq!(cedar.current_generation(), cedar_generation);
+
         let initial = engine
             .configuration_generation_guard()
             .expect("configuration guard");
-        let cedar_generation = cedar.current_generation();
         let mut candidate = cedar_proto_policy(CEDAR_RELOAD_POLICY);
         candidate.network_middlewares.insert(
             "redactor".to_string(),
@@ -6883,7 +6904,7 @@ permit (principal, action == Sandbox::Action::"NetworkConnect",
 
         assert!(initial.is_stale());
         assert!(!guard.is_stale());
-        assert_eq!(cedar.current_generation(), cedar_generation);
+        assert_eq!(cedar.current_generation(), cedar_generation + 1);
         let input = openshell_supervisor_network::policy_types::NetworkInput {
             host: "pypi.org".to_string(),
             port: 443,

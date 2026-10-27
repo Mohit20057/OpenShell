@@ -1951,7 +1951,11 @@ fn validate_cedar_policy_source(
     }
     #[cfg(feature = "cedar")]
     {
-        cedar::validate(&policy.cedar_policy_source, violations)
+        cedar::validate(
+            &policy.cedar_policy_source,
+            &policy.endpoint_settings,
+            violations,
+        )
     }
     #[cfg(not(feature = "cedar"))]
     {
@@ -3522,6 +3526,46 @@ when { context.binary_path == "/usr/bin/curl" };
             )),
             "{violations:?}"
         );
+    }
+
+    #[cfg(feature = "cedar")]
+    #[test]
+    fn tls_skip_endpoint_setting_on_an_inspected_cedar_endpoint_is_rejected() {
+        let mut policy = cedar_sourced_policy(
+            r#"permit (principal, action == Sandbox::Action::"NetworkConnect",
+        resource == Sandbox::NetworkEndpoint::"api.example.com:443");
+permit (principal, action == Sandbox::Action::"HttpRequest",
+        resource == Sandbox::NetworkEndpoint::"api.example.com:443")
+when { context.method == "GET" };
+permit (principal, action == Sandbox::Action::"NetworkConnect",
+        resource == Sandbox::NetworkEndpoint::"pypi.org:443");"#,
+        );
+        let skip = |host: &str, ports: Vec<u32>| NetworkEndpoint {
+            host: host.to_string(),
+            ports,
+            tls: openshell_core::proto::NetworkTlsMode::Skip as i32,
+            ..Default::default()
+        };
+
+        for host in ["api.example.com", "*.example.com", "API.example.com"] {
+            policy.endpoint_settings = vec![skip("pypi.org", vec![443]), skip(host, vec![443])];
+            let violations = validate_sandbox_policy(&policy).expect_err(host);
+            assert_eq!(violations.len(), 1, "{host}: {violations:?}");
+            let message = violations[0].to_string();
+            assert!(
+                message.starts_with(&format!("endpoint_settings[1] ('{host}'): tls: skip"))
+                    && message.contains("api.example.com:443"),
+                "{message}"
+            );
+        }
+
+        // Skipping TLS on endpoints the policy only connects to stays valid.
+        policy.endpoint_settings = vec![
+            skip("pypi.org", vec![443]),
+            skip("api.example.com", vec![8443]),
+            skip("*.other.com", vec![443]),
+        ];
+        assert!(validate_sandbox_policy(&policy).is_ok());
     }
 
     #[cfg(feature = "cedar")]

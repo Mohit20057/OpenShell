@@ -1032,6 +1032,8 @@ pub mod test_support {
         Legacy,
         /// Applies and acknowledges streamed configuration.
         Apply,
+        /// Applies streamed configuration but cannot enforce Cedar policies.
+        ApplyWithoutCedar,
     }
 
     /// Serve `state` on loopback and open a supervisor stream whose hello
@@ -1093,11 +1095,15 @@ pub mod test_support {
                 payload: Some(supervisor_message::Payload::Hello(SupervisorHello {
                     sandbox_id: sandbox_id.into(),
                     instance_id: "instance".into(),
-                    supports_config_push: features == StreamFeatures::Apply,
+                    supports_config_push: matches!(
+                        features,
+                        StreamFeatures::Apply | StreamFeatures::ApplyWithoutCedar
+                    ),
                     connection_epoch,
                     supports_provider_readiness: false,
                     redirected: false,
                     supports_session_redirect: false,
+                    supports_cedar_policy: features == StreamFeatures::Apply,
                 })),
             })
             .await

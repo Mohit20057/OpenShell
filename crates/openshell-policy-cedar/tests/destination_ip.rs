@@ -253,11 +253,11 @@ when {
 }
 
 #[test]
-fn an_unless_forbid_reading_the_address_denies_before_resolution() {
+fn an_unless_forbid_reading_the_address_is_rejected() {
     // The guard is false before resolution, so an `unless` body that reads
-    // the address is false and the forbid applies; write address-only
-    // forbids with `when`.
-    let engine = load(
+    // the address would be false and the forbid would deny every
+    // connection at connect time. The error shows the `when` form.
+    let error = load(
         r#"
 permit (principal, action == Sandbox::Action::"NetworkConnect",
         resource == Sandbox::NetworkEndpoint::"svc.corp.net:443");
@@ -265,11 +265,12 @@ forbid (principal, action == Sandbox::Action::"NetworkConnect", resource)
 unless { context has destination_ip && context.destination_ip.isInRange(ip("10.0.0.0/8")) };
 "#,
     )
-    .expect("policy loads");
-    let unresolved = request("svc.corp.net", 443, "/usr/bin/curl", None);
-    assert!(!engine.evaluate_network(&unresolved).unwrap().is_allow());
-    let inside = request("svc.corp.net", 443, "/usr/bin/curl", Some("10.1.2.3"));
-    assert!(engine.evaluate_network(&inside).unwrap().is_allow());
+    .expect_err("an address read under `unless` is rejected");
+    assert!(
+        matches!(&error, CedarEngineError::InvalidDestinationIp { reason, .. }
+            if reason.contains("when { context has destination_ip && !context.destination_ip")),
+        "{error}"
+    );
 }
 
 #[test]

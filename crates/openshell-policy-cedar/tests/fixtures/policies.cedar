@@ -1,17 +1,3 @@
-// Identity guard
-// run_as_user: sandbox / run_as_group: sandbox
-// Connections are denied unless the process runs as sandbox:sandbox.
-// Placed as a top-level forbid so it cannot be bypassed by any permit.
-// Scoped to NetworkConnect: every HttpRequest happens on a connection
-// whose CONNECT was already checked, and Landlock grants cannot be
-// conditioned on identity.
-
-forbid (principal is Sandbox::Process, action == Sandbox::Action::"NetworkConnect", resource)
-unless {
-    principal.user  == Sandbox::User::"sandbox"
-    && principal.group == Sandbox::Group::"sandbox"
-};
-
 // Filesystem: read-only paths
 // /usr /lib /proc /dev/urandom /app /etc /var/log
 

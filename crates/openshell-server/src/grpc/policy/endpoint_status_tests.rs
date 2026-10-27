@@ -1977,6 +1977,7 @@ async fn replacement_reset_timeout_invalidates_superseded_evidence() {
             redirected: false,
             supports_session_redirect: false,
             supports_config_push: false,
+            supports_cedar_policy: false,
         })),
     };
     let error = gateway_client(Arc::clone(&state))
@@ -2051,6 +2052,7 @@ async fn replacement_reset_retry_does_not_hold_gateway_shutdown() {
             redirected: false,
             supports_session_redirect: false,
             supports_config_push: false,
+            supports_cedar_policy: false,
         })),
     };
     let error = gateway_client(Arc::clone(&state))

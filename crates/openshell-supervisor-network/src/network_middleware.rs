@@ -34,7 +34,7 @@ use crate::policy_types::{
 /// The `network_middlewares` of one policy revision, ready for selection.
 ///
 /// Cloning is cheap and shares the configs.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct MiddlewareConfigs(Arc<[MiddlewareConfig]>);
 
 impl MiddlewareConfigs {
@@ -133,9 +133,10 @@ pub struct ActiveMiddleware {
 /// runtime configuration is committed, and when a quarantine starts or ends
 /// (see [`Self::change_configuration`]), under the write lock, so a reader
 /// that observes a generation under the read lock also sees the middleware
-/// that produced it. It is independent of the Cedar policy generation: a
-/// middleware-only change does not close inspected tunnels, which keep the
-/// middleware they started with.
+/// that produced it. It is independent of the Cedar policy generation, which
+/// a commit also advances when the authored configs change (see
+/// [`Self::commit`]), so a middleware edit closes inspected tunnels at their
+/// next request boundary while registry reconciliation leaves them open.
 pub struct MiddlewareState {
     active: RwLock<ActiveMiddleware>,
     generation: Arc<AtomicU64>,
@@ -254,10 +255,10 @@ impl MiddlewareState {
     ///
     /// `prepare` runs under the write lock before the generation advances;
     /// it acquires whatever else the commit needs and may fail. `publish`
-    /// runs with its result after the generation advances, so existing
-    /// guards are already stale, and before the new middleware is visible:
-    /// readers stay blocked until it returns. Neither may call back into
-    /// this state.
+    /// runs with its result, and with whether `configs` differ from the
+    /// active configs, after the generation advances, so existing guards are
+    /// already stale, and before the new middleware is visible: readers stay
+    /// blocked until it returns. Neither may call back into this state.
     ///
     /// # Errors
     ///
@@ -268,13 +269,13 @@ impl MiddlewareState {
         configs: MiddlewareConfigs,
         registry: Option<MiddlewareRegistry>,
         prepare: impl FnOnce() -> Result<P>,
-        publish: impl FnOnce(P),
+        publish: impl FnOnce(P, bool),
     ) -> Result<PolicyGenerationGuard> {
         let mut active = self.write()?;
         let prepared = prepare()?;
         let runner = registry.map(|registry| active.runner.with_replacement_registry(registry));
         let generation = self.advance_generation();
-        publish(prepared);
+        publish(prepared, active.configs != configs);
         active.configs = configs;
         if let Some(runner) = runner {
             active.runner = runner;
@@ -423,7 +424,7 @@ mod tests {
                     stale_during_prepare = before.is_stale();
                     Ok(())
                 },
-                |()| stale_during_publish = before.is_stale(),
+                |(), _| stale_during_publish = before.is_stale(),
             )
             .expect("commit");
         assert!(!stale_during_prepare);
@@ -449,7 +450,7 @@ mod tests {
                 MiddlewareConfigs::from_proto(&middleware_proto()),
                 None,
                 || Err::<(), _>(miette::miette!("lock poisoned")),
-                |()| published = true,
+                |(), _| published = true,
             )
             .expect_err("preparation fails");
         assert!(error.to_string().contains("lock poisoned"));

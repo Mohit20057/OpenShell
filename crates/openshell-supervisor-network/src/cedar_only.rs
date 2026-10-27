@@ -122,8 +122,8 @@ use openshell_supervisor_middleware::MiddlewareRegistry;
 ///
 /// Process identity is fixed per sandbox and enforced by the runtime, not
 /// by network policy, so requests carry a constant identity that satisfies
-/// the schema's `Process` shape. Policies that test `principal.user` see
-/// this value.
+/// the schema's `Process` shape. Analysis rejects policies that read
+/// `principal.user` or `principal.group`, so no decision depends on it.
 const PLACEHOLDER_IDENTITY: &str = "sandbox";
 
 /// Policy name of every Cedar policy DNS record and matched endpoint.
@@ -218,6 +218,39 @@ impl LoadedPolicy {
                     .status(StatusId::Success)
                     .state(StateId::Enabled, "cedar policy loaded")
                     .message(format!("CONFIG:CEDAR policy warning: {warning}"))
+                    .build()
+            );
+        }
+        let tls_skip_overrides = policy
+            .provider_credential_rules
+            .values()
+            .flat_map(|rule| &rule.endpoints)
+            .chain(&policy.endpoint_settings)
+            .filter(|endpoint| TlsSetting::from_proto(endpoint.tls) == TlsSetting::Skip)
+            .filter(|endpoint| {
+                cedar.configured_l7_endpoints().any(|(host, port, _, _)| {
+                    let ports = if endpoint.ports.is_empty() {
+                        std::slice::from_ref(&endpoint.port)
+                    } else {
+                        &endpoint.ports
+                    };
+                    ports.contains(&u32::from(port))
+                        && openshell_core::host_pattern::host_patterns_overlap(
+                            &endpoint.host,
+                            &host,
+                        )
+                        .unwrap_or(false)
+                })
+            })
+            .count();
+        if tls_skip_overrides > 0 {
+            ocsf_emit!(
+                ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
+                    .severity(SeverityId::Low)
+                    .status(StatusId::Success)
+                    .state(StateId::Enabled, "cedar inspection overrides tls skip")
+                    .unmapped("tls_skip_overrides", serde_json::json!(tls_skip_overrides))
+                    .message("CONFIG:CEDAR tls: skip ignored on Cedar-inspected endpoints")
                     .build()
             );
         }
@@ -359,6 +392,7 @@ impl LoadedPolicy {
                 });
             }
             return RoutePlan {
+                inspects_http: false,
                 routes,
                 settings,
                 policy_hash: &self.policy_hash,
@@ -391,6 +425,7 @@ impl LoadedPolicy {
             }
         }
         RoutePlan {
+            inspects_http: true,
             routes,
             settings,
             policy_hash: &self.policy_hash,
@@ -461,6 +496,7 @@ const UNMATCHED_PATH: &str = "no L7 endpoint path matched request";
 
 /// The endpoint configs of one allowed connection, before they are built.
 struct RoutePlan<'a> {
+    inspects_http: bool,
     host: String,
     port: u16,
     mcp_endpoints: &'a [openshell_core::proto::NetworkEndpoint],
@@ -569,6 +605,11 @@ impl RoutePlan<'_> {
             );
         } else {
             config.endpoint_id.clear();
+        }
+        // TLS termination is connection-wide. Even an uninspected provider
+        // path must not bypass another path's Cedar HTTP enforcement.
+        if self.inspects_http && config.tls == TlsSetting::Skip {
+            config.tls = TlsSetting::Auto;
         }
         config
     }
@@ -1385,18 +1426,19 @@ impl CedarOnlyEngine {
     /// Activates a staged policy, its middleware, and the caller's
     /// credentials as one runtime configuration, or changes nothing.
     ///
-    /// Everything that can fail runs first, before any lock is taken: the
-    /// staged policy (or, when the inputs were unchanged, a copy of the
+    /// Fallible preparation runs before publication: the staged policy
+    /// (or, when the inputs were unchanged, a copy of the
     /// active one) is resolved for the entrypoint process (see
     /// [`Self::prepare_policy`]). Then, under the middleware write lock, the
-    /// engine's own locks are acquired; the middleware generation advances,
-    /// so pinned middleware readers are stale; the Cedar policy is swapped
-    /// in and its generation advances when the policy changed, which closes
-    /// inspected tunnels; `commit_credentials` runs; and only then do the
-    /// new middleware configs and, when given, `registry` become visible.
-    /// Middleware readers stay blocked throughout. An unchanged Cedar policy
-    /// keeps its generation, so a middleware-only change does not close
-    /// inspected tunnels; they keep the middleware they started with.
+    /// engine's own locks are acquired and startup resolution is rechecked.
+    /// Only then does the middleware generation advance, so pinned middleware
+    /// readers are stale; the Cedar policy is swapped in and its generation
+    /// advances when the policy or the authored middleware configs changed,
+    /// which closes inspected tunnels, as one OPA generation does for YAML;
+    /// `commit_credentials` runs; and only then do the new middleware configs
+    /// and, when given, `registry` become visible. Middleware readers stay
+    /// blocked throughout. A commit that changes neither, such as registry
+    /// reconciliation, keeps the Cedar generation and open tunnels.
     ///
     /// `commit_credentials` must be infallible and must not call back into
     /// this engine.
@@ -1424,9 +1466,9 @@ impl CedarOnlyEngine {
         self.middleware.commit(
             middleware,
             registry,
-            || self.write_locks(),
-            |locks| {
-                self.publish_policy(locks, prepared);
+            || self.prepare_publication(prepared),
+            |(locks, prepared), middleware_changed| {
+                self.publish_policy(locks, prepared, middleware_changed);
                 commit_credentials();
             },
         )
@@ -1492,12 +1534,37 @@ impl CedarOnlyEngine {
         })
     }
 
+    /// Rechecks startup resolution under the publication lock. This remains
+    /// fallible preparation, before middleware or credentials are published.
+    fn prepare_publication(
+        &self,
+        prepared: PreparedPolicy,
+    ) -> Result<(WriteLocks<'_>, PreparedPolicy)> {
+        let locks = self.write_locks()?;
+        let prepared = match prepared {
+            PreparedPolicy::Replaced(loaded, inputs)
+                if loaded.entrypoint_pid == 0 && locks.engine.entrypoint_pid != 0 =>
+            {
+                let loaded = loaded
+                    .resolved_for(&inputs.provider_rule_map(), locks.engine.entrypoint_pid)?;
+                PreparedPolicy::Replaced(loaded, inputs)
+            }
+            prepared => prepared,
+        };
+        Ok((locks, prepared))
+    }
+
     /// Swaps `prepared` into the active policy and ends any quarantine.
     ///
-    /// The generation advances when the policy changed, when a resolved
-    /// alias or the entrypoint process changed, or when a quarantine ended.
-    /// Infallible: every lock is already held.
-    fn publish_policy(&self, locks: WriteLocks<'_>, prepared: PreparedPolicy) {
+    /// The generation advances when the policy or its middleware configs
+    /// changed, when a resolved alias or the entrypoint process changed, or
+    /// when a quarantine ended. Infallible: every lock is already held.
+    fn publish_policy(
+        &self,
+        locks: WriteLocks<'_>,
+        prepared: PreparedPolicy,
+        middleware_changed: bool,
+    ) {
         let WriteLocks {
             mut engine,
             mut inputs,
@@ -1517,7 +1584,7 @@ impl CedarOnlyEngine {
                 true
             }
         };
-        if changed || was_fail_closed {
+        if changed || middleware_changed || was_fail_closed {
             self.advance_generation();
         }
     }
@@ -1968,8 +2035,12 @@ impl CedarL7TunnelEngine {
         }
         match grants.admitted_owners(&requests) {
             Ok(owners) => Ok(owners.into_iter().collect()),
-            // Too many query combinations to evaluate admits no owner.
-            Err(CedarEngineError::TooManyQueryCombinations { .. }) => Ok(none()),
+            // Too many query combinations to evaluate, or a request field
+            // over the engine's length cap, admits no owner.
+            Err(
+                CedarEngineError::TooManyQueryCombinations { .. }
+                | CedarEngineError::RequestFieldTooLong { .. },
+            ) => Ok(none()),
             Err(error) => Err(miette::miette!("{error}")),
         }
     }
@@ -2158,8 +2229,8 @@ impl CedarL7TunnelEngine {
     /// Evaluates one Cedar request and returns `(allowed, deny_reason)`,
     /// logging any staged audit decision when `staged_audit` asks for it.
     ///
-    /// A query with too many value combinations to evaluate is denied with
-    /// that reason.
+    /// A query with too many value combinations to evaluate, or a request
+    /// field over the engine's length cap, is denied with that reason.
     fn evaluate_one(
         cedar: &CedarEngine,
         ctx: &crate::l7::relay::L7EvalContext,
@@ -2169,7 +2240,10 @@ impl CedarL7TunnelEngine {
     ) -> Result<(bool, String)> {
         let evaluation = match cedar.evaluate_l7(l7_request) {
             Ok(evaluation) => evaluation,
-            Err(error @ CedarEngineError::TooManyQueryCombinations { .. }) => {
+            Err(
+                error @ (CedarEngineError::TooManyQueryCombinations { .. }
+                | CedarEngineError::RequestFieldTooLong { .. }),
+            ) => {
                 return Ok((false, error.to_string()));
             }
             Err(error) => return Err(miette::miette!("{error}")),
@@ -2795,12 +2869,12 @@ when { resource.host like("*.example.com", ".") && resource.port == 443 };
         }
     }
 
-    /// A middleware-only reload publishes the new chain under a new
-    /// middleware generation, keeps the Cedar generation so inspected
-    /// tunnels stay open, and leaves existing tunnels on the chain they
-    /// started with.
+    /// Registry reconciliation keeps the Cedar generation and open tunnels; a
+    /// middleware-only reload publishes the new chain and advances the Cedar
+    /// generation, as one OPA generation does for YAML, so existing tunnels
+    /// close before they can run the old middleware again.
     #[test]
-    fn middleware_only_reload_keeps_the_cedar_generation_and_tunnel_chains() {
+    fn middleware_only_reload_advances_the_cedar_generation_and_closes_tunnels() {
         let cedar = Arc::new(
             CedarOnlyEngine::from_proto(&middleware_policy("api.example.com"))
                 .expect("policy loads"),
@@ -2826,6 +2900,15 @@ when { resource.host like("*.example.com", ".") && resource.port == 443 };
             vec!["redactor"]
         );
 
+        let unchanged = cedar
+            .stage(&middleware_policy("api.example.com"), 0)
+            .expect("stage");
+        cedar
+            .commit_configuration(unchanged, Some(MiddlewareRegistry::default()), || {})
+            .expect("reconcile");
+        assert_eq!(cedar.current_generation(), policy_generation);
+        assert!(!tunnel.is_stale(), "registry reconciliation keeps tunnels");
+
         let staged = cedar
             .stage(&middleware_policy("other.example.com"), 0)
             .expect("stage");
@@ -2835,22 +2918,18 @@ when { resource.host like("*.example.com", ".") && resource.port == 443 };
             .expect("commit");
 
         assert!(credentials_committed);
-        assert_eq!(cedar.current_generation(), policy_generation);
-        assert!(!tunnel.is_stale());
-        assert_eq!(guard.captured_generation(), middleware_generation + 1);
+        assert_eq!(cedar.current_generation(), policy_generation + 1);
+        assert!(tunnel.is_stale());
+        assert_eq!(guard.captured_generation(), middleware_generation + 2);
         let (chain, generation) = engine
             .query_middleware_chain_with_generation(&middleware_input("api.example.com"))
             .expect("chain");
         assert!(chain.is_empty());
-        assert_eq!(generation, middleware_generation + 1);
-        assert_eq!(
-            selected(
-                tunnel
-                    .query_middleware_chain(&middleware_input("api.example.com"))
-                    .expect("tunnel chain")
-            ),
-            vec!["redactor"],
-            "an open tunnel keeps the middleware it started with"
+        assert_eq!(generation, middleware_generation + 2);
+        assert!(
+            tunnel
+                .evaluate_request(&ctx(), &request("GET", "/v1/status"))
+                .is_err()
         );
     }
 
@@ -2989,11 +3068,10 @@ when { resource.host like("*.example.com", ".") && resource.port == 443 };
         assert!(configuration.is_stale());
     }
 
-    /// A passthrough tunnel keeps the middleware it started with across a
-    /// middleware-only reload, as an inspected tunnel does, and closes when
-    /// the Cedar policy changes.
+    /// A passthrough tunnel closes at the next request after a middleware
+    /// config change, which advances the Cedar generation its guard pins.
     #[test]
-    fn passthrough_middleware_keeps_its_snapshot_across_a_middleware_only_reload() {
+    fn passthrough_middleware_closes_after_a_middleware_only_reload() {
         let cedar = Arc::new(
             CedarOnlyEngine::from_proto(&middleware_policy("api.example.com"))
                 .expect("policy loads"),
@@ -3019,30 +3097,12 @@ when { resource.host like("*.example.com", ".") && resource.port == 443 };
             .query_middleware_chain_with_generation(&input)
             .expect("chain");
         assert!(live.is_empty(), "new tunnels select the new middleware");
-        assert!(
-            !guard.is_stale(),
-            "a middleware-only reload keeps the Cedar generation"
-        );
-        let (chain, _) = passthrough
-            .select(&input, &guard)
-            .expect("select")
-            .expect("tunnel open");
-        assert_eq!(
-            chain_names(chain),
-            vec!["redactor"],
-            "an open passthrough tunnel keeps the middleware it started with"
-        );
-
-        cedar
-            .reload_from_policy_str(&format!("{POLICY}\n// changed\n"))
-            .expect("reload");
-        assert!(guard.is_stale());
+        assert!(guard.is_stale(), "a middleware-only reload closes tunnels");
         assert!(
             passthrough
                 .select(&input, &guard)
                 .expect("select")
-                .is_none(),
-            "a policy change closes the tunnel"
+                .is_none()
         );
     }
 
@@ -3908,28 +3968,22 @@ when {{ context.path like("/api/**", "/") }};
         glob_setting.allow_encoded_slash = true;
         let mut exact_setting = setting("api.example.com", "");
         exact_setting.tls = openshell_core::proto::NetworkTlsMode::Skip as i32;
-        let engine = CedarOnlyEngine::from_proto(&settings_policy(
-            GLOB_INSPECTED,
-            vec![glob_setting, exact_setting],
-        ))
+        let engine = LoadedPolicy::from_proto(
+            &settings_policy(GLOB_INSPECTED, vec![glob_setting, exact_setting]),
+            0,
+        )
         .expect("policy loads");
 
-        let api = engine
-            .authorize_egress(&curl_input("api.example.com"))
-            .expect("evaluates")
-            .endpoint_configs;
+        let api = engine.endpoint_configs("api.example.com", 443);
         assert_eq!(api.len(), 1);
         let config = crate::l7::parse_l7_config(&api[0]).expect("inspected");
         assert!(
             config.allow_encoded_slash,
             "the glob setting applies: {config:?}"
         );
-        assert_eq!(crate::l7::parse_tls_mode(&api[0]), crate::l7::TlsMode::Skip);
+        assert_eq!(crate::l7::parse_tls_mode(&api[0]), crate::l7::TlsMode::Auto);
 
-        let other = engine
-            .authorize_egress(&curl_input("other.example.com"))
-            .expect("evaluates")
-            .endpoint_configs;
+        let other = engine.endpoint_configs("other.example.com", 443);
         assert_eq!(other.len(), 1);
         let config = crate::l7::parse_l7_config(&other[0]).expect("inspected");
         assert!(
@@ -4807,6 +4861,53 @@ when { context.method == "POST" };
         other.commit(unchanged).expect("commit");
         assert_eq!(other.read_engine().expect("lock").entrypoint_pid, PID);
         assert_eq!(other.current_generation(), generation + 1);
+    }
+
+    #[test]
+    fn a_policy_prepared_before_startup_keeps_the_resolved_pid() {
+        let engine = CedarOnlyEngine::from_policy_str(POLICY).expect("policy loads");
+        let staged = engine
+            .stage(&policy_from_source(ALIAS_POLICY), 0)
+            .expect("stage");
+        let prepared = engine
+            .prepare_policy(staged.policy, staged.entrypoint_pid)
+            .expect("prepare");
+        engine
+            .resolve_binary_symlinks(std::process::id())
+            .expect("startup resolves");
+        let (locks, prepared) = engine
+            .prepare_publication(prepared)
+            .expect("prepare publication");
+        engine.publish_policy(locks, prepared, false);
+        assert_eq!(
+            engine.read_engine().expect("engine").entrypoint_pid,
+            std::process::id()
+        );
+    }
+
+    #[test]
+    fn provider_tls_skip_cannot_bypass_cedar_inspection_on_another_path() {
+        let mut endpoint = credentialed_endpoint();
+        endpoint.path = "/uninspected/**".into();
+        endpoint.tls = openshell_core::proto::NetworkTlsMode::Skip as i32;
+        for source in [POLICY, PATHS_POLICY] {
+            let engine =
+                LoadedPolicy::from_proto(&provider_policy(source, vec![endpoint.clone()]), 0)
+                    .expect("policy loads");
+            let configs = engine.endpoint_configs("api.example.com", 443);
+            assert!(configs.iter().all(|config| config.tls == TlsSetting::Auto));
+            assert!(
+                configs
+                    .iter()
+                    .any(|config| crate::l7::parse_l7_config(config).is_some())
+            );
+        }
+        let engine = LoadedPolicy::from_proto(&provider_policy(CONNECT_ONLY, vec![endpoint]), 0)
+            .expect("policy loads");
+        assert_eq!(
+            engine.endpoint_configs("api.example.com", 443)[0].tls,
+            TlsSetting::Skip
+        );
     }
 
     /// Resolves a real symlink through `/proc/<pid>/root`, as for YAML.

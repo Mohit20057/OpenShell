@@ -14101,8 +14101,13 @@ type SupervisorHello struct {
 	// ConfigUpdate payloads, and answers each with its result and admission.
 	// Gateways push configuration only to supervisors that set this.
 	SupportsConfigPush bool `protobuf:"varint,7,opt,name=supports_config_push,json=supportsConfigPush,proto3" json:"supports_config_push,omitempty"`
-	unknownFields      protoimpl.UnknownFields
-	sizeCache          protoimpl.SizeCache
+	// The supervisor can enforce Cedar policies, as
+	// GetSandboxConfigRequest.supports_cedar_policy reports when polling.
+	// Gateways never push a Cedar configuration to a supervisor that does not
+	// set this; it receives a configuration that is not admitted instead.
+	SupportsCedarPolicy bool `protobuf:"varint,8,opt,name=supports_cedar_policy,json=supportsCedarPolicy,proto3" json:"supports_cedar_policy,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
 }
 
 func (x *SupervisorHello) Reset() {
@@ -14180,6 +14185,13 @@ func (x *SupervisorHello) GetSupportsSessionRedirect() bool {
 func (x *SupervisorHello) GetSupportsConfigPush() bool {
 	if x != nil {
 		return x.SupportsConfigPush
+	}
+	return false
+}
+
+func (x *SupervisorHello) GetSupportsCedarPolicy() bool {
+	if x != nil {
+		return x.SupportsCedarPolicy
 	}
 	return false
 }
@@ -20533,7 +20545,7 @@ const file_openshell_proto_rawDesc = "" +
 	"relayClose\x12J\n" +
 	"\x10session_redirect\x18\x06 \x01(\v2\x1d.openshell.v1.SessionRedirectH\x00R\x0fsessionRedirect\x12A\n" +
 	"\rconfig_update\x18\a \x01(\v2\x1a.openshell.v1.ConfigUpdateH\x00R\fconfigUpdateB\t\n" +
-	"\apayload\"\xca\x02\n" +
+	"\apayload\"\xfe\x02\n" +
 	"\x0fSupervisorHello\x12\x1d\n" +
 	"\n" +
 	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x12\x1f\n" +
@@ -20545,7 +20557,8 @@ const file_openshell_proto_rawDesc = "" +
 	"redirected\x18\x05 \x01(\bR\n" +
 	"redirected\x12:\n" +
 	"\x19supports_session_redirect\x18\x06 \x01(\bR\x17supportsSessionRedirect\x120\n" +
-	"\x14supports_config_push\x18\a \x01(\bR\x12supportsConfigPush\"\x83\x02\n" +
+	"\x14supports_config_push\x18\a \x01(\bR\x12supportsConfigPush\x122\n" +
+	"\x15supports_cedar_policy\x18\b \x01(\bR\x13supportsCedarPolicy\"\x83\x02\n" +
 	"\x0fSessionAccepted\x12\x1d\n" +
 	"\n" +
 	"session_id\x18\x01 \x01(\tR\tsessionId\x128\n" +

@@ -399,14 +399,19 @@ when {
     ));
 }
 
+/// YAML honors `tls: skip` on an inspected endpoint and warns; the gateway
+/// rejects that endpoint setting for Cedar, whose `HttpRequest` policies
+/// must keep deciding, so the Cedar side of these scenarios omits it.
+const TLS_SKIP_ON_INSPECTED: &str = "Cedar rejects tls: skip on an inspected endpoint";
+
 // ---------------------------------------------------------------------------
 // opa.rs::credential_guard_does_not_shadow_inspected_endpoint_config
 // ---------------------------------------------------------------------------
 
 /// `access: full` without `enforcement` is an audit-only `HttpRequest`
 /// permit, as YAML defaults it to audit. The inspected endpoint's
-/// `tls: skip` is an endpoint setting on the Cedar
-/// side. The L4 endpoint's `provider_credentialed` and
+/// `tls: skip` has no Cedar counterpart (see [`TLS_SKIP_ON_INSPECTED`]).
+/// The L4 endpoint's `provider_credentialed` and
 /// `allow_uninspected_credentials` come only from provider endpoints on a
 /// Cedar sandbox, so the credential-guard count is not ported; provider
 /// credential guards are covered by the phase 1 ports. The YAML test's
@@ -416,7 +421,7 @@ when {
 fn ported_credential_guard_does_not_shadow_allowed_ips() {
     const NAME: &str = "opa.rs::credential_guard_does_not_shadow_inspected_endpoint_config";
     let input = || network("api.example.com", 443, BINARY);
-    assert_settings_parity(&SettingsScenario {
+    assert_parity(&Scenario {
         name: "Credential guard does not shadow allowed_ips",
         host: "api.example.com",
         yaml: r#"
@@ -461,16 +466,15 @@ permit (principal, action == Sandbox::Action::"HttpRequest",
         resource == Sandbox::NetworkEndpoint::"api.example.com:443")
 when { context.binary_path == "/usr/bin/curl" };
 "#,
-        settings: r"
-endpoint_settings:
-  - host: api.example.com
-    port: 443
-    tls: skip
-",
         cases: vec![
             same_probe(format!("{NAME} inspection"), Probe::Inspection(input()))
                 .asserting_yaml("Rest/Audit"),
-            same_probe(format!("{NAME} tls"), Probe::TlsMode(input())).asserting_yaml("Skip"),
+            diverges_probe(
+                format!("{NAME} tls"),
+                Probe::TlsMode(input()),
+                TLS_SKIP_ON_INSPECTED,
+            )
+            .asserting_yaml("Skip"),
             same_probe(
                 format!("{NAME} allowed_ips inside"),
                 destination("api.example.com", 443, BINARY, &["10.0.5.3"]),
@@ -498,12 +502,13 @@ endpoint_settings:
 /// endpoint, the second with `tls: skip` and `allowed_ips`. The YAML test
 /// asserts the per-config lists and the matched policy name; here the TLS
 /// mode, the two matched records, the exact host, and the admitted address
-/// are compared. The second endpoint's `tls: skip` is an endpoint setting.
+/// are compared. The second endpoint's `tls: skip` has no Cedar counterpart
+/// (see [`TLS_SKIP_ON_INSPECTED`]).
 #[test]
 fn ported_overlapping_policy_outputs() {
     const NAME: &str = "opa.rs::overlapping_policy_outputs_are_snapshotted_independently";
     let input = || network("192.168.1.100", 8567, BINARY);
-    assert_settings_parity(&SettingsScenario {
+    assert_parity(&Scenario {
         name: "Overlapping policy outputs",
         host: "192.168.1.100",
         yaml: r#"
@@ -554,17 +559,16 @@ permit (principal, action == Sandbox::Action::"HttpRequest",
         resource == Sandbox::NetworkEndpoint::"192.168.1.100:8567")
 when { context.binary_path == "/usr/bin/curl" && context.method == "GET" };
 "#,
-        settings: r"
-endpoint_settings:
-  - host: 192.168.1.100
-    port: 8567
-    tls: skip
-",
         cases: vec![
             same_probe(format!("{NAME} allow"), Probe::Connect(input())).asserting_yaml("allow"),
             same_probe(format!("{NAME} matched"), Probe::MatchedEndpoints(input()))
                 .asserting_yaml("192.168.1.100:8567;192.168.1.100:8567"),
-            same_probe(format!("{NAME} tls"), Probe::TlsMode(input())).asserting_yaml("Skip"),
+            diverges_probe(
+                format!("{NAME} tls"),
+                Probe::TlsMode(input()),
+                TLS_SKIP_ON_INSPECTED,
+            )
+            .asserting_yaml("Skip"),
             same_probe(format!("{NAME} exact"), Probe::ExactHost(input())).asserting_yaml("exact"),
             same_probe(
                 format!("{NAME} allowed_ips"),

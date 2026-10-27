@@ -5939,6 +5939,16 @@ pub async fn sandbox_policy_update(
             "policy is managed globally; delete the global policy before using `openshell policy update`"
         ));
     }
+    if current
+        .policy
+        .as_ref()
+        .is_some_and(|policy| !policy.cedar_policy_source.is_empty())
+    {
+        return Err(miette!(
+            "incremental policy updates are not available for Cedar policies; edit the Cedar \
+             policy and replace it with `openshell policy set`"
+        ));
+    }
 
     let merged = openshell_policy::merge_policy(
         current.policy.clone().unwrap_or_default(),

@@ -67,6 +67,8 @@ struct SandboxState {
     create_requests: Arc<Mutex<Vec<CreateSandboxRequest>>>,
     provider_create_requests: Arc<AtomicUsize>,
     policy_update_requests: Arc<AtomicUsize>,
+    /// The policy `GetSandboxConfig` returns.
+    sandbox_config_policy: Arc<Mutex<Option<openshell_core::proto::SandboxPolicy>>>,
     expose_service_requests: Arc<Mutex<Vec<openshell_core::proto::ExposeServiceRequest>>>,
     fail_delete_sandbox_message: Arc<Mutex<Option<String>>>,
     vm_error_after_started: Arc<AtomicBool>,
@@ -420,7 +422,10 @@ impl OpenShell for TestOpenShell {
         &self,
         _request: tonic::Request<GetSandboxConfigRequest>,
     ) -> Result<Response<GetSandboxConfigResponse>, Status> {
-        Ok(Response::new(GetSandboxConfigResponse::default()))
+        Ok(Response::new(GetSandboxConfigResponse {
+            policy: self.state.sandbox_config_policy.lock().await.clone(),
+            ..Default::default()
+        }))
     }
 
     async fn get_gateway_config(
@@ -4233,6 +4238,52 @@ async fn cedar_policy_rejects_legacy_gateway_before_any_mutation() {
             .load(Ordering::SeqCst),
         0
     );
+    assert_eq!(
+        server
+            .openshell
+            .state
+            .policy_update_requests
+            .load(Ordering::SeqCst),
+        0
+    );
+}
+
+#[tokio::test]
+async fn policy_update_rejects_a_cedar_sandbox_before_merging() {
+    let server = run_server().await;
+    *server.openshell.state.sandbox_config_policy.lock().await =
+        Some(openshell_core::proto::SandboxPolicy {
+            version: 1,
+            cedar_policy_source: r#"permit(principal, action == Sandbox::Action::"NetworkConnect", resource == Sandbox::NetworkEndpoint::"api.github.com:443");"#.to_string(),
+            ..Default::default()
+        });
+    let tls = test_tls(&server);
+    for dry_run in [true, false] {
+        let error = run::sandbox_policy_update(
+            &server.endpoint,
+            "cedar-sandbox",
+            &["api.example.com:443".to_string()],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+            false,
+            None,
+            dry_run,
+            false,
+            1,
+            "default",
+            &tls,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("openshell policy set"),
+            "dry_run={dry_run}: {error}"
+        );
+    }
     assert_eq!(
         server
             .openshell

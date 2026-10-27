@@ -39,6 +39,7 @@ use std::fmt::{self, Write as _};
 use cedar_policy::{Policy, PolicyId, PolicySet, ValidationMode, Validator};
 
 use crate::analysis::QueryKeys;
+use crate::limits::{self, SourceShape};
 use crate::{CedarEngineError, Evaluator, HttpRequestInput, Principal, QueryCombinations};
 
 /// Annotation naming the owner whose grant a `permit` admits.
@@ -201,6 +202,8 @@ pub struct TokenGrantRules {
     /// The binary glob patterns the generated policies test.
     binary_globs: BTreeSet<String>,
     source: String,
+    /// The shape of [`Self::source`], which sizes the stack evaluation needs.
+    shape: SourceShape,
     untranslated: Vec<UntranslatedRule>,
     fail_closed: Option<String>,
 }
@@ -215,7 +218,9 @@ impl TokenGrantRules {
     ///
     /// Returns [`CedarEngineError`] if the schema fails to load or a
     /// generated policy fails to parse or validate, which indicates a
-    /// compiler defect rather than a policy error.
+    /// compiler defect rather than a policy error, or nests deeper than
+    /// [`crate::MAX_POLICY_NESTING`] or
+    /// [`crate::MAX_POLICY_EXPRESSION_DEPTH`].
     pub fn compile(policies: &[ProviderPolicy]) -> Result<Self, CedarEngineError> {
         let evaluator = Evaluator::new()?;
         let mut compiler = Compiler::default();
@@ -235,23 +240,14 @@ impl TokenGrantRules {
             .collect::<Vec<_>>()
             .join("\n");
         let mut set = PolicySet::new();
+        let mut shape = SourceShape::default();
         if compiler.fail_closed.is_none() {
-            for (id, text) in &compiler.sources {
-                let policy = Policy::parse(Some(PolicyId::new(id)), text)
-                    .map_err(|e| CedarEngineError::PolicyParse(Box::new(e)))?;
-                set.add(policy)
-                    .map_err(|e| CedarEngineError::PolicySet(Box::new(e)))?;
-            }
-            let validation =
-                Validator::new(evaluator.schema.clone()).validate(&set, ValidationMode::Strict);
-            if !validation.validation_passed() {
-                let reason = validation
-                    .validation_errors()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join("; ");
-                return Err(CedarEngineError::PolicyValidation { reason });
-            }
+            // The generated text is bounded like authored text, since Cedar
+            // parses and evaluates it the same way.
+            shape = limits::check_shape(&source)?;
+            set = limits::with_stack(shape.load_stack(), || {
+                Self::parse_and_validate(&evaluator, &compiler.sources)
+            })?;
         }
         Ok(Self {
             evaluator,
@@ -265,9 +261,35 @@ impl TokenGrantRules {
             query_keys: QueryKeys::Named(compiler.query_keys),
             binary_globs: compiler.binary_globs,
             source,
+            shape,
             untranslated: compiler.untranslated,
             fail_closed: compiler.fail_closed,
         })
+    }
+
+    /// Parses the generated policies and validates them against the schema.
+    fn parse_and_validate(
+        evaluator: &Evaluator,
+        sources: &[(String, String)],
+    ) -> Result<PolicySet, CedarEngineError> {
+        let mut set = PolicySet::new();
+        for (id, text) in sources {
+            let policy = Policy::parse(Some(PolicyId::new(id)), text)
+                .map_err(|e| CedarEngineError::PolicyParse(Box::new(e)))?;
+            set.add(policy)
+                .map_err(|e| CedarEngineError::PolicySet(Box::new(e)))?;
+        }
+        let validation =
+            Validator::new(evaluator.schema.clone()).validate(&set, ValidationMode::Strict);
+        if !validation.validation_passed() {
+            let reason = validation
+                .validation_errors()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(CedarEngineError::PolicyValidation { reason });
+        }
+        Ok(set)
     }
 
     /// Returns the generated Cedar policies.
@@ -307,9 +329,11 @@ impl TokenGrantRules {
     ///
     /// # Errors
     ///
-    /// Returns [`CedarEngineError::TooManyQueryCombinations`] when the query
-    /// has too many combinations of the keys provider rules read, and
-    /// another [`CedarEngineError`] when Cedar fails to evaluate a request.
+    /// Returns [`CedarEngineError::RequestFieldTooLong`] when a request
+    /// string is over [`crate::MAX_REQUEST_FIELD_BYTES`],
+    /// [`CedarEngineError::TooManyQueryCombinations`] when the query has too
+    /// many combinations of the keys provider rules read, and another
+    /// [`CedarEngineError`] when Cedar fails to evaluate a request.
     pub fn admitted_owners(
         &self,
         requests: &[HttpRequestInput],
@@ -321,6 +345,16 @@ impl TokenGrantRules {
         {
             return Ok(BTreeSet::new());
         }
+        let mut longest = 0;
+        for request in requests {
+            longest = longest.max(limits::check_http_request(request)?);
+        }
+        limits::with_stack(self.shape.eval_stack(longest), || self.admit(requests))
+    }
+
+    /// Returns the owners admitted for `requests`, which are comparable and
+    /// within the request field caps; see [`Self::admitted_owners`].
+    fn admit(&self, requests: &[HttpRequestInput]) -> Result<BTreeSet<String>, CedarEngineError> {
         let mut admitted: Option<BTreeSet<usize>> = None;
         for request in requests {
             let query = QueryCombinations::new(&request.query, &self.query_keys)?;
@@ -340,6 +374,7 @@ impl TokenGrantRules {
                     "",
                     context.clone(),
                     Some(self.evaluator.query_entity(query.combination(index))?),
+                    &|_| false,
                 )?;
                 // A denial, by a `forbid` or for want of a `permit`, admits
                 // no owner for this evaluation and so for the request.
@@ -1356,6 +1391,70 @@ mod tests {
 
     fn single(path_rule: RuleMatcher) -> TokenGrantRules {
         compile(&[policy("p", vec![endpoint("o", "rest", vec![path_rule])])])
+    }
+
+    #[test]
+    fn glob_matching_is_bounded_on_a_worker_stack() {
+        // Globs compile to delimited `like`, which recurses once per
+        // character of the request string.
+        use crate::MAX_REQUEST_FIELD_BYTES as MAX;
+        let glob_method = RuleMatcher {
+            method: Some("resources/*".to_string()),
+            ..Default::default()
+        };
+        let mut tool_rule = RuleMatcher {
+            method: Some("tools/call".to_string()),
+            ..Default::default()
+        };
+        tool_rule.params.insert(
+            "name".to_string(),
+            ValueMatcher {
+                globs: vec!["github.*".to_string()],
+            },
+        );
+        let mut mcp = endpoint("o", "mcp", vec![glob_method, tool_rule]);
+        mcp.path = "/mcp".to_string();
+        let mcp_rules = compile(&[policy("p", vec![mcp])]);
+        let rest_rules = single(rule("GET", "/**"));
+        let method = format!("resources/{}", "a".repeat(MAX - "resources/".len()));
+        let tool = format!("github.{}", "a".repeat(MAX - "github.".len()));
+        let path = "/a".repeat(MAX / 2);
+        let over = "a".repeat(MAX + 1);
+        std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .stack_size(2 * 1024 * 1024)
+                .spawn_scoped(scope, || {
+                    let available = "available";
+                    assert_eq!(owners(&mcp_rules, &[call(&method, "", available)]), ["o"]);
+                    assert_eq!(
+                        owners(&mcp_rules, &[call("tools/call", &tool, available)]),
+                        ["o"]
+                    );
+                    assert_eq!(owners(&rest_rules, &[rest("GET", &path)]), ["o"]);
+                    for (field, request) in [
+                        ("jsonrpc_method", call(&over, "", available)),
+                        ("mcp_tool", call("tools/call", &over, available)),
+                        ("path", rest("GET", &format!("/{over}"))),
+                    ] {
+                        let rules = if field == "path" {
+                            &rest_rules
+                        } else {
+                            &mcp_rules
+                        };
+                        assert!(
+                            matches!(
+                                rules.admitted_owners(&[request]),
+                                Err(CedarEngineError::RequestFieldTooLong { field: actual, .. })
+                                    if actual == field
+                            ),
+                            "{field}"
+                        );
+                    }
+                })
+                .expect("thread spawns")
+                .join()
+                .expect("thread does not panic");
+        });
     }
 
     #[test]

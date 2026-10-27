@@ -396,6 +396,9 @@ fn eligible_endpoints(
             },
             ports,
             destination_plan,
+            // The synthetic identity tracks the DNS contract (host, ports,
+            // protocol, allowed IPs), not request rules or the policy hash.
+            // Reloads still invalidate old mappings through policy_generation.
             contract_fingerprint: format!("{:?}", endpoint.endpoint),
         });
     }
@@ -727,6 +730,104 @@ filesystem_policy: { include_workdir: true, read_only: [], read_write: [] }
 landlock: { compatibility: best_effort }
 process: { run_as_user: sandbox, run_as_group: sandbox }
 ";
+
+    #[test]
+    fn allocation_identity_rotates_for_dns_contract_and_endpoint_identity_changes() {
+        use crate::policy_types::{DnsRecord, EndpointProtocol, MatchedEndpoint};
+
+        let endpoint = MatchedEndpoint {
+            policy_name: "database".into(),
+            endpoint_index: 0,
+            endpoint: DnsRecord {
+                host: "*.example".into(),
+                ports: vec![5432],
+                protocol: EndpointProtocol::Tcp,
+                allowed_ips: vec!["10.0.0.0/8".into()],
+            },
+        };
+        let identity = |endpoint| {
+            allocation_identity(
+                &eligible_endpoints(
+                    &[endpoint],
+                    &NormalizedName::parse("db.example").unwrap(),
+                    None,
+                )
+                .unwrap(),
+            )
+        };
+        let original = identity(endpoint.clone());
+        for field in [
+            "policy_name",
+            "endpoint_index",
+            "host",
+            "ports",
+            "protocol",
+            "allowed_ips",
+        ] {
+            let mut changed = endpoint.clone();
+            match field {
+                "policy_name" => changed.policy_name = "renamed".into(),
+                "endpoint_index" => changed.endpoint_index = 1,
+                "host" => changed.endpoint.host = "db.example".into(),
+                "ports" => changed.endpoint.ports.push(5433),
+                "protocol" => changed.endpoint.protocol = EndpointProtocol::None,
+                "allowed_ips" => changed.endpoint.allowed_ips = vec!["10.1.0.0/16".into()],
+                _ => unreachable!(),
+            }
+            assert_ne!(
+                identity(changed),
+                original,
+                "{field} must rotate the identity"
+            );
+        }
+    }
+
+    #[test]
+    fn allocation_identity_survives_request_rules_settings_and_policy_hash_changes() {
+        let yaml = r#"
+version: 1
+network_policies:
+  api:
+    endpoints:
+      - host: api.example
+        port: 443
+        protocol: rest
+        rules:
+          - allow: { method: GET, path: "/v1/**" }
+    binaries: [{ path: /usr/bin/curl }]
+"#;
+        let identity = |yaml: &str| {
+            let policy = openshell_policy::parse_sandbox_policy(yaml).unwrap();
+            let hash = openshell_core::policy_identity::deterministic_policy_hash(&policy);
+            let snapshot = OpaEngine::from_proto(&policy)
+                .unwrap()
+                .policy_dns_eligibility_snapshot()
+                .unwrap();
+            assert_eq!(snapshot.endpoints.len(), 1);
+            let eligible = eligible_endpoints(
+                &snapshot.endpoints,
+                &NormalizedName::parse("api.example").unwrap(),
+                None,
+            )
+            .unwrap();
+            (allocation_identity(&eligible), hash)
+        };
+        let (original, original_hash) = identity(yaml);
+        for changed in [
+            yaml.replace("GET", "POST"),
+            yaml.replace("/v1/**", "/v2/**"),
+            yaml.replace(
+                "protocol: rest",
+                "protocol: rest\n        enforcement: audit",
+            ),
+            yaml.replace("protocol: rest", "protocol: rest\n        tls: skip"),
+            yaml.replace("/usr/bin/curl", "/usr/bin/wget"),
+        ] {
+            let (changed_identity, changed_hash) = identity(&changed);
+            assert_ne!(changed_hash, original_hash);
+            assert_eq!(changed_identity, original);
+        }
+    }
 
     #[tokio::test]
     async fn stages_unknown_name_without_upstream_resolution() {

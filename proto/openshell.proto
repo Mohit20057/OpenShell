@@ -3170,6 +3170,11 @@ message SupervisorHello {
   // ConfigUpdate payloads, and answers each with its result and admission.
   // Gateways push configuration only to supervisors that set this.
   bool supports_config_push = 7;
+  // The supervisor can enforce Cedar policies, as
+  // GetSandboxConfigRequest.supports_cedar_policy reports when polling.
+  // Gateways never push a Cedar configuration to a supervisor that does not
+  // set this; it receives a configuration that is not admitted instead.
+  bool supports_cedar_policy = 8;
 }
 
 // Gateway accepts the supervisor session.

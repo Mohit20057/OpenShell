@@ -117,7 +117,8 @@ impl PolicyEngine {
     /// generation. For Cedar it is the middleware generation, which advances
     /// on every committed reload, service registry change, and quarantine
     /// entry or exit, while the Cedar policy generation advances only when
-    /// the policy itself changes or a quarantine starts or ends.
+    /// the policy or its authored middleware configs change or a quarantine
+    /// starts or ends.
     ///
     /// # Errors
     ///
@@ -216,8 +217,8 @@ impl PolicyEngine {
     /// Returns the generation the middleware chain and services come from.
     ///
     /// For YAML this is the policy generation. For Cedar it is the
-    /// middleware generation, which moves independently of the Cedar policy
-    /// generation.
+    /// middleware generation, which also advances on registry changes that
+    /// leave the Cedar policy generation unchanged.
     #[must_use]
     pub fn middleware_generation(&self) -> u64 {
         match self {
@@ -271,7 +272,8 @@ impl PolicyEngine {
     ///
     /// A Cedar tunnel keeps the middleware configs and services in effect
     /// now, the snapshot [`Self::tunnel_engine`] gives an inspected tunnel,
-    /// so a middleware-only reload does not change its chain mid-tunnel. A
+    /// until a middleware or policy change advances the Cedar generation
+    /// its guard pins and the tunnel closes at the next request boundary. A
     /// YAML tunnel selects from the live engine (see
     /// [`PassthroughMiddleware`]).
     ///
@@ -357,9 +359,9 @@ pub enum PassthroughMiddleware<'a> {
     /// the tunnel's guard and the tunnel closes at the next request boundary.
     Live(&'a PolicyEngine),
     /// A Cedar sandbox keeps the configs and services in effect when the
-    /// tunnel started, as an inspected tunnel does, because its middleware
-    /// generation moves independently of the Cedar generation its guard
-    /// is pinned to.
+    /// tunnel started, as an inspected tunnel does: registry reconciliation
+    /// moves only its middleware generation, while a middleware config
+    /// change advances the Cedar generation its guard is pinned to.
     Snapshot(ActiveMiddleware),
 }
 

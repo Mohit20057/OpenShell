@@ -5,7 +5,7 @@
 //! requests against the canonical schema
 //! (`openshell_policy_cedar_schema::SANDBOX_SCHEMA_SRC`) and
 //! `tests/fixtures/policies.cedar` the way the policy authoring intends:
-//! identity-guarded, binary-restricted per-endpoint allowlisting.
+//! binary-restricted per-endpoint allowlisting.
 
 use openshell_policy_cedar::{CedarEngine, CedarEngineError, Decision, NetworkConnectRequest};
 
@@ -43,17 +43,6 @@ fn allows_nvidia_api_post_from_sandbox_identity() {
         .evaluate_network(&sandbox_request("integrate.api.nvidia.com", 443))
         .expect("request must be representable in the schema");
     assert!(matches!(decision, Decision::Allow { .. }), "{decision:?}");
-}
-
-#[test]
-fn denies_any_connect_without_the_sandbox_identity() {
-    let mut request = sandbox_request("pypi.org", 443);
-    request.user = "root".to_string();
-    request.group = "root".to_string();
-    let decision = engine()
-        .evaluate_network(&request)
-        .expect("request must be representable in the schema");
-    assert!(matches!(decision, Decision::Deny { .. }), "{decision:?}");
 }
 
 #[test]

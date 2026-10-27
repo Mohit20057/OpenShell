@@ -2912,20 +2912,29 @@ async fn handle_get_sandbox_config_inner(
     )
     .await?;
     let config = load_sandbox_config(state, &sandbox).await?;
-    if matches!(principal, Principal::Sandbox(_))
-        && !req.supports_cedar_policy
-        && config
-            .policy
-            .as_ref()
-            .is_some_and(|policy| !policy.cedar_policy_source.is_empty())
-    {
-        // Do not return an empty compatibility response: an older supervisor
-        // might treat it as a usable YAML configuration.
-        return Err(Status::unimplemented(
-            "Cedar policy requires a supervisor with Cedar support",
-        ));
+    if matches!(principal, Principal::Sandbox(_)) {
+        require_cedar_support(req.supports_cedar_policy, config.policy.as_ref())?;
     }
     Ok(Response::new(config))
+}
+
+const CEDAR_SUPPORT_REQUIRED: &str = "Cedar policy requires a supervisor with Cedar support";
+
+/// Refuses a Cedar policy to a supervisor that did not report Cedar support.
+///
+/// Callers must not answer with an empty compatibility configuration
+/// instead: an older supervisor might treat it as a usable YAML
+/// configuration. Pushed configuration delivers the refusal as a
+/// configuration that is not admitted.
+pub fn require_cedar_support(
+    supports_cedar_policy: bool,
+    policy: Option<&ProtoSandboxPolicy>,
+) -> Result<(), Status> {
+    if !supports_cedar_policy && policy.is_some_and(|policy| !policy.cedar_policy_source.is_empty())
+    {
+        return Err(Status::unimplemented(CEDAR_SUPPORT_REQUIRED));
+    }
+    Ok(())
 }
 
 /// Resolve the same effective configuration for authenticated RPCs and trusted
@@ -4620,6 +4629,12 @@ async fn handle_update_config_inner(
             .spec
             .as_ref()
             .ok_or_else(|| Status::internal("sandbox has no spec"))?;
+        // A sandbox cannot switch policy formats, so its baseline tells a
+        // Cedar sandbox apart before the operations are read. The merge
+        // checks the current revision again.
+        if let Some(baseline_policy) = &spec.policy {
+            require_mergeable_policy(baseline_policy)?;
+        }
         let merge_ops = parse_merge_operations(&req.merge_operations)?;
         validate_merge_operations_for_server(&merge_ops)?;
         let merge_validation =
@@ -5065,7 +5080,9 @@ fn bounded_configuration_diagnostic(message: &str) -> String {
 
 fn configuration_failure_diagnostic(error: &Status) -> &'static str {
     let message = error.message();
-    if message.contains("middleware") {
+    if error.code() == Code::Unimplemented && message == CEDAR_SUPPORT_REQUIRED {
+        "Effective policy is a Cedar policy, which this supervisor cannot enforce; run the sandbox with a supervisor built with Cedar support or set a YAML policy"
+    } else if message.contains("middleware") {
         "Effective middleware configuration is invalid; repair the policy middleware bindings or registered services"
     } else if message.contains("credential") || message.contains("provider") {
         "Effective provider configuration is invalid; repair credential bindings, attached providers, or their policy layers"
@@ -7479,6 +7496,18 @@ fn parse_proto_l7_target(
     Ok(target)
 }
 
+/// Rejects merge operations on a Cedar policy, which has no YAML rules to
+/// merge into.
+fn require_mergeable_policy(policy: &ProtoSandboxPolicy) -> Result<(), Status> {
+    if policy.cedar_policy_source.is_empty() {
+        return Ok(());
+    }
+    Err(Status::failed_precondition(
+        "incremental policy updates are not available for Cedar policies; edit the Cedar \
+         policy and replace it with `openshell policy set`",
+    ))
+}
+
 fn validate_merge_operations_for_server(operations: &[PolicyMergeOp]) -> Result<(), Status> {
     for operation in operations {
         match operation {
@@ -7704,6 +7733,8 @@ async fn apply_merge_operations_with_retry(
         } else {
             (baseline_policy.cloned().unwrap_or_default(), None)
         };
+        // Also covers a sandbox without a baseline policy.
+        require_mergeable_policy(&current_policy)?;
 
         clear_provider_credentialed_markers(&mut current_policy);
         if let Some(expected_hash) = expected_current_effective_hash {
@@ -22803,6 +22834,93 @@ mod tests {
         .expect_err("a Cedar global policy must be rejected");
         assert_eq!(err.code(), Code::InvalidArgument);
         assert!(err.message().contains("Cedar"), "{}", err.message());
+    }
+
+    #[tokio::test]
+    async fn update_config_rejects_merge_operations_on_a_cedar_policy() {
+        use crate::policy_store::PolicyStoreExt as _;
+
+        let cedar = ProtoSandboxPolicy {
+            version: 1,
+            cedar_policy_source: "permit(principal, \
+                action == Sandbox::Action::\"NetworkConnect\", \
+                resource == Sandbox::NetworkEndpoint::\"pypi.org:443\");"
+                .to_string(),
+            ..Default::default()
+        };
+        let state = test_server_state().await;
+        // One sandbox whose baseline is Cedar, and one with no baseline whose
+        // current revision is Cedar.
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-cedar-merge",
+                "cedar-merge",
+                cedar.clone(),
+                Vec::new(),
+            ))
+            .await
+            .unwrap();
+        let mut unbased =
+            test_sandbox("sb-cedar-revision", "cedar-revision", cedar.clone(), vec![]);
+        unbased.spec.as_mut().unwrap().policy = None;
+        state.store.put_message(&unbased).await.unwrap();
+        state
+            .store
+            .put_policy_revision(
+                "cedar-revision-1",
+                "sb-cedar-revision",
+                "default",
+                1,
+                &cedar.encode_to_vec(),
+                &deterministic_policy_hash(&cedar),
+            )
+            .await
+            .unwrap();
+
+        // Removing an absent rule would otherwise succeed without a change.
+        let remove_rule = PolicyMergeOperation {
+            operation: Some(policy_merge_operation::Operation::RemoveRule(
+                openshell_core::proto::RemoveNetworkRule {
+                    rule_name: "absent".to_string(),
+                },
+            )),
+        };
+        for (sandbox_id, sandbox) in [
+            ("sb-cedar-merge", "cedar-merge"),
+            ("sb-cedar-revision", "cedar-revision"),
+        ] {
+            let before = state.store.get_latest_policy(sandbox_id).await.unwrap();
+            let err = handle_update_config(
+                &state,
+                with_user(Request::new(UpdateConfigRequest {
+                    sandbox: sandbox.to_string(),
+                    workspace_scope: Some(openshell_core::proto::workspace_selector(
+                        "default".to_string(),
+                    )),
+                    merge_operations: vec![remove_rule.clone()],
+                    ..Default::default()
+                })),
+            )
+            .await
+            .expect_err("merging into a Cedar policy must be rejected");
+            assert_eq!(err.code(), Code::FailedPrecondition, "{sandbox}");
+            // A gateway without Cedar support refuses to read a stored Cedar
+            // revision before it reaches the merge.
+            assert!(
+                err.message().contains("openshell policy set")
+                    || (!cfg!(feature = "cedar")
+                        && sandbox == "cedar-revision"
+                        && err.message().contains("without Cedar policy support")),
+                "{sandbox}: {}",
+                err.message()
+            );
+            let after = state.store.get_latest_policy(sandbox_id).await.unwrap();
+            assert_eq!(
+                after.map(|record| record.version),
+                before.map(|record| record.version)
+            );
+        }
     }
 
     #[tokio::test]

@@ -446,7 +446,9 @@ same run; the promotion record links to the attempt that produced that evidence.
 Release rebuilds all stable artifacts with the stable version and publishes
 without rerunning qualification. These artifacts have different embedded versions
 from the qualified prerelease. Existing stable tags are never moved; a retry must
-resolve to the same qualified candidate.
+resolve to the same qualified candidate. A retry rebuilds, then publishes only what
+is missing: it keeps published GHCR version tags, Helm charts, GitHub Release assets,
+npm versions, and PyPI versions. Snap uploads are not skipped.
 
 Stable image builds save multi-platform OCI archives as workflow artifacts without
 pushing to GHCR. Publication copies those archives, including their attestations,

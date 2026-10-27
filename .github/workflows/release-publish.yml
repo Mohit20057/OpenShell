@@ -256,11 +256,18 @@ jobs:
           set -euo pipefail
           for component in gateway sandbox supervisor; do
             image="ghcr.io/nvidia/openshell/${component}:${VERSION}"
-            # Archives are build artifacts from this run, not externally signed images.
-            nix shell --inputs-from . nixpkgs#skopeo -c \
-              skopeo --insecure-policy copy --all --preserve-digests \
-              --authfile "${HOME}/.docker/config.json" \
-              "oci-archive:artifacts/images/${component}.tar" "docker://${image}"
+            # Never replace a published stable image; a rerun keeps the original.
+            if nix shell --inputs-from . nixpkgs#skopeo -c \
+              skopeo inspect --raw --authfile "${HOME}/.docker/config.json" \
+              "docker://${image}" >/dev/null 2>&1; then
+              echo "${image} is already published; keeping it."
+            else
+              # Archives are build artifacts from this run, not externally signed images.
+              nix shell --inputs-from . nixpkgs#skopeo -c \
+                skopeo --insecure-policy copy --all --preserve-digests \
+                --authfile "${HOME}/.docker/config.json" \
+                "oci-archive:artifacts/images/${component}.tar" "docker://${image}"
+            fi
             tasks/scripts/verify-image-sbom.sh "${image}" --require-cargo
           done
 
@@ -318,7 +325,16 @@ jobs:
           persist-credentials: false
           ref: ${{ inputs.source-sha }}
 
-      - uses: ./.github/actions/release-helm-oci
+      # Charts come from the release source; the publish logic comes from this
+      # workflow so retrying an older tag uses the current duplicate handling.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.workflow_sha }}
+          path: release-workflow
+          sparse-checkout: .github/actions/release-helm-oci
+
+      - uses: ./release-workflow/.github/actions/release-helm-oci
         with:
           chart-version: ${{ inputs.semver }}
           app-version: ${{ inputs.semver }}
@@ -396,6 +412,8 @@ jobs:
           make_latest: ${{ steps.latest.outputs.make-latest == 'true' && 'true' || 'false' }}
           tag_name: ${{ env.RELEASE_TAG }}
           body_path: release/release-notes.md
+          # A rerun uploads only missing assets and keeps published ones.
+          overwrite_files: false
           files: |
             release/openshell-x86_64-unknown-linux-musl.tar.gz
             release/openshell-aarch64-unknown-linux-musl.tar.gz

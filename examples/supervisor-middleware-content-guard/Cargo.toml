@@ -21,7 +21,7 @@ tokio-stream = "0.1"
 tonic = { version = "0.14", features = ["transport"] }
 
 [dev-dependencies]
-openshell-policy = { path = "../../crates/openshell-policy", default-features = false }
+openshell-policy = { path = "../../crates/openshell-policy" }
 
 [[bin]]
 name = "supervisor-middleware-content-guard"

@@ -3589,6 +3589,7 @@ mod tests {
         handle.abort();
     }
 
+    #[cfg(feature = "cedar")]
     #[tokio::test]
     async fn stream_provider_rotation_rebinds_cedar_configuration_generation() {
         use crate::tests::{CEDAR_RELOAD_POLICY, cedar_engine, cedar_proto_policy};
@@ -3632,6 +3633,7 @@ mod tests {
         assert_eq!(observed.config_revision, 200);
     }
 
+    #[cfg(feature = "cedar")]
     #[tokio::test]
     async fn stream_format_switch_quarantines_cedar_and_restoration_recovers() {
         use crate::tests::{CEDAR_RELOAD_POLICY, cedar_engine, cedar_proto_policy};

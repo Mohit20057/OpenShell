@@ -1531,7 +1531,8 @@ enum SandboxCommands {
         #[arg(long = "provider")]
         providers: Vec<String>,
 
-        /// Path to a custom sandbox policy file: YAML, or Cedar with a `.cedar` extension.
+        /// Path to a custom sandbox policy file: YAML, or Cedar with a `.cedar` extension
+        /// (Cedar requires a development build of the gateway).
         /// Overrides the built-in default and the `OPENSHELL_SANDBOX_POLICY` env var.
         #[arg(long, value_hint = ValueHint::FilePath)]
         policy: Option<String>,
@@ -2150,7 +2151,8 @@ enum PolicyCommands {
         #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
         name: Option<String>,
 
-        /// Path to the policy file: YAML, or Cedar with a `.cedar` extension.
+        /// Path to the policy file: YAML, or Cedar with a `.cedar` extension (Cedar
+        /// requires a development build of the gateway).
         /// Global policies must be YAML.
         #[arg(long, value_hint = ValueHint::FilePath)]
         policy: String,

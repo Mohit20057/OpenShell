@@ -155,6 +155,7 @@ impl std::fmt::Debug for MiddlewareState {
 }
 
 impl MiddlewareState {
+    #[cfg(feature = "cedar")]
     /// Starts at generation 0 with `configs` and no connected services.
     pub fn new(configs: MiddlewareConfigs) -> Self {
         let (generation_tx, _) = watch::channel(0);
@@ -248,6 +249,7 @@ impl MiddlewareState {
         Ok(())
     }
 
+    #[cfg(feature = "cedar")]
     /// Activates `configs`, and `registry` when given, as a new generation.
     ///
     /// `prepare` runs under the write lock before the generation advances;
@@ -281,6 +283,7 @@ impl MiddlewareState {
         self.generation_guard(generation)
     }
 
+    #[cfg(feature = "cedar")]
     /// Applies a configuration change that keeps the middleware itself.
     ///
     /// `change` runs under the write lock and returns whether the
@@ -405,6 +408,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "cedar")]
     #[test]
     fn commit_advances_the_generation_before_publishing() {
         let state = MiddlewareState::new(MiddlewareConfigs::default());
@@ -434,6 +438,7 @@ mod tests {
 
     /// A failed preparation commits nothing: the guard stays current and the
     /// middleware stays on the previous configs.
+    #[cfg(feature = "cedar")]
     #[test]
     fn commit_changes_nothing_when_preparation_fails() {
         let state = MiddlewareState::new(MiddlewareConfigs::default());
@@ -457,6 +462,7 @@ mod tests {
         assert!(chain.is_empty());
     }
 
+    #[cfg(feature = "cedar")]
     #[test]
     fn change_configuration_advances_only_when_changed() {
         let state = MiddlewareState::new(MiddlewareConfigs::default());

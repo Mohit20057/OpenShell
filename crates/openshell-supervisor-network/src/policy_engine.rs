@@ -41,6 +41,22 @@ pub enum PolicyEngine {
 }
 
 impl PolicyEngine {
+    /// Builds the engine the policy's format selects: Cedar for a policy with
+    /// `cedar_policy_source`, Rego otherwise. Either engine validates the
+    /// policy as it builds.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the policy is invalid, or is a Cedar policy and
+    /// this build has no Cedar support.
+    pub fn from_proto(policy: &openshell_core::proto::SandboxPolicy) -> Result<Self> {
+        if policy.cedar_policy_source.is_empty() {
+            Ok(Self::Opa(Arc::new(OpaEngine::from_proto(policy)?)))
+        } else {
+            Ok(Self::Cedar(Arc::new(CedarOnlyEngine::from_proto(policy)?)))
+        }
+    }
+
     /// Authorizes one egress request against one policy generation.
     ///
     /// # Errors
@@ -282,6 +298,8 @@ impl PolicyEngine {
     ///
     /// Returns an error if `expected_generation` is stale or an engine lock
     /// is poisoned.
+    // Without the `cedar` feature, `CedarOnlyEngine` is uninhabited.
+    #[cfg_attr(not(feature = "cedar"), allow(unreachable_code))]
     pub fn tunnel_engine(&self, expected_generation: u64) -> Result<TunnelPolicyEngine> {
         match self {
             Self::Opa(engine) => engine.clone_engine_for_tunnel(expected_generation),

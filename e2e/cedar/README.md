@@ -15,6 +15,9 @@ layer enforces it:
 | Filesystem | `policy.template.cedar` | A `WriteFile` grant makes `/sandbox` writable, a `ReadFile` grant makes `/opt` readable, and `/srv` stays unreadable. |
 | Syscalls | sandbox runtime | `memfd_create`, `ptrace`, user-namespace `unshare`, `mount`, `io_uring_setup`, raw netlink sockets, and direct TCP connects that bypass the proxy return `EPERM`. |
 
+Cedar policies need a gateway and supervisor built with the `cedar` feature:
+a Release Dev build, or a local e2e build with `OPENSHELL_BUILD_CEDAR=1`.
+
 Syscall filtering is not authored policy, in YAML or Cedar. The syscall checks
 confirm that the sandbox's seccomp restrictions still apply when the policy is
 Cedar. Middleware is configuration rather than access control, so it is passed
@@ -58,8 +61,9 @@ mise run e2e:cedar
 ```
 
 The suite is also part of `mise run e2e`, and CI runs it as the `cedar` entry of
-the Docker E2E matrix. When `OPENSHELL_BIN` is set, as in CI, the task uses that
-CLI instead of building one.
+the Docker E2E matrix in branch E2E and Release Dev. Pre-release qualification
+omits it, because pre-release builds exclude Cedar. When `OPENSHELL_BIN` is
+set, as in CI, the task uses that CLI instead of building one.
 
 Against a gateway you already started with `mise run gateway:docker`:
 

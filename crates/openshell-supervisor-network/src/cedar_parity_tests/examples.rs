@@ -699,15 +699,12 @@ fn yaml_grants(policy: &SandboxPolicy, workdir: &str) -> Grants {
 /// baseline when a policy can permit `NetworkConnect` (as YAML adds it only
 /// to a policy with network policies), and no workdir.
 fn cedar_grants(policy: &SandboxPolicy) -> Grants {
-    let filesystem = openshell_policy::cedar_filesystem_grants(&policy.cedar_policy_source)
-        .expect("Cedar filesystem grants load");
+    let effective =
+        openshell_policy::effective_filesystem(policy).expect("Cedar filesystem grants load");
+    let filesystem = effective.filesystem.expect("Cedar grants are explicit");
     assert!(!filesystem.include_workdir);
     let (mut read_only, mut read_write) = (filesystem.read_only, filesystem.read_write);
-    let has_network_permits = CedarOnlyEngine::from_proto(policy)
-        .expect("Cedar engine loads")
-        .has_network_permits()
-        .expect("engine lock");
-    if has_network_permits {
+    if effective.needs_proxy_baseline {
         add_baseline(&mut read_only, &mut read_write);
     }
     if read_only.is_empty() && read_write.is_empty() {
@@ -1025,18 +1022,6 @@ fn example_gator() {
         .with_middleware(include_str!(
             "../../../../scripts/agents/gator/middleware.yaml"
         )),
-        &none,
-    );
-}
-
-#[test]
-fn example_mxc_fs_empty() {
-    check(
-        &Example::new(
-            "mxc fs-empty",
-            include_str!("../../../openshell-driver-mxc/examples/e2e-policies/fs-empty.yaml"),
-            include_str!("../../../openshell-driver-mxc/examples/e2e-policies/fs-empty.cedar"),
-        ),
         &none,
     );
 }

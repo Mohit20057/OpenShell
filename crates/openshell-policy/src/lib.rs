@@ -9,6 +9,8 @@
 //! `openshell-policy-schema`; this crate adapts that representation to the
 //! runtime protobuf model and owns runtime-dependent validation.
 
+#[cfg(feature = "cedar")]
+pub mod cedar;
 mod compose;
 pub mod endpoint_status;
 mod l7_validate;
@@ -994,42 +996,40 @@ pub fn parse_sandbox_policy_file_auto(path: &Path) -> Result<SandboxPolicy> {
     }
 }
 
-/// Reads and validates a `.cedar` policy file, building a [`SandboxPolicy`]
-/// with `cedar_policy_source` set and every other field at default.
+/// Reads a `.cedar` policy file, building a [`SandboxPolicy`] with
+/// `cedar_policy_source` set and every other field at default.
 ///
-/// Runs the same checks the gateway runs at submission time so a malformed
-/// Cedar policy is rejected locally with a fast, actionable error instead of
-/// a round trip to the gateway.
+/// The Cedar text is carried as an opaque document; the gateway validates it
+/// when the policy is submitted. See [`cedar_sandbox_policy`].
 ///
 /// # Errors
 ///
-/// Returns an error if the file cannot be read, contains no policy text, or
-/// fails validation (see [`validate_sandbox_policy`]).
+/// Returns an error if the file cannot be read or contains no policy text.
 pub fn parse_cedar_sandbox_policy_file(path: &Path) -> Result<SandboxPolicy> {
     let cedar_policy_source = std::fs::read_to_string(path)
         .into_diagnostic()
         .wrap_err_with(|| format!("failed to read Cedar policy file {}", path.display()))?;
-    // An empty `cedar_policy_source` selects the YAML path, so an empty file
-    // would silently become an empty YAML policy.
+    cedar_sandbox_policy(cedar_policy_source)
+        .wrap_err_with(|| format!("invalid Cedar policy file {}", path.display()))
+}
+
+/// Builds a [`SandboxPolicy`] that carries `cedar_policy_source` as an opaque
+/// document, with every other field at default. Runs no Cedar engine.
+///
+/// # Errors
+///
+/// Returns an error if the text is empty: an empty `cedar_policy_source`
+/// selects the YAML path, so an empty Cedar document would silently become an
+/// empty YAML policy.
+pub fn cedar_sandbox_policy(cedar_policy_source: String) -> Result<SandboxPolicy> {
     if cedar_policy_source.trim().is_empty() {
-        return Err(miette::miette!(
-            "Cedar policy file {} is empty",
-            path.display()
-        ));
+        return Err(miette::miette!("Cedar policy is empty"));
     }
-    let policy = SandboxPolicy {
+    Ok(SandboxPolicy {
         version: 1,
         cedar_policy_source,
-        provider_credential_rules: HashMap::default(),
         ..Default::default()
-    };
-    validate_sandbox_policy(&policy)
-        .map_err(|violations| {
-            let messages: Vec<String> = violations.iter().map(ToString::to_string).collect();
-            miette::miette!("policy contains unsafe content: {}", messages.join("; "))
-        })
-        .wrap_err_with(|| format!("invalid Cedar policy at {}", path.display()))?;
-    Ok(policy)
+    })
 }
 
 /// Serialize a proto sandbox policy to a YAML string.
@@ -1582,6 +1582,8 @@ pub enum PolicyViolation {
     /// `cedar_policy_source` failed to parse or validate, or uses a policy
     /// shape Cedar cannot enforce exactly.
     InvalidCedarPolicy { reason: String },
+    /// `cedar_policy_source` is set in a build without the `cedar` feature.
+    CedarUnsupported,
     /// `endpoint_settings` is set on a policy that is not a Cedar policy.
     EndpointSettingsRequireCedar,
     /// An `endpoint_settings` entry is invalid.
@@ -1805,6 +1807,9 @@ impl fmt::Display for PolicyViolation {
             Self::InvalidCedarPolicy { reason } => {
                 write!(f, "cedar_policy_source is invalid: {reason}")
             }
+            Self::CedarUnsupported => {
+                write!(f, "Cedar policy support is not enabled in this build")
+            }
             Self::EndpointSettingsRequireCedar => {
                 write!(
                     f,
@@ -1844,7 +1849,11 @@ impl fmt::Display for PolicyViolation {
 pub fn validate_sandbox_policy(
     policy: &SandboxPolicy,
 ) -> std::result::Result<(), Vec<PolicyViolation>> {
-    validate_sandbox_policy_with_mcp_presence(policy, McpVersionPresence::RequireMaterialized)
+    validate_sandbox_policy_with_mcp_presence(
+        policy,
+        McpVersionPresence::RequireMaterialized,
+        &mut Vec::new(),
+    )
 }
 
 /// Validate filesystem paths shared by typed policies and raw OPA data.
@@ -1908,16 +1917,21 @@ enum McpVersionPresence {
     AllowDefaultable,
 }
 
-/// Validates `policy.cedar_policy_source`, when non-empty.
+/// Validates `policy.cedar_policy_source`, when non-empty, returning its
+/// load-time warnings.
 ///
 /// Checks mutual exclusivity with `network_policies`, that the Cedar engine
 /// accepts the policy (parse, strict schema validation, and supported
 /// shapes), and that the derived Landlock grants pass the same path checks
-/// as YAML `filesystem` paths. A no-op when `cedar_policy_source` is empty
-/// (the YAML-sourced path, unaffected).
-fn validate_cedar_policy_source(policy: &SandboxPolicy, violations: &mut Vec<PolicyViolation>) {
+/// as YAML `filesystem` paths. Builds without the `cedar` feature reject every
+/// Cedar policy. A no-op when `cedar_policy_source` is empty (the YAML-sourced
+/// path, unaffected).
+fn validate_cedar_policy_source(
+    policy: &SandboxPolicy,
+    violations: &mut Vec<PolicyViolation>,
+) -> Vec<String> {
     if policy.cedar_policy_source.is_empty() {
-        return;
+        return Vec::new();
     }
     if !policy.network_policies.is_empty() {
         violations.push(PolicyViolation::CedarMutuallyExclusiveWithNetworkPolicies);
@@ -1935,79 +1949,64 @@ fn validate_cedar_policy_source(policy: &SandboxPolicy, violations: &mut Vec<Pol
                 .to_string(),
         });
     }
-    match load_cedar_grants(&policy.cedar_policy_source) {
-        Ok((read_only, read_write)) => {
-            if let Err(errors) = validate_filesystem_paths(&read_only, &read_write) {
-                violations.extend(errors);
-            }
-        }
-        Err(reason) => violations.push(PolicyViolation::InvalidCedarPolicy { reason }),
-    }
-}
-
-/// Returns the Landlock grants a Cedar policy source authorizes.
-///
-/// Grants are returned as a proto `FilesystemPolicy` so callers can compare
-/// them with the same rules that apply to YAML `filesystem` sections.
-/// Returns `None` if the source does not load; validation reports why.
-#[must_use]
-pub fn cedar_filesystem_grants(cedar_policy_source: &str) -> Option<FilesystemPolicy> {
-    let (read_only, read_write) = load_cedar_grants(cedar_policy_source).ok()?;
-    Some(FilesystemPolicy {
-        include_workdir: false,
-        read_only,
-        read_write,
-    })
-}
-
-/// Returns the load-time warnings of a Cedar policy source, one line each.
-///
-/// Warnings describe shapes that load but are likely not what the author
-/// meant, such as an audit-only `@path` beside enforced policies of the same
-/// `host:port`; they never change enforcement. Returns nothing for a source
-/// that does not load, since [`validate_sandbox_policy`] reports why, and in
-/// builds without the `cedar` feature.
-#[must_use]
-pub fn cedar_policy_warnings(cedar_policy_source: &str) -> Vec<String> {
     #[cfg(feature = "cedar")]
     {
-        openshell_policy_cedar::CedarEngine::from_policy_str(cedar_policy_source)
-            .map(|engine| engine.warnings().iter().map(ToString::to_string).collect())
-            .unwrap_or_default()
+        cedar::validate(&policy.cedar_policy_source, violations)
     }
     #[cfg(not(feature = "cedar"))]
     {
-        let _ = cedar_policy_source;
+        violations.push(PolicyViolation::CedarUnsupported);
         Vec::new()
     }
 }
 
-/// Loads a Cedar policy and returns its `(read_only, read_write)` grants.
-#[cfg(feature = "cedar")]
-fn load_cedar_grants(
-    cedar_policy_source: &str,
-) -> std::result::Result<(Vec<String>, Vec<String>), String> {
-    let engine = openshell_policy_cedar::CedarEngine::from_policy_str(cedar_policy_source)
-        .map_err(|error| error.to_string())?;
-    let grants = engine.filesystem_grants();
-    Ok((grants.read_only.clone(), grants.read_write.clone()))
+/// The filesystem access a policy grants, whatever its policy language.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffectiveFilesystem {
+    /// The granted paths. `None` when a YAML policy has no `filesystem`
+    /// section, so the runtime default applies.
+    pub filesystem: Option<FilesystemPolicy>,
+    /// Whether the supervisor must add its proxy baseline paths to these
+    /// grants. A YAML policy carries those paths in its own `filesystem`
+    /// section, which the supervisor enriches and syncs back, so this is set
+    /// only for grants derived from the policy text.
+    pub needs_proxy_baseline: bool,
 }
 
-/// Rejects every Cedar policy in builds without the `cedar` feature.
-#[cfg(not(feature = "cedar"))]
-fn load_cedar_grants(
-    _cedar_policy_source: &str,
-) -> std::result::Result<(Vec<String>, Vec<String>), String> {
-    Err("Cedar policy support is not enabled in this build".to_string())
+/// Returns the filesystem access `policy` grants.
+///
+/// A YAML policy grants its authored `filesystem` section. A Cedar policy
+/// grants the paths its `ReadFile`/`WriteFile` permits authorize.
+///
+/// # Errors
+///
+/// Returns the violation when a Cedar policy does not load, including in
+/// builds without the `cedar` feature.
+pub fn effective_filesystem(
+    policy: &SandboxPolicy,
+) -> std::result::Result<EffectiveFilesystem, PolicyViolation> {
+    if policy.cedar_policy_source.is_empty() {
+        return Ok(EffectiveFilesystem {
+            filesystem: policy.filesystem.clone(),
+            needs_proxy_baseline: false,
+        });
+    }
+    #[cfg(feature = "cedar")]
+    {
+        cedar::effective_filesystem(&policy.cedar_policy_source)
+    }
+    #[cfg(not(feature = "cedar"))]
+    Err(PolicyViolation::CedarUnsupported)
 }
 
 fn validate_sandbox_policy_with_mcp_presence(
     policy: &SandboxPolicy,
     mcp_version_presence: McpVersionPresence,
+    warnings: &mut Vec<String>,
 ) -> std::result::Result<(), Vec<PolicyViolation>> {
     let mut violations = Vec::new();
 
-    validate_cedar_policy_source(policy, &mut violations);
+    warnings.extend(validate_cedar_policy_source(policy, &mut violations));
     if !policy.endpoint_settings.is_empty() && policy.cedar_policy_source.is_empty() {
         violations.push(PolicyViolation::EndpointSettingsRequireCedar);
     }
@@ -2775,17 +2774,42 @@ fn validate_and_canonicalize_mcp_policy_schema(
 /// policy field. Debug builds recheck that local transformation invariant
 /// without imposing a second whole-policy traversal on production read paths.
 pub fn validate_and_canonicalize_sandbox_policy(
-    mut policy: SandboxPolicy,
+    policy: SandboxPolicy,
 ) -> std::result::Result<SandboxPolicy, PolicyValidationError> {
-    validate_sandbox_policy_with_mcp_presence(&policy, McpVersionPresence::AllowDefaultable)
-        .map_err(|violations| PolicyValidationError { violations })?;
+    validate_and_canonicalize_sandbox_policy_report(policy).map(|validated| validated.policy)
+}
+
+/// A policy accepted by [`validate_and_canonicalize_sandbox_policy_report`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValidatedPolicy {
+    /// The canonical policy, safe to hash and persist.
+    pub policy: SandboxPolicy,
+    /// Load-time warnings, one line each: shapes that load but are likely
+    /// not what the author meant, such as an audit-only Cedar `@path` beside
+    /// enforced policies of the same `host:port`. They never change
+    /// enforcement.
+    pub warnings: Vec<String>,
+}
+
+/// Like [`validate_and_canonicalize_sandbox_policy`], also returning the
+/// policy's load-time warnings from the same validation pass.
+pub fn validate_and_canonicalize_sandbox_policy_report(
+    mut policy: SandboxPolicy,
+) -> std::result::Result<ValidatedPolicy, PolicyValidationError> {
+    let mut warnings = Vec::new();
+    validate_sandbox_policy_with_mcp_presence(
+        &policy,
+        McpVersionPresence::AllowDefaultable,
+        &mut warnings,
+    )
+    .map_err(|violations| PolicyValidationError { violations })?;
     materialize_default_mcp_versions(&mut policy);
     canonicalize_mcp_version_allowlists(&mut policy);
     debug_assert!(
         validate_sandbox_policy(&policy).is_ok(),
         "validated MCP canonicalization must preserve every policy invariant"
     );
-    Ok(policy)
+    Ok(ValidatedPolicy { policy, warnings })
 }
 
 /// Replace absent protobuf MCP options and empty revision lists with the
@@ -2855,7 +2879,6 @@ pub use openshell_policy_schema::normalize_path;
 mod tests {
     use super::*;
 
-    #[cfg(feature = "cedar")]
     #[test]
     fn parse_sandbox_policy_file_auto_dispatches_cedar_extension() {
         let dir = std::env::temp_dir().join(format!(
@@ -2886,7 +2909,6 @@ when { context.binary_path == "/usr/bin/curl" };
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    #[cfg(feature = "cedar")]
     #[test]
     fn parse_sandbox_policy_file_auto_dispatches_uppercase_cedar_extension() {
         let dir = std::env::temp_dir().join(format!(
@@ -2927,7 +2949,7 @@ when { context.binary_path == "/usr/bin/curl" };
     }
 
     #[test]
-    fn parse_cedar_sandbox_policy_file_rejects_invalid_syntax() {
+    fn parse_cedar_sandbox_policy_file_carries_the_text_unvalidated() {
         let dir = std::env::temp_dir().join(format!(
             "openshell-policy-test-{}-{}",
             std::process::id(),
@@ -2937,8 +2959,10 @@ when { context.binary_path == "/usr/bin/curl" };
         let path = dir.join("policy.cedar");
         std::fs::write(&path, "not valid cedar {{{").expect("write policy file");
 
-        let result = parse_cedar_sandbox_policy_file(&path);
-        assert!(result.is_err());
+        // Loading only transports the document; validation rejects it.
+        let policy = parse_cedar_sandbox_policy_file(&path).expect("document loads");
+        assert_eq!(policy.cedar_policy_source, "not valid cedar {{{");
+        assert!(validate_sandbox_policy(&policy).is_err());
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -3167,6 +3191,7 @@ when { context.binary_path == "/usr/bin/curl" };
         assert_eq!(mcp.versions, vec!["2025-06-18", "2025-11-25"]);
         assert_eq!(mcp.strict_tool_names, Some(false));
         assert_eq!(policy.endpoint_settings[2].json_rpc_max_body_bytes, 131_072);
+        #[cfg(feature = "cedar")]
         assert!(validate_sandbox_policy(&policy).is_ok());
 
         let rendered = serialize_network_middlewares(&policy)
@@ -3224,6 +3249,7 @@ when { context.binary_path == "/usr/bin/curl" };
         };
         assert_eq!(policy.process.as_ref(), Some(&expected));
         assert_eq!(policy.network_middlewares.len(), 1);
+        #[cfg(feature = "cedar")]
         assert!(validate_sandbox_policy(&policy).is_ok());
 
         let rendered = serialize_network_middlewares(&policy)
@@ -3545,9 +3571,10 @@ when { context.binary_path == "/usr/bin/curl" };
         assert!(
             violations
                 .iter()
-                .any(|v| matches!(v, PolicyViolation::InvalidCedarPolicy { .. })),
+                .any(|v| matches!(v, PolicyViolation::CedarUnsupported)),
             "{violations:?}"
         );
+        assert!(effective_filesystem(&policy).is_err());
     }
 
     #[cfg(feature = "cedar")]
@@ -3566,6 +3593,93 @@ when { context.binary_path == "/usr/bin/curl" };
         assert!(validate_sandbox_policy(&policy).is_ok());
     }
 
+    #[cfg(feature = "cedar")]
+    #[test]
+    fn validation_report_returns_cedar_load_time_warnings() {
+        let http = |annotations: &str, effect: &str, condition: &str| {
+            format!(
+                "{annotations}\n{effect} (principal, action == Sandbox::Action::\"HttpRequest\", \
+                 resource == Sandbox::NetworkEndpoint::\"api.example.com:443\")\nwhen {{ {condition} }};\n"
+            )
+        };
+        let audit_only_path = format!(
+            "{}{}",
+            http("", "permit", "context.method == \"GET\""),
+            http(
+                "@path(\"/admin/**\") @enforcement(\"audit\")",
+                "forbid",
+                "context.method == \"DELETE\""
+            ),
+        );
+        let report =
+            validate_and_canonicalize_sandbox_policy_report(cedar_sourced_policy(&audit_only_path))
+                .expect("policy is valid");
+        assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
+        assert!(
+            report.warnings[0].starts_with("path `/admin/**` of api.example.com:443 is audit-only"),
+            "{}",
+            report.warnings[0]
+        );
+
+        let enforced = cedar_sourced_policy(&http("", "permit", "context.method == \"GET\""));
+        let report = validate_and_canonicalize_sandbox_policy_report(enforced).expect("valid");
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    }
+
+    #[test]
+    fn effective_filesystem_of_a_yaml_policy_is_its_filesystem_section() {
+        let policy = SandboxPolicy {
+            filesystem: Some(FilesystemPolicy {
+                include_workdir: true,
+                read_only: vec!["/usr".to_string()],
+                read_write: vec!["/tmp".to_string()],
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            effective_filesystem(&policy).expect("YAML policy"),
+            EffectiveFilesystem {
+                filesystem: policy.filesystem.clone(),
+                needs_proxy_baseline: false,
+            }
+        );
+        let defaulted = effective_filesystem(&SandboxPolicy::default()).expect("YAML policy");
+        assert_eq!(defaulted.filesystem, None);
+    }
+
+    #[cfg(feature = "cedar")]
+    #[test]
+    fn effective_filesystem_of_a_cedar_policy_derives_its_grants() {
+        let read_usr = r#"permit (principal, action == Sandbox::Action::"ReadFile",
+                                  resource in Sandbox::FilesystemPath::"/usr");"#;
+        let effective =
+            effective_filesystem(&cedar_sourced_policy(read_usr)).expect("policy loads");
+        assert_eq!(
+            effective.filesystem,
+            Some(FilesystemPolicy {
+                include_workdir: false,
+                read_only: vec!["/usr".to_string()],
+                read_write: Vec::new(),
+            })
+        );
+        assert!(!effective.needs_proxy_baseline);
+
+        let with_network = format!(
+            "{read_usr}\npermit (principal, action == Sandbox::Action::\"NetworkConnect\", \
+             resource == Sandbox::NetworkEndpoint::\"pypi.org:443\");"
+        );
+        let effective =
+            effective_filesystem(&cedar_sourced_policy(&with_network)).expect("policy loads");
+        assert!(effective.needs_proxy_baseline);
+
+        let invalid = effective_filesystem(&cedar_sourced_policy("not cedar {{{"));
+        assert!(matches!(
+            invalid,
+            Err(PolicyViolation::InvalidCedarPolicy { .. })
+        ));
+    }
+
+    #[cfg(feature = "cedar")]
     #[test]
     fn cedar_policy_source_rejects_unparsable_policy() {
         let policy = cedar_sourced_policy("this is not valid cedar syntax {{{");
@@ -3578,6 +3692,7 @@ when { context.binary_path == "/usr/bin/curl" };
         );
     }
 
+    #[cfg(feature = "cedar")]
     #[test]
     fn cedar_policy_source_rejects_forbid_on_filesystem_path() {
         let policy = cedar_sourced_policy(

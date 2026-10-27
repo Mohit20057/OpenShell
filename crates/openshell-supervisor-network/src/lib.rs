@@ -11,9 +11,17 @@
 //! aggregate them.
 
 mod binary_resolution;
+#[cfg(feature = "cedar")]
 pub mod cedar_only;
-#[cfg(test)]
+// Builds without the `cedar` feature keep the Cedar engine's types, but none
+// can be constructed: loading a Cedar policy fails, so every Cedar branch of
+// the proxy is unreachable.
+#[cfg(not(feature = "cedar"))]
+#[path = "cedar_disabled.rs"]
+pub mod cedar_only;
+#[cfg(all(test, feature = "cedar"))]
 mod cedar_parity_tests;
+#[cfg(feature = "cedar")]
 mod cedar_provider_rules;
 mod google_cloud_metadata;
 #[cfg(target_os = "windows")]

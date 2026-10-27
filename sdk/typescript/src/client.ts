@@ -560,6 +560,8 @@ export interface UpdateConfigResult {
   /** u64 rendered as a string. */
   settingsRevision: string;
   deleted: boolean;
+  /** The gateway's load-time warnings for a submitted sandbox policy, one line each. */
+  policyWarnings: string[];
 }
 
 // ---- enum → lowercase string -----------------------------------------------
@@ -695,6 +697,7 @@ function updateConfigResult(resp: UpdateConfigResponse): UpdateConfigResult {
     policyHash: resp.policyHash,
     settingsRevision: resp.settingsRevision.toString(),
     deleted: resp.deleted,
+    policyWarnings: resp.policyWarnings.map((warning) => warning.message),
   };
 }
 
@@ -1214,7 +1217,7 @@ export class SandboxClient {
     if (!info.supportsCedarPolicy)
       throw new SdkError(
         'invalid_config',
-        'gateway does not advertise Cedar policy support; upgrade the gateway before sending Cedar policies',
+        'gateway does not advertise Cedar policy support; Cedar policies require a development build of the gateway and supervisor',
       );
   }
 

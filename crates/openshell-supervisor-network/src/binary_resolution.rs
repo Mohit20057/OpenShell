@@ -26,6 +26,7 @@ use std::path::{Path, PathBuf};
 ///
 /// Returns the `globset` error for a pattern that does not compile, which
 /// fails Rego evaluation.
+#[cfg(feature = "cedar")]
 pub fn compile_binary_glob(pattern: &str) -> Result<globset::GlobMatcher, globset::Error> {
     Ok(globset::GlobBuilder::new(pattern)
         .literal_separator(true)

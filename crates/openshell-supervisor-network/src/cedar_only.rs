@@ -1641,26 +1641,6 @@ impl CedarOnlyEngine {
         self.generation_tx.send_replace(generation);
         generation
     }
-
-    /// Returns the Landlock path grants the loaded policy authorizes.
-    ///
-    /// See [`openshell_policy_cedar::CedarEngine::filesystem_grants`].
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the engine lock is poisoned.
-    pub fn filesystem_grants(&self) -> Result<openshell_policy_cedar::FilesystemGrants> {
-        Ok(self.read_engine()?.cedar.filesystem_grants().clone())
-    }
-
-    /// See [`openshell_policy_cedar::CedarEngine::has_network_permits`].
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the engine lock is poisoned.
-    pub fn has_network_permits(&self) -> Result<bool> {
-        Ok(self.read_engine()?.cedar.has_network_permits())
-    }
 }
 
 /// A validated Cedar policy waiting for [`CedarOnlyEngine::commit`].

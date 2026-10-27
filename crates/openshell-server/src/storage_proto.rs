@@ -164,8 +164,10 @@ mod tests {
     // Cedar policies keep their current behavior.
     // HealthResponse and GetSandboxConfigRequest negotiate Cedar support with
     // public-only capability fields; durable schemas remain unchanged.
+    // SandboxResponse and UpdateConfigResponse return policy warnings in the
+    // new public-only PolicyWarning message; durable schemas remain unchanged.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "132f05219393f768e2be633775d711c0abd334b6e42a496d18c8f814e3ef6abf";
+        "31ca0a9b74df8b30a8b61cd6824daf689cd2dd062c70b28dbbab96a3fc74227d";
     const DURABLE_SCHEMA_SHA256: &str =
         "36ee37f13c85532dd659e6ad839d5c0b0c1ffd7778e3226b6d793c406d1e621d";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
@@ -703,7 +705,7 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (329, 29),
+                (330, 29),
                 (96, 22),
                 (84, 22),
                 PUBLIC_RPC_SCHEMA_SHA256,

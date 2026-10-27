@@ -393,7 +393,11 @@ fn main() -> Result<()> {
             .into_diagnostic()?;
         return runtime.block_on(async move {
             openshell_crypto::tls::ensure_default_provider();
-            let exit = openshell_supervisor_process::debug_rpc::run(&raw_args[2..]).await?;
+            let exit = openshell_supervisor_process::debug_rpc::run(
+                &raw_args[2..],
+                cfg!(feature = "cedar"),
+            )
+            .await?;
             std::process::exit(exit);
         });
     }

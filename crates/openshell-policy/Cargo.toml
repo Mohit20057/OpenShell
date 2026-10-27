@@ -21,10 +21,11 @@ miette = { workspace = true }
 prost-types = { workspace = true }
 
 [features]
-default = ["cedar"]
-# Validates Cedar-authored policies (`cedar_policy_source`). Without it, any
-# policy with Cedar source fails validation as unsupported. Crates that only
-# use this crate's constants and defaults disable it to avoid linking Cedar.
+default = []
+# Validates and interprets Cedar-authored policies (`cedar_policy_source`).
+# Without it, any policy with Cedar source fails validation as unsupported.
+# Only the gateway and supervisor enable it, through their own `cedar`
+# features; clients carry Cedar documents without linking the engine.
 cedar = ["dep:openshell-policy-cedar"]
 
 [lints]

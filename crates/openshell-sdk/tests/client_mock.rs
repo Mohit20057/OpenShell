@@ -364,6 +364,7 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(proto::SandboxResponse {
             sandbox: Some(sandbox_with_phase(&name, proto::SandboxPhase::Provisioning)),
             service_urls,
+            ..Default::default()
         }))
     }
 
@@ -434,6 +435,7 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(proto::SandboxResponse {
             sandbox: Some(sandbox),
             service_urls: HashMap::new(),
+            ..Default::default()
         }))
     }
 
@@ -451,6 +453,7 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(proto::SandboxResponse {
             sandbox: Some(sandbox),
             service_urls: HashMap::new(),
+            ..Default::default()
         }))
     }
 
@@ -492,6 +495,7 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(proto::SandboxResponse {
             sandbox: Some(sandbox),
             service_urls: HashMap::new(),
+            ..Default::default()
         }))
     }
 

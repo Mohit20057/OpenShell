@@ -1723,7 +1723,8 @@ type GetSandboxConfigRequest struct {
 	WorkspaceScope *datamodelv1.WorkspaceSelector `protobuf:"bytes,3,opt,name=workspace_scope,json=workspaceScope,proto3" json:"workspace_scope,omitempty"`
 	Name           string                         `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
 	// Required for sandbox-authenticated callers receiving a Cedar policy.
-	// Omitted by older supervisors, which cannot safely interpret Cedar fields.
+	// Supervisors built with Cedar support set it; supervisors built without
+	// it, and older supervisors, cannot safely interpret Cedar fields.
 	SupportsCedarPolicy bool `protobuf:"varint,4,opt,name=supports_cedar_policy,json=supportsCedarPolicy,proto3" json:"supports_cedar_policy,omitempty"`
 	unknownFields       protoimpl.UnknownFields
 	sizeCache           protoimpl.SizeCache

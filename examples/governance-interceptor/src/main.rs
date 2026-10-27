@@ -23,7 +23,7 @@ use openshell_core::proto::{
     UpdateConfigRequest, open_shell_client::OpenShellClient,
 };
 use openshell_crypto::jwt::{decode, encode};
-use openshell_policy::parse_sandbox_policy;
+use openshell_policy::{cedar_sandbox_policy, parse_sandbox_policy};
 use openshell_providers::{ProviderTypeProfile, normalize_profile_id};
 use policy_hash::{
     HASH_ALGORITHM, canonical_policy_hash, canonical_profile_hash,
@@ -842,21 +842,14 @@ impl PolicyFormat {
 
 /// Parses the governance policy file.
 ///
-/// A Cedar policy is carried as `cedar_policy_source`, as the CLI builds it.
-/// This example builds `openshell-policy` without Cedar support, so the
-/// gateway validates the Cedar text when it creates the sandbox.
+/// A Cedar policy is carried as `cedar_policy_source`, as the CLI builds it,
+/// and the gateway validates the Cedar text when it creates the sandbox.
 fn parse_policy(policy_text: &str, policy_format: PolicyFormat) -> Result<SandboxPolicy, String> {
     match policy_format {
         PolicyFormat::Yaml => parse_sandbox_policy(policy_text)
             .map_err(|err| format!("failed to parse policy YAML: {err}")),
-        PolicyFormat::Cedar if policy_text.trim().is_empty() => {
-            Err("Cedar policy file is empty".to_string())
-        }
-        PolicyFormat::Cedar => Ok(SandboxPolicy {
-            version: 1,
-            cedar_policy_source: policy_text.to_string(),
-            ..Default::default()
-        }),
+        PolicyFormat::Cedar => cedar_sandbox_policy(policy_text.to_string())
+            .map_err(|err| format!("failed to load Cedar policy: {err}")),
     }
 }
 

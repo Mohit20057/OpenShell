@@ -27,7 +27,6 @@ use openshell_ocsf::{
 };
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::cedar_only::CedarOnlyEngine;
 use crate::identity::BinaryIdentityCache;
 use crate::l7::tls::{
     CertCache, ProxyTlsState, SandboxCa, build_upstream_client_config, read_system_ca_bundle,
@@ -98,11 +97,7 @@ pub async fn start_host_proxy(config: HostProxyConfig) -> Result<HostProxyHandle
         ));
     }
 
-    let engine = if config.policy.cedar_policy_source.is_empty() {
-        PolicyEngine::from(Arc::new(OpaEngine::from_proto(&config.policy)?))
-    } else {
-        PolicyEngine::Cedar(Arc::new(CedarOnlyEngine::from_proto(&config.policy)?))
-    };
+    let engine = PolicyEngine::from(Arc::new(OpaEngine::from_proto(&config.policy)?));
     let (_workspace_tx, workspace_rx) = tokio::sync::watch::channel(String::new());
     let policy_local_ctx = Arc::new(PolicyLocalContext::new(
         Some(config.policy.clone()),
@@ -316,23 +311,6 @@ mod tests {
             error
                 .to_string()
                 .contains("cannot enforce network_middlewares"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[tokio::test]
-    async fn builds_cedar_engine_for_cedar_policy() {
-        let mut config = test_config(
-            ([127, 0, 0, 1], 0).into(),
-            PathBuf::from("missing-agent.exe"),
-        );
-        config.policy.cedar_policy_source = "permit (".into();
-
-        let Err(error) = start_host_proxy(config).await else {
-            panic!("host proxy must evaluate a Cedar policy with Cedar");
-        };
-        assert!(
-            error.to_string().to_lowercase().contains("cedar"),
             "unexpected error: {error}"
         );
     }

@@ -13,8 +13,8 @@ middleware file (`--middleware`), carried in `network_middlewares` and
 schema in `openshell-policy-cedar-schema`. It then derives three artifacts that
 Cedar does not decide at request time: Landlock grants, which endpoints the
 proxy inspects per request, and policy DNS eligibility. It accepts only policy
-shapes whose meaning those artifacts can enforce exactly. The CLI, the gateway,
-and the supervisor reject everything else. Errors evaluating deciding policies
+shapes whose meaning those artifacts can enforce exactly. The gateway and the
+supervisor reject everything else. Errors evaluating deciding policies
 fail the request instead of skipping the erroring policy. Errors in staged
 comparisons preserve the enforcing decision and skip the comparison.
 
@@ -77,10 +77,17 @@ Its Lean specification and proofs are in `ai-openshell/cedar-spec`.
 
 ## Integration
 
-- `openshell-policy` validates Cedar sources behind its default `cedar`
-  feature. Crates that never see Cedar policies disable the feature.
-- The gateway rejects format switches on update, Cedar global policies, and
-  removal of a Cedar-derived Landlock grant on a live sandbox.
+- `openshell-policy` validates Cedar sources behind its opt-in `cedar`
+  feature. This crate is linked only when `openshell-gateway` and
+  `openshell-supervisor` are built with their `cedar` feature. Release Dev
+  builds enable it, and local e2e builds
+  enable it with `OPENSHELL_BUILD_CEDAR=1`; stable and prerelease builds do
+  not, and their gateways reject Cedar policies. The CLI sends Cedar text
+  without linking this crate. The gateway validates it and returns load
+  warnings, which the CLI prints.
+- The gateway rejects format switches on update, Cedar global policies, Cedar
+  sandboxes on the MXC driver, which enforces policy without the supervisor,
+  and removal of a Cedar-derived Landlock grant on a live sandbox.
 - Providers attached to a Cedar sandbox supply credentials but grant no access.
   Provider composition puts their rules in `provider_credential_rules` instead
   of `network_policies`. For a connection Cedar allows, each matching provider

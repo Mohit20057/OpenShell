@@ -55,6 +55,8 @@ match the signed governance hash.
 
 Pass `--policy policy.cedar` to govern sandboxes with the same policy written in
 Cedar; the `.cedar` extension selects the format, as it does for the CLI.
+Cedar needs a development build of the gateway and supervisor: Release Dev,
+or `OPENSHELL_BUILD_CEDAR=1` for local e2e builds.
 
 The interceptor polls the policy file every second by default. When `policy.yaml`
 changes and parses successfully, the interceptor re-signs it immediately. New

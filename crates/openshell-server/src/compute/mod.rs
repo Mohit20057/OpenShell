@@ -370,6 +370,9 @@ pub struct ComputeDriverInfoSnapshot {
     pub supports_sandbox_authentication: bool,
     /// Whether the driver reports runtime readiness without a supervisor session.
     pub driver_reports_runtime_readiness: bool,
+    /// Whether the driver enforces sandbox policy itself rather than leaving
+    /// it to the `OpenShell` supervisor.
+    pub driver_enforces_policy: bool,
     /// Static portable resource request forms from the startup capability snapshot.
     pub resource_capabilities: Option<DriverResourceCapabilities>,
     /// Directory where rootfs tar files must be staged.
@@ -840,6 +843,7 @@ impl ComputeRuntime {
             gateway_manages_lifecycle: capabilities.gateway_manages_lifecycle,
             supports_sandbox_authentication: capabilities.supports_sandbox_authentication,
             driver_reports_runtime_readiness: capabilities.driver_reports_runtime_readiness,
+            driver_enforces_policy: capabilities.driver_enforces_policy,
             resource_capabilities: capabilities.resource_capabilities,
             rootfs_tar_staging_dir: capabilities.rootfs_tar_staging_dir,
             rootfs_tar_max_bytes: capabilities.rootfs_tar_max_bytes,
@@ -1139,6 +1143,13 @@ impl ComputeRuntime {
     #[must_use]
     pub fn supports_sandbox_authentication(&self) -> bool {
         self.driver_info.supports_sandbox_authentication
+    }
+
+    /// Whether the compute driver enforces sandbox policy itself rather than
+    /// leaving it to the `OpenShell` supervisor.
+    #[must_use]
+    pub fn driver_enforces_policy(&self) -> bool {
+        self.driver_info.driver_enforces_policy
     }
 
     pub(crate) async fn authenticate_sandbox(
@@ -7669,6 +7680,7 @@ impl ComputeDriver for NoopTestDriver {
                 gateway_manages_lifecycle: false,
                 supports_sandbox_authentication: self.sandbox_authentication.is_some(),
                 driver_reports_runtime_readiness: false,
+                driver_enforces_policy: false,
                 resource_capabilities: None,
                 rootfs_tar_staging_dir: String::new(),
                 rootfs_tar_max_bytes: 0,
@@ -7853,6 +7865,7 @@ pub fn new_test_runtime_with_driver(
             gateway_manages_lifecycle: false,
             supports_sandbox_authentication,
             driver_reports_runtime_readiness: false,
+            driver_enforces_policy: false,
             resource_capabilities: None,
             rootfs_tar_staging_dir: String::new(),
             rootfs_tar_max_bytes: 0,
@@ -8284,6 +8297,7 @@ mod tests {
                 gateway_manages_lifecycle: false,
                 supports_sandbox_authentication: false,
                 driver_reports_runtime_readiness: false,
+                driver_enforces_policy: false,
                 resource_capabilities: None,
                 rootfs_tar_staging_dir: String::new(),
                 rootfs_tar_max_bytes: 0,
@@ -8702,6 +8716,7 @@ mod tests {
                 gateway_manages_lifecycle: false,
                 supports_sandbox_authentication: false,
                 driver_reports_runtime_readiness: false,
+                driver_enforces_policy: false,
                 resource_capabilities: None,
                 rootfs_tar_staging_dir: String::new(),
                 rootfs_tar_max_bytes: 0,
@@ -8974,6 +8989,7 @@ mod tests {
                 gateway_manages_lifecycle: false,
                 supports_sandbox_authentication: false,
                 driver_reports_runtime_readiness: false,
+                driver_enforces_policy: false,
                 resource_capabilities: None,
                 rootfs_tar_staging_dir: String::new(),
                 rootfs_tar_max_bytes: 0,

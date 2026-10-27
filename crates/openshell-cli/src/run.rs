@@ -729,6 +729,7 @@ pub async fn sandbox_create(
         Err(status) => return Err(miette::miette!(status.to_string())),
     };
     let response = response.into_inner();
+    print_policy_warnings(&response.policy_warnings);
     let service_urls = response
         .service_urls
         .into_iter()
@@ -1531,16 +1532,18 @@ fn merge_rootfs_tar_driver_config(
 ///
 /// Resolution order: `--policy` flag > `OPENSHELL_SANDBOX_POLICY` env var.
 /// Returns `None` when no policy source is configured, allowing the server
-/// to apply its own default. A Cedar policy's load-time warnings are printed
-/// to stderr; they never fail the load.
+/// to apply its own default. A Cedar file is carried as-is; the gateway
+/// validates it and returns its warnings.
 fn load_sandbox_policy(cli_path: Option<&str>) -> Result<Option<SandboxPolicy>> {
-    let policy = openshell_policy::load_sandbox_policy(cli_path)?;
-    if let Some(policy) = &policy {
-        for warning in cedar_policy_warning_lines(policy) {
-            eprintln!("{} {warning}", "warning:".yellow().bold());
-        }
+    openshell_policy::load_sandbox_policy(cli_path)
+}
+
+/// Prints the policy warnings the gateway returned. They never fail the
+/// command.
+fn print_policy_warnings(warnings: &[openshell_core::proto::PolicyWarning]) {
+    for warning in warnings {
+        eprintln!("{} {}", "warning:".yellow().bold(), warning.message);
     }
-    Ok(policy)
 }
 
 /// Reject Cedar before any provisioning or policy mutation on older gateways.
@@ -1556,19 +1559,11 @@ async fn require_cedar_gateway_support(
             .into_inner();
         if !info.supports_cedar_policy {
             return Err(miette::miette!(
-                "gateway does not advertise Cedar policy support; upgrade the gateway before sending Cedar policies"
+                "gateway does not advertise Cedar policy support; Cedar policies require a development build of the gateway and supervisor"
             ));
         }
     }
     Ok(())
-}
-
-/// The load-time warnings of a policy's Cedar source, if it has one.
-fn cedar_policy_warning_lines(policy: &SandboxPolicy) -> Vec<String> {
-    if policy.cedar_policy_source.is_empty() {
-        return Vec::new();
-    }
-    openshell_policy::cedar_policy_warnings(&policy.cedar_policy_source)
 }
 
 /// Renders a policy for `policy get`.
@@ -5804,6 +5799,7 @@ pub async fn sandbox_policy_set(
         .into_diagnostic()?;
 
     let resp = response.into_inner();
+    print_policy_warnings(&resp.policy_warnings);
 
     if resp.version == current_version {
         eprintln!(
@@ -7131,15 +7127,15 @@ fn format_endpoint(endpoint: &openshell_core::proto::NetworkEndpoint) -> String 
 mod tests {
     use super::{
         ForwardTcpConnectionError, PolicyGetView, ProvisioningStep, build_sandbox_resource_limits,
-        cedar_policy_warning_lines, format_endpoint, format_log_line,
-        forward_requires_session_token, git_sync_files, has_main_process_result,
-        parse_cli_setting_value, parse_credential_expiry_cli_value, parse_driver_config_json,
-        parse_env_from_pairs, parse_secret_material_env_pairs, policy_for_view,
-        policy_revision_list_json, policy_revision_to_json, proto_execution_timeout,
-        provisioning_timeout_message, ready_false_condition_message, relay_local_socket,
-        render_policy_text, resolve_from, rootfs_tar_sources_supported_for_gateway,
-        sandbox_should_persist, sandbox_upload_plan, service_endpoint_to_json,
-        service_status_error, service_url_for_gateway, workspace_member_to_json,
+        format_endpoint, format_log_line, forward_requires_session_token, git_sync_files,
+        has_main_process_result, parse_cli_setting_value, parse_credential_expiry_cli_value,
+        parse_driver_config_json, parse_env_from_pairs, parse_secret_material_env_pairs,
+        policy_for_view, policy_revision_list_json, policy_revision_to_json,
+        proto_execution_timeout, provisioning_timeout_message, ready_false_condition_message,
+        relay_local_socket, render_policy_text, resolve_from,
+        rootfs_tar_sources_supported_for_gateway, sandbox_should_persist, sandbox_upload_plan,
+        service_endpoint_to_json, service_status_error, service_url_for_gateway,
+        workspace_member_to_json,
     };
     use openshell_core::proto::TcpForwardFrame;
 
@@ -9470,45 +9466,6 @@ mod tests {
         assert!(!forward_requires_session_token(&Status::permission_denied(
             "authorization_token is required for ForwardTcp"
         )));
-    }
-
-    #[test]
-    fn cedar_policy_warning_lines_report_an_audit_only_path_beside_enforced_policies() {
-        let http = |annotations: &str, effect: &str, condition: &str| {
-            format!(
-                "{annotations}\n{effect} (principal, action == Sandbox::Action::\"HttpRequest\", \
-                 resource == Sandbox::NetworkEndpoint::\"api.example.com:443\")\nwhen {{ {condition} }};\n"
-            )
-        };
-        let trap = format!(
-            "{}{}",
-            http("", "permit", "context.method == \"GET\""),
-            http(
-                "@path(\"/admin/**\") @enforcement(\"audit\")",
-                "forbid",
-                "context.method == \"DELETE\""
-            ),
-        );
-        let policy = SandboxPolicy {
-            version: 1,
-            cedar_policy_source: trap,
-            ..Default::default()
-        };
-        let warnings = cedar_policy_warning_lines(&policy);
-        assert_eq!(warnings.len(), 1, "{warnings:?}");
-        assert!(
-            warnings[0].starts_with("path `/admin/**` of api.example.com:443 is audit-only"),
-            "{}",
-            warnings[0]
-        );
-
-        let enforced = SandboxPolicy {
-            version: 1,
-            cedar_policy_source: http("", "permit", "context.method == \"GET\""),
-            ..Default::default()
-        };
-        assert!(cedar_policy_warning_lines(&enforced).is_empty());
-        assert!(cedar_policy_warning_lines(&SandboxPolicy::default()).is_empty());
     }
 
     #[test]

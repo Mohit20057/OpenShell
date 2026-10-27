@@ -17,6 +17,8 @@ export NO_COLOR=1
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+# shellcheck source=e2e/support/gateway-common.sh disable=SC1091
+source "${REPO_ROOT}/e2e/support/gateway-common.sh"
 OPENSHELL_BIN="${OPENSHELL_BIN:-${REPO_ROOT}/target/debug/openshell}"
 # Sandbox names are limited to 19 characters.
 RUN_ID="${RUN_ID:-$(date +%H%M%S)}"
@@ -124,7 +126,9 @@ sed -e "s|__HOST__|${UP_HOST}|g" -e "s|__PORT__|${UP_PORT}|g" -e "s|__PREFIX__|$
 sed -e "s|__HOST__|${UP_HOST}|g" \
     "${SCRIPT_DIR}/middleware.template.yaml" > "${TMP_DIR}/middleware.yaml"
 
-"$OPENSHELL_BIN" sandbox create \
+# The first Cedar command fails fast, with a rebuild hint, when the gateway
+# was built without Cedar.
+e2e_run_cedar_cli "$OPENSHELL_BIN" sandbox create \
     --name "$SANDBOX" \
     --policy "${TMP_DIR}/policy.cedar" \
     --middleware "${TMP_DIR}/middleware.yaml" \

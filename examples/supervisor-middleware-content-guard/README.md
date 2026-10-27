@@ -94,6 +94,8 @@ openshell sandbox create \
 ```
 
 Set `POLICY_FORMAT=cedar` to run `smoke.sh` with these files.
+Cedar needs a development build of the gateway and supervisor: Release Dev,
+or `OPENSHELL_BUILD_CEDAR=1` for local e2e builds.
 
 From the sandbox, send a matching request:
 

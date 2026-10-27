@@ -1013,11 +1013,46 @@ pub(super) fn validate_object_metadata(
 // Policy validation
 // ---------------------------------------------------------------------------
 
+/// Whether this gateway was built with Cedar policy support.
+pub(super) const SUPPORTS_CEDAR_POLICY: bool = cfg!(feature = "cedar");
+
+/// Rejects a Cedar policy when this gateway was built without Cedar support.
+///
+/// Keyed to this crate's own feature, so the gateway rejects exactly what its
+/// health response says it cannot handle, whatever features other crates in
+/// the same build enable.
+pub(super) fn require_cedar_policy_support(policy: &ProtoSandboxPolicy) -> Result<(), Status> {
+    if !SUPPORTS_CEDAR_POLICY && !policy.cedar_policy_source.is_empty() {
+        return Err(Status::failed_precondition(
+            "this gateway was built without Cedar policy support; Cedar policies require a \
+             development build of the gateway and supervisor",
+        ));
+    }
+    Ok(())
+}
+
+/// Rejects a Cedar policy when the compute driver enforces sandbox policy
+/// itself: Cedar is enforced by the `OpenShell` supervisor, which such a driver
+/// does not use.
+pub(super) fn require_policy_enforceable_by_driver(
+    driver_enforces_policy: bool,
+    policy: &ProtoSandboxPolicy,
+) -> Result<(), Status> {
+    if driver_enforces_policy && !policy.cedar_policy_source.is_empty() {
+        return Err(Status::failed_precondition(
+            "the compute driver enforces sandbox policy itself and cannot enforce Cedar \
+             policies; use a compute driver whose sandboxes run the OpenShell supervisor",
+        ));
+    }
+    Ok(())
+}
+
 /// Validate that a policy does not contain unsafe content.
 ///
 /// Delegates to [`openshell_policy::validate_sandbox_policy`] and converts
 /// violations into a gRPC `INVALID_ARGUMENT` status.
 pub(super) fn validate_policy_safety(policy: &ProtoSandboxPolicy) -> Result<(), Status> {
+    require_cedar_policy_support(policy)?;
     if let Err(violations) = openshell_policy::validate_sandbox_policy(policy) {
         let messages: Vec<String> = violations.iter().map(ToString::to_string).collect();
         return Err(Status::invalid_argument(format!(
@@ -1036,7 +1071,16 @@ pub(super) fn validate_policy_safety(policy: &ProtoSandboxPolicy) -> Result<(), 
 pub(super) fn validate_and_canonicalize_policy(
     policy: ProtoSandboxPolicy,
 ) -> Result<ProtoSandboxPolicy, Status> {
-    openshell_policy::validate_and_canonicalize_sandbox_policy(policy).map_err(|error| {
+    validate_and_canonicalize_policy_report(policy).map(|validated| validated.policy)
+}
+
+/// Like [`validate_and_canonicalize_policy`], also returning the policy's
+/// load-time warnings for the caller to return to the client.
+pub(super) fn validate_and_canonicalize_policy_report(
+    policy: ProtoSandboxPolicy,
+) -> Result<openshell_policy::ValidatedPolicy, Status> {
+    require_cedar_policy_support(&policy)?;
+    openshell_policy::validate_and_canonicalize_sandbox_policy_report(policy).map_err(|error| {
         Status::invalid_argument(format!("policy contains unsafe content: {error}"))
     })
 }
@@ -1087,8 +1131,18 @@ pub(super) fn validate_static_fields_unchanged(
     // This supports the supervisor's baseline path enrichment at startup.
     // Note: Landlock is a one-way door — adding paths to the stored policy
     // has no effect on a running child process; the enriched paths only
-    // take effect on the next restart.
-    validate_filesystem_additive(baseline.filesystem.as_ref(), new.filesystem.as_ref())?;
+    // take effect on the next restart. A policy whose grants come from its
+    // text (Cedar) follows the same rule, so a narrowing edit cannot report
+    // success while the old grants stay in force until restart.
+    let effective_filesystem = |policy: &ProtoSandboxPolicy| {
+        openshell_policy::effective_filesystem(policy).map_err(|violation| {
+            Status::invalid_argument(format!("policy contains unsafe content: {violation}"))
+        })
+    };
+    validate_filesystem_additive(
+        effective_filesystem(baseline)?.filesystem.as_ref(),
+        effective_filesystem(new)?.filesystem.as_ref(),
+    )?;
 
     if baseline.landlock != new.landlock {
         return Err(Status::invalid_argument(
@@ -1099,20 +1153,6 @@ pub(super) fn validate_static_fields_unchanged(
         return Err(Status::invalid_argument(
             "process policy cannot be changed on a live sandbox (applied at startup)",
         ));
-    }
-    // A Cedar policy's Landlock grants come from its text. Apply the same
-    // additive-only rule as YAML `filesystem`: Landlock cannot revoke a grant
-    // from a running process, so a narrowing edit would report success while
-    // the old grants stay in force until restart.
-    if !baseline.cedar_policy_source.is_empty()
-        && baseline.cedar_policy_source != new.cedar_policy_source
-    {
-        let baseline_grants =
-            openshell_policy::cedar_filesystem_grants(&baseline.cedar_policy_source);
-        let new_grants = openshell_policy::cedar_filesystem_grants(&new.cedar_policy_source);
-        if let (Some(baseline_grants), Some(new_grants)) = (baseline_grants, new_grants) {
-            validate_filesystem_additive(Some(&baseline_grants), Some(&new_grants))?;
-        }
     }
     Ok(())
 }
@@ -1201,6 +1241,52 @@ mod tests {
     use openshell_core::rpc_error::StatusExt;
     use std::collections::HashMap;
     use tonic::Code;
+
+    use crate::grpc::test_support::cedar_policy;
+
+    #[cfg(not(feature = "cedar"))]
+    #[test]
+    fn cedar_policies_are_rejected_without_the_cedar_feature() {
+        let policy = cedar_policy();
+        for status in [
+            require_cedar_policy_support(&policy).expect_err("Cedar is unsupported"),
+            validate_policy_safety(&policy).expect_err("Cedar is unsupported"),
+            validate_and_canonicalize_policy(policy.clone()).expect_err("Cedar is unsupported"),
+        ] {
+            assert_eq!(status.code(), Code::FailedPrecondition, "{status:?}");
+            assert_eq!(
+                status.message(),
+                "this gateway was built without Cedar policy support; Cedar policies require a \
+                 development build of the gateway and supervisor"
+            );
+        }
+        assert!(require_cedar_policy_support(&ProtoSandboxPolicy::default()).is_ok());
+    }
+
+    #[cfg(feature = "cedar")]
+    #[test]
+    fn cedar_policy_validation_returns_load_time_warnings() {
+        let validated = validate_and_canonicalize_policy_report(
+            crate::grpc::test_support::cedar_policy_with_warning(),
+        )
+        .expect("policy is valid");
+        assert_eq!(validated.warnings.len(), 1, "{:?}", validated.warnings);
+        assert!(
+            validate_and_canonicalize_policy_report(cedar_policy())
+                .expect("policy is valid")
+                .warnings
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn cedar_policies_require_a_driver_that_leaves_enforcement_to_the_supervisor() {
+        let status = require_policy_enforceable_by_driver(true, &cedar_policy())
+            .expect_err("the driver cannot enforce Cedar");
+        assert_eq!(status.code(), Code::FailedPrecondition, "{status:?}");
+        assert!(require_policy_enforceable_by_driver(false, &cedar_policy()).is_ok());
+        assert!(require_policy_enforceable_by_driver(true, &ProtoSandboxPolicy::default()).is_ok());
+    }
 
     #[test]
     fn sandbox_and_exec_validation_return_wire_field_paths() {
@@ -2331,6 +2417,7 @@ mod tests {
         assert!(error.message().contains("provider_credential_rules"));
     }
 
+    #[cfg(feature = "cedar")]
     #[test]
     fn validate_and_canonicalize_policy_checks_endpoint_settings() {
         use openshell_core::proto::{McpOptions, NetworkEndpoint};
@@ -2466,12 +2553,20 @@ mod tests {
 
     /// A Cedar sandbox's process identity comes from its middleware file, and
     /// `policy set` with a different one is rejected as for a YAML policy.
+    #[cfg(feature = "cedar")]
+    const CONNECT_PYPI: &str = r#"permit (principal, action == Sandbox::Action::"NetworkConnect",
+        resource == Sandbox::NetworkEndpoint::"pypi.org:443");"#;
+    #[cfg(feature = "cedar")]
+    const CONNECT_EXAMPLE: &str = r#"permit (principal, action == Sandbox::Action::"NetworkConnect",
+        resource == Sandbox::NetworkEndpoint::"example.com:443");"#;
+
+    #[cfg(feature = "cedar")]
     #[test]
     fn validate_static_fields_rejects_process_change_within_cedar() {
         use openshell_core::proto::ProcessPolicy;
 
         let baseline = ProtoSandboxPolicy {
-            cedar_policy_source: "permit(principal, action, resource);".into(),
+            cedar_policy_source: CONNECT_PYPI.into(),
             process: Some(ProcessPolicy {
                 run_as_user: "1000".into(),
                 run_as_group: "sandbox".into(),
@@ -2479,7 +2574,7 @@ mod tests {
             ..Default::default()
         };
         let same = ProtoSandboxPolicy {
-            cedar_policy_source: "forbid(principal, action, resource);".into(),
+            cedar_policy_source: CONNECT_EXAMPLE.into(),
             ..baseline.clone()
         };
         assert!(validate_static_fields_unchanged(&baseline, &same).is_ok());
@@ -2512,21 +2607,23 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "cedar")]
     #[test]
     fn validate_static_fields_allows_cedar_policy_source_change_within_cedar() {
         let baseline = ProtoSandboxPolicy {
-            cedar_policy_source: "permit(principal, action, resource);".into(),
+            cedar_policy_source: CONNECT_PYPI.into(),
             provider_credential_rules: HashMap::default(),
             ..Default::default()
         };
         let new = ProtoSandboxPolicy {
-            cedar_policy_source: "forbid(principal, action, resource);".into(),
+            cedar_policy_source: CONNECT_EXAMPLE.into(),
             provider_credential_rules: HashMap::default(),
             ..Default::default()
         };
         assert!(validate_static_fields_unchanged(&baseline, &new).is_ok());
     }
 
+    #[cfg(feature = "cedar")]
     fn cedar_policy_granting(paths: &[&str]) -> ProtoSandboxPolicy {
         let cedar_policy_source = paths
             .iter()
@@ -2545,6 +2642,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "cedar")]
     #[test]
     fn validate_static_fields_rejects_removing_a_cedar_filesystem_grant() {
         let baseline = cedar_policy_granting(&["/usr", "/etc"]);
@@ -2554,6 +2652,7 @@ mod tests {
         assert!(error.message().contains("/etc"), "{}", error.message());
     }
 
+    #[cfg(feature = "cedar")]
     #[test]
     fn validate_static_fields_allows_adding_a_cedar_filesystem_grant() {
         let baseline = cedar_policy_granting(&["/usr"]);

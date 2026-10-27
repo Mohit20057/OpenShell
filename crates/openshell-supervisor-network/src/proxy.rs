@@ -845,7 +845,7 @@ async fn preauthorize_transparent_open(
 }
 
 /// What a staged transparent open to a policy DNS destination did.
-#[cfg(test)]
+#[cfg(all(test, feature = "cedar"))]
 pub(crate) struct StagedOpenOutcome {
     /// The decision sent back to the boundary.
     pub(crate) decision: TcpOpenDecision,
@@ -858,7 +858,7 @@ pub(crate) struct StagedOpenOutcome {
 
 /// Stages a transparent open from `binary` to `destination` through
 /// `engine`, as the boundary does, for tests that compare policy engines.
-#[cfg(test)]
+#[cfg(all(test, feature = "cedar"))]
 pub(crate) async fn stage_transparent_open_for_test(
     engine: &PolicyEngine,
     store: &Arc<ResolvedEndpointStore>,
@@ -936,7 +936,7 @@ pub(crate) async fn stage_transparent_open_for_test(
 /// all-or-nothing with that mode's own check, without resolving anything.
 /// Returns `"deny"` for a policy denial, `"rejected"` when a destination
 /// check rejects the addresses, and `"admitted"` otherwise.
-#[cfg(test)]
+#[cfg(all(test, feature = "cedar"))]
 pub(crate) fn connect_destination_outcome_for_test(
     engine: &PolicyEngine,
     input: &crate::opa::NetworkInput,
@@ -9416,6 +9416,7 @@ network_policies:
     /// which moves independently of Cedar's (installing the middleware
     /// registry advances it). A plain-HTTP forward request Cedar allows must
     /// still reach the upstream, not fail the middleware generation check.
+    #[cfg(feature = "cedar")]
     #[tokio::test]
     async fn cedar_forward_request_survives_middleware_generation_advance() {
         let Some(upstream_ip) = non_loopback_test_ipv4() else {

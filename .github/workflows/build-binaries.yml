@@ -17,6 +17,20 @@ on:
         required: false
         type: string
         default: ""
+      extra-cargo-features:
+        description: >-
+          Cargo features added to the openshell-gateway and openshell-supervisor
+          builds only. Release Dev passes "cedar"; stable builds pass nothing.
+        required: false
+        type: string
+        default: ""
+      forbidden-crates:
+        description: >-
+          Space-separated crate names that must not appear in any built
+          binary's embedded dependency list.
+        required: false
+        type: string
+        default: ""
     secrets:
       CACHIX_AUTH_TOKEN:
         required: true
@@ -26,6 +40,9 @@ permissions:
 
 env:
   EXTRA_CARGO_FLAGS: ""
+  # Jobs that build openshell-gateway or openshell-supervisor override this
+  # with inputs.extra-cargo-features. No other package defines those features.
+  EXTRA_CARGO_FEATURES: ""
 
 jobs:
   cli:
@@ -60,7 +77,8 @@ jobs:
           triple: ${{ matrix.triple }}
           cargo-version: ${{ inputs.cargo-version }}
           supervisor-image-tag: ${{ inputs.supervisor-image-tag }}
-          extra-cargo-flags: ${{ env.EXTRA_CARGO_FLAGS }}
+          extra-cargo-flags: ${{ env.EXTRA_CARGO_FLAGS }}${{ env.EXTRA_CARGO_FEATURES != '' && format(' --features {0}', env.EXTRA_CARGO_FEATURES) || '' }}
+          forbidden-crates: ${{ inputs.forbidden-crates }}
 
   prover:
     name: openshell-prover (${{ matrix.triple }})
@@ -85,6 +103,7 @@ jobs:
     env:
       PACKAGE: openshell-gateway
       BINARY: openshell-gateway
+      EXTRA_CARGO_FEATURES: ${{ inputs.extra-cargo-features }}
     strategy:
       matrix:
         include:
@@ -103,6 +122,9 @@ jobs:
     env:
       PACKAGE: ${{ matrix.package }}
       BINARY: ${{ matrix.binary }}
+      # openshell-sandbox has no cedar or dev feature; only the supervisor
+      # entries take the extra features.
+      EXTRA_CARGO_FEATURES: ${{ matrix.package == 'openshell-supervisor' && inputs.extra-cargo-features || '' }}
     strategy:
       matrix:
         include:

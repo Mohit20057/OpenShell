@@ -850,7 +850,7 @@ class SandboxClient:
         if spec.policy.cedar_policy_source and not self.health().supports_cedar_policy:
             raise SandboxError(
                 "gateway does not advertise Cedar policy support; "
-                "upgrade the gateway before sending Cedar policies"
+                "Cedar policies require a development build of the gateway and supervisor"
             )
 
     def create(

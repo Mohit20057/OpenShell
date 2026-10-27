@@ -1143,9 +1143,9 @@ fn handled_fields_inventory() {
             m.insert("redactor".to_owned(), middleware_config());
             m
         },
-        // Cedar-only fields. A Cedar policy cannot carry `network_policies`,
-        // so this YAML inventory leaves them empty; a Cedar policy is routed
-        // to the Cedar engine by the host proxy, not through the mapper.
+        // Fields of policies only the sandbox supervisor enforces. The
+        // gateway admits none of them for this driver, which reports
+        // `driver_enforces_policy`, so the inventory leaves them empty.
         cedar_policy_source: String::new(),
         provider_credential_rules: std::collections::HashMap::new(),
         endpoint_settings: Vec::new(),

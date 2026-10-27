@@ -46,6 +46,8 @@ openshell sandbox create \
 To use Cedar, pass `--policy examples/local-inference/sandbox-policy.cedar`
 instead. Providers attached to a Cedar sandbox supply credentials but grant no
 access, so the Cedar policy permits the NVIDIA endpoint itself.
+Cedar needs a development build of the gateway and supervisor: Release Dev,
+or `OPENSHELL_BUILD_CEDAR=1` for local e2e builds.
 
 The profile contributes the NVIDIA endpoint to the effective network policy and
 injects an opaque `NVIDIA_API_KEY` placeholder. The proxy substitutes the real

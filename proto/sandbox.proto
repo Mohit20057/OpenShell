@@ -390,7 +390,8 @@ message GetSandboxConfigRequest {
   openshell.datamodel.v1.WorkspaceSelector workspace_scope = 3;
   string name = 1;
   // Required for sandbox-authenticated callers receiving a Cedar policy.
-  // Omitted by older supervisors, which cannot safely interpret Cedar fields.
+  // Supervisors built with Cedar support set it; supervisors built without
+  // it, and older supervisors, cannot safely interpret Cedar fields.
   bool supports_cedar_policy = 4;
 }
 

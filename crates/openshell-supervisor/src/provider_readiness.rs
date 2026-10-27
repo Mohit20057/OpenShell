@@ -823,6 +823,7 @@ mod tests {
         assert!(!observed.launch_environment_installed);
     }
 
+    #[cfg(feature = "cedar")]
     /// A Cedar sandbox's configuration guard is pinned to the middleware
     /// generation; a quarantine must stale it as it stales a YAML guard.
     #[test]

@@ -298,7 +298,7 @@ openshell sandbox create \
 Key flags:
 
 - `--provider`: Attach configured credential providers for API keys, tokens, and other secrets (repeatable)
-- `--policy`: Custom policy YAML or `.cedar` file (otherwise uses built-in default or `OPENSHELL_SANDBOX_POLICY` env var). Cedar middleware, endpoint settings, and process identity go in a separate file passed with `--middleware`.
+- `--policy`: Custom policy YAML or `.cedar` file (otherwise uses built-in default or `OPENSHELL_SANDBOX_POLICY` env var). Cedar middleware, endpoint settings, and process identity go in a separate file passed with `--middleware`. Cedar requires a development-channel gateway and supervisor; a stable gateway rejects it.
 - `--gpu [COUNT]`: Request the driver's default GPU selection or a specific GPU count
 - `--cpu`, `--memory`: Set per-sandbox compute sizing. Docker/Podman apply limits; Kubernetes applies matching requests and limits.
 - `--driver-config-json`: Pass experimental driver-specific sandbox configuration
@@ -544,7 +544,7 @@ This is the most important multi-step workflow. It enables a tight feedback cycl
 
 **Key concept**: Policies have static fields (immutable after activation: `filesystem_policy`, `landlock`, `process`) and two dynamic fields: `network_policies` and `network_middlewares`. Both dynamic fields can be updated without recreating the sandbox when the selected compute driver supports live policy updates. Drivers without the standard supervisor fetch revisions through the sandbox configuration API and report whether they loaded them.
 
-Determine the authored format before editing. A sandbox keeps YAML or Cedar for its lifetime; changing formats requires recreation. Cedar replaces YAML access rules with Cedar source, while middleware, endpoint settings, and process identity use a separate `--middleware` file. Preserve both files when replacing a Cedar policy. Global policies and incremental `policy update` operations support YAML only. Use the published [Cedar policy guide](https://docs.nvidia.com/openshell/latest/how-it-works/policies/cedar) for Cedar authoring and supported policy shapes.
+Determine the authored format before editing. A sandbox keeps YAML or Cedar for its lifetime; changing formats requires recreation. Cedar replaces YAML access rules with Cedar source, while middleware, endpoint settings, and process identity use a separate `--middleware` file. Preserve both files when replacing a Cedar policy. Global policies and incremental `policy update` operations support YAML only. Cedar requires a development-channel gateway and supervisor; stable and prerelease gateways reject Cedar policies, and the CLI reports `gateway does not advertise Cedar policy support`. Use the development-channel [Cedar policy guide](https://docs.nvidia.com/openshell/dev/how-it-works/policies/cedar) for Cedar authoring and supported policy shapes.
 
 If startup reports `ConfigurationInvalid`, inspect `openshell sandbox get` and
 repair the complete policy or provider set through the gateway. The workload

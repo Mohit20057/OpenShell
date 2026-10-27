@@ -383,7 +383,6 @@ use openshell_core::policy::{NetworkMode, NetworkPolicy, ProxyPolicy, SandboxPol
 use openshell_core::proposals::AgentProposals;
 use openshell_core::proto::ProviderReadinessReason;
 use openshell_core::provider_credentials::ProviderCredentialState;
-use openshell_supervisor_network::cedar_only::CedarOnlyEngine;
 use openshell_supervisor_network::opa::OpaEngine;
 use openshell_supervisor_network::policy_engine::PolicyEngine;
 use openshell_supervisor_network::policy_types::PolicyGenerationGuard;
@@ -994,6 +993,7 @@ pub async fn run_sandbox_instance(
     // Every gateway client of this instance uses its own credentials.
     let gateway = openshell_endpoint.as_deref().map(|endpoint| {
         openshell_core::grpc_client::GatewayEndpoint::new(endpoint, gateway_credentials.clone())
+            .with_cedar_policy_support(SUPPORTS_CEDAR_POLICY)
     });
     #[cfg(unix)]
     let ssh_host_key = if ssh_socket_path.is_some() {
@@ -1806,6 +1806,10 @@ async fn flush_activity_to_gateway(
 // ============================================================================
 // Baseline filesystem path enrichment
 // ============================================================================
+
+/// Whether this supervisor can enforce Cedar policies. It reports this to
+/// the gateway, which withholds Cedar configuration when it is false.
+const SUPPORTS_CEDAR_POLICY: bool = cfg!(feature = "cedar");
 
 /// Minimum read-only paths required for a proxy-mode sandbox child process to
 /// function: dynamic linker, shared libraries, DNS resolution, CA certs,
@@ -3028,42 +3032,25 @@ fn prepare_startup_configuration(
             "Provider environment revision changed during configuration preparation"
         ));
     }
-    // A non-empty `cedar_policy_source` makes Cedar the sole authoritative
-    // network, L7, middleware, and filesystem engine; no OPA engine is built
-    // (see `openshell_supervisor_network::policy_engine`). Either engine
-    // validates the policy as it builds, as a reload validates while staging.
-    let cedar_engine = if policy.cedar_policy_source.is_empty() {
-        None
-    } else {
-        Some(Arc::new(CedarOnlyEngine::from_proto(policy)?))
-    };
-    let engine = match &cedar_engine {
-        Some(cedar) => PolicyEngine::from(Arc::clone(cedar)),
-        None => PolicyEngine::from(Arc::new(OpaEngine::from_proto(policy)?)),
-    };
+    if !SUPPORTS_CEDAR_POLICY && !policy.cedar_policy_source.is_empty() {
+        return Err(miette::miette!(
+            "Cedar policy support is not enabled in this supervisor build"
+        ));
+    }
+    // The policy's format selects its engine, which validates the policy as
+    // it builds, as a reload validates while staging. A Cedar policy builds
+    // no OPA engine (see `openshell_supervisor_network::policy_engine`).
+    let engine = PolicyEngine::from_proto(policy)?;
     let mut process_policy = SandboxPolicy::try_from(policy.clone())?;
-    if let Some(cedar) = &cedar_engine {
-        let grants = cedar.filesystem_grants()?;
-        process_policy.filesystem = openshell_core::policy::FilesystemPolicy {
-            read_only: grants
-                .read_only
-                .into_iter()
-                .map(std::path::PathBuf::from)
-                .collect(),
-            read_write: grants
-                .read_write
-                .into_iter()
-                .map(std::path::PathBuf::from)
-                .collect(),
-            include_workdir: false,
-        };
-        // Same baseline a YAML policy gets, under the same condition: YAML
-        // adds it only when the policy has network rules
-        // (`enrich_proto_baseline_paths`), so Cedar adds it only when a
-        // policy can permit NetworkConnect.
-        if cedar.has_network_permits()? {
-            enrich_sandbox_baseline_paths(&mut process_policy);
-        }
+    let filesystem = openshell_policy::effective_filesystem(policy)
+        .map_err(|violation| miette::miette!("{violation}"))?;
+    process_policy.filesystem = filesystem.filesystem.map(Into::into).unwrap_or_default();
+    // Same baseline a YAML policy gets, under the same condition: YAML adds
+    // it to its own `filesystem` section only when the policy has network
+    // rules (`enrich_proto_baseline_paths`), and derived grants get it only
+    // when the policy can permit `NetworkConnect`.
+    if filesystem.needs_proxy_baseline {
+        enrich_sandbox_baseline_paths(&mut process_policy);
     }
     let credentials = prepare_provider_environment(provider)?;
     Ok((engine, process_policy, credentials))
@@ -6727,10 +6714,13 @@ permit (principal, action == Sandbox::Action::"NetworkConnect",
         }
     }
 
-    pub fn cedar_engine() -> Arc<CedarOnlyEngine> {
+    #[cfg(feature = "cedar")]
+    pub fn cedar_engine() -> Arc<openshell_supervisor_network::cedar_only::CedarOnlyEngine> {
         Arc::new(
-            CedarOnlyEngine::from_proto(&cedar_proto_policy(CEDAR_RELOAD_POLICY))
-                .expect("build Cedar engine"),
+            openshell_supervisor_network::cedar_only::CedarOnlyEngine::from_proto(
+                &cedar_proto_policy(CEDAR_RELOAD_POLICY),
+            )
+            .expect("build Cedar engine"),
         )
     }
 
@@ -6754,6 +6744,7 @@ permit (principal, action == Sandbox::Action::"NetworkConnect",
         .await
     }
 
+    #[cfg(feature = "cedar")]
     #[tokio::test]
     async fn yaml_reload_of_a_cedar_sandbox_is_rejected_and_keeps_previous_policy() {
         let cedar = cedar_engine();
@@ -6793,6 +6784,7 @@ permit (principal, action == Sandbox::Action::"NetworkConnect",
         assert_eq!(engine.current_generation(), opa_generation);
     }
 
+    #[cfg(feature = "cedar")]
     #[tokio::test]
     async fn invalid_cedar_reload_leaves_the_previous_configuration_active() {
         let cedar = cedar_engine();
@@ -6811,6 +6803,7 @@ permit (principal, action == Sandbox::Action::"NetworkConnect",
     /// A Cedar policy's middleware gets the same validation a YAML policy's
     /// does; a rejected candidate commits no policy, middleware, or
     /// credentials.
+    #[cfg(feature = "cedar")]
     #[tokio::test]
     async fn invalid_cedar_middleware_reload_commits_nothing() {
         let cedar = cedar_engine();
@@ -6861,6 +6854,7 @@ permit (principal, action == Sandbox::Action::"NetworkConnect",
 
     /// A middleware-only change publishes a new configuration generation but
     /// keeps Cedar's, so inspected tunnels are not closed.
+    #[cfg(feature = "cedar")]
     #[tokio::test]
     async fn cedar_middleware_only_reload_keeps_the_cedar_generation() {
         let cedar = cedar_engine();
@@ -6911,6 +6905,7 @@ permit (principal, action == Sandbox::Action::"NetworkConnect",
         );
     }
 
+    #[cfg(feature = "cedar")]
     #[tokio::test]
     async fn valid_cedar_reload_commits_cedar_and_ends_its_quarantine() {
         let cedar = cedar_engine();
@@ -6932,6 +6927,7 @@ permit (principal, action == Sandbox::Action::"NetworkConnect",
         assert!(cedar.current_generation() > quarantined_generation);
     }
 
+    #[cfg(feature = "cedar")]
     /// A Cedar sandbox's startup configuration is the Cedar engine alone; no
     /// OPA engine is built for it.
     #[test]
@@ -6948,6 +6944,27 @@ permit (principal, action == Sandbox::Action::"NetworkConnect",
         assert!(matches!(engine, PolicyEngine::Cedar(_)), "{engine:?}");
     }
 
+    /// A supervisor built without Cedar refuses a Cedar policy at startup.
+    #[cfg(not(feature = "cedar"))]
+    #[test]
+    fn cedar_startup_configuration_fails_without_cedar_support() {
+        let policy = cedar_proto_policy(CEDAR_RELOAD_POLICY);
+        let snapshot = settings_poll_result(
+            Some(policy.clone()),
+            1,
+            openshell_core::proto::PolicySource::Sandbox,
+        );
+        let error = prepare_startup_configuration(&snapshot, &policy, &startup_provider(0))
+            .expect_err("Cedar policy is unsupported");
+        assert!(
+            error
+                .to_string()
+                .contains("not enabled in this supervisor build"),
+            "{error}"
+        );
+    }
+
+    #[cfg(feature = "cedar")]
     /// As YAML adds baseline paths only to a policy with network rules, a
     /// Cedar policy gets them only when it can permit `NetworkConnect`.
     #[test]
@@ -6983,6 +7000,7 @@ permit (principal, action == Sandbox::Action::"NetworkConnect",
         assert!(filesystem.read_write.contains(&tmp), "{filesystem:?}");
     }
 
+    #[cfg(feature = "cedar")]
     #[test]
     fn policy_rejection_quarantines_the_cedar_engine_of_a_cedar_sandbox() {
         let cedar = cedar_engine();

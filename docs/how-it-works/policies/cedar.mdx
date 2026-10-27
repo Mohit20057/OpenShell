@@ -6,11 +6,16 @@ sidebar-title: "Cedar Policies"
 description: "Author an OpenShell sandbox policy in Cedar instead of YAML and understand which Cedar policy shapes OpenShell accepts."
 keywords: "Generative AI, Cybersecurity, Policy, Cedar, Network Policy, Landlock, Sandbox, Security"
 position: 8
+development-only: true
 ---
 
 A sandbox policy can be written in [Cedar](https://www.cedarpolicy.com/) instead of YAML. Cedar then decides every network connection, every inspected HTTP or JSON-RPC request, and the filesystem paths Landlock allows. A sandbox uses one format for its whole lifetime: YAML policies are evaluated by the built-in Rego engine, and Cedar policies by Cedar.
 
 Cedar's restricted language makes policies easier to analyze, for example to check that a revision grants no more access than the one it replaces. OpenShell accepts only Cedar policy shapes it can enforce exactly as written, and rejects the rest when you submit the policy.
+
+<Note>
+Cedar policies are available only in [development builds](/about/installation#prerelease-and-development-builds). Stable and prerelease gateways and supervisors reject them. Cedar also requires a compute driver whose sandboxes run the OpenShell supervisor: Docker, Podman, Kubernetes, or VM. The Windows MXC driver enforces policy itself, so the gateway rejects Cedar sandboxes on it.
+</Note>
 
 ## Apply a Cedar Policy
 
@@ -18,7 +23,15 @@ OpenShell treats a policy file as Cedar when its extension is `.cedar`, in any c
 
 Host selectors, including host globs, must not exceed 253 bytes.
 
-Both the gateway and sandbox runtime must support Cedar. The CLI refuses to send Cedar policies to a gateway that does not advertise Cedar support, and the gateway withholds Cedar configuration from an older runtime. Upgrade both before applying a Cedar policy.
+The gateway and the sandbox supervisor must both be built with Cedar support. The CLI refuses to send a Cedar policy to a gateway without it and reports `gateway does not advertise Cedar policy support`. Such a gateway also rejects Cedar policies on sandbox create and policy update. If it runs on state that already holds Cedar sandboxes, for example after you switch from a development build to a stable one, it refuses to start those sandboxes, deliver their configuration, change their policy or providers, or show their policy. Delete them with `openshell sandbox delete`, or switch back to a development build. A gateway with Cedar support does not deliver a Cedar policy to a supervisor without it. Stable CLIs read, send, and show Cedar policies, but only a gateway with Cedar support accepts them.
+
+To run Cedar from source, build the gateway and supervisor with the `cedar` Cargo feature. With `OPENSHELL_BUILD_CEDAR=1`, the local Docker gateway task builds both the gateway and the supervisor image with it:
+
+```shell
+OPENSHELL_BUILD_CEDAR=1 mise run gateway:docker
+```
+
+For a standalone build, use `cargo build -p openshell-gateway --features cedar` and `cargo build -p openshell-supervisor --features cedar`.
 
 Create a sandbox with a Cedar policy:
 
@@ -32,7 +45,7 @@ Replace the policy on a running sandbox:
 openshell policy set <name> --policy ./policy.cedar --wait
 ```
 
-The CLI validates the file before sending it, and the gateway validates it again. If the sandbox cannot load a revision, the `policy_validation_failure_mode` setting applies as it does for YAML policies. Refer to [Manage Policies](/how-it-works/policies/manage-policies).
+The CLI sends the file's text to the gateway, which validates it and rejects an invalid policy with the reason. The gateway also returns warnings found while loading the policy, such as an [audit path beside enforced policies](#audit-mode), and the CLI prints them after `sandbox create` and `policy set`. If the sandbox cannot load a revision, the `policy_validation_failure_mode` setting applies as it does for YAML policies. Refer to [Manage Policies](/how-it-works/policies/manage-policies).
 
 `openshell policy get <name>` prints the Cedar text of a Cedar sandbox's policy.
 
@@ -87,7 +100,7 @@ Each `endpoint_settings` entry selects endpoints the way a YAML endpoint does: `
 | `mcp.versions`, `mcp.strict_tool_names` | MCP endpoints. Without `mcp.versions`, an MCP endpoint uses the YAML default revision. |
 | `graphql_max_body_bytes`, `persisted_queries`, `graphql_persisted_queries` | GraphQL and GraphQL-over-WebSocket endpoints. |
 
-A setting takes effect only on connections the Cedar policy allows, and a protocol option only where the policy inspects that protocol. Fields that decide access, such as `protocol`, `enforcement`, `access`, `rules`, `deny_rules`, `allowed_ips`, and `binaries`, and credential fields, which providers supply, are rejected. A YAML policy rejects `endpoint_settings`, because its endpoints carry these fields directly.
+A setting takes effect only on connections the Cedar policy allows, and a protocol option only where the policy inspects that protocol. Fields that decide access, such as `protocol`, `enforcement`, `access`, `rules`, `deny_rules`, `allowed_ips`, and `binaries`, and credential fields, which providers supply, are rejected. A YAML policy rejects `endpoint_settings`, because its endpoints carry these fields directly. As for a YAML endpoint, middleware with the default `on_error` behavior cannot select an endpoint that `endpoint_settings` sets to `tls: skip`, because OpenShell cannot inspect that traffic.
 
 An entry with a `path` applies to requests whose path it matches, and an entry without one applies to every request. When several entries match, the most specific path wins, as for YAML endpoints sharing a host and port, and a later entry overrides an earlier one for the fields it sets. Two entries cannot select the same host, path, and port. An entry with a `path` takes the protocol and enforcement of the [inspected path](#paths) that matches it, and has no effect where no inspected path matches.
 

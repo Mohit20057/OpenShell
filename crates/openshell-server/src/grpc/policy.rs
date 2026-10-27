@@ -112,8 +112,9 @@ use tonic::{Code, Request, Response, Status};
 use tracing::{debug, info, warn};
 
 use super::validation::{
-    level_matches, source_matches, validate_and_canonicalize_policy, validate_caller_annotations,
-    validate_no_reserved_provider_policy_keys, validate_policy_safety,
+    level_matches, require_cedar_policy_support, require_policy_enforceable_by_driver,
+    source_matches, validate_and_canonicalize_policy, validate_and_canonicalize_policy_report,
+    validate_caller_annotations, validate_no_reserved_provider_policy_keys, validate_policy_safety,
     validate_static_fields_unchanged,
 };
 use super::{StoredSettingValue, StoredSettings};
@@ -2502,6 +2503,28 @@ fn provider_policy_composition_enabled_in(settings: &StoredSettings) -> Result<b
     Ok(decode_policy_from_global_settings(settings)?.is_none())
 }
 
+/// Whether a scan over many sandboxes must skip `sandbox` because its policy is
+/// a Cedar policy and this gateway was built without Cedar support.
+///
+/// Such a sandbox already fails closed on every path that serves its policy,
+/// so it must not fail the scan for every other sandbox. A sandbox never
+/// switches policy formats, so its spec policy decides. Logs the skip.
+pub(super) fn skip_sandbox_with_unsupported_cedar_policy(sandbox: &Sandbox) -> bool {
+    let unsupported = sandbox
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.policy.as_ref())
+        .is_some_and(|policy| require_cedar_policy_support(policy).is_err());
+    if unsupported {
+        warn!(
+            workspace = %sandbox.object_workspace(),
+            sandbox = %sandbox.object_name(),
+            "skipping sandbox with a Cedar policy this gateway was built without support for"
+        );
+    }
+    unsupported
+}
+
 async fn validate_provider_composition_for_existing_sandboxes(
     state: &ServerState,
 ) -> Result<(), Status> {
@@ -2524,7 +2547,7 @@ async fn validate_provider_composition_for_existing_sandboxes(
                 .as_ref()
                 .map(|spec| spec.providers.as_slice())
                 .unwrap_or_default();
-            if provider_names.is_empty() {
+            if provider_names.is_empty() || skip_sandbox_with_unsupported_cedar_policy(&sandbox) {
                 continue;
             }
 
@@ -2670,6 +2693,7 @@ fn update_config_response(
         settings_revision,
         deleted,
         annotations,
+        policy_warnings: Vec::new(),
     })
 }
 
@@ -4687,6 +4711,8 @@ async fn handle_update_config_inner(
         .policy
         .ok_or_else(|| Status::invalid_argument("policy is required"))?;
     clear_provider_credentialed_markers(&mut new_policy);
+    require_cedar_policy_support(&new_policy)?;
+    require_policy_enforceable_by_driver(state.compute.driver_enforces_policy(), &new_policy)?;
     let global_settings = load_global_settings(state.store.as_ref()).await?;
     if global_settings.settings.contains_key(POLICY_SETTING_KEY) {
         return Err(Status::failed_precondition(
@@ -4723,7 +4749,9 @@ async fn handle_update_config_inner(
         true
     };
 
-    new_policy = validate_and_canonicalize_policy(new_policy)?;
+    let validated = validate_and_canonicalize_policy_report(new_policy)?;
+    new_policy = validated.policy;
+    let policy_warnings = super::policy_warnings(validated.warnings);
     let backfill_policy = should_backfill_policy.then(|| new_policy.clone());
     validate_policy_safety(&new_policy)?;
     crate::middleware::validate_policy(state.middleware_registry.as_ref(), &new_policy).await?;
@@ -4791,13 +4819,18 @@ async fn handle_update_config_inner(
                     );
                     publish_sandbox_config_update(state, &sandbox_id);
                 }
-                return Ok(update_config_response(
+                let mut response = update_config_response(
                     u32::try_from(current.version).unwrap_or(0),
                     hash,
                     0,
                     false,
                     response_annotations,
-                ));
+                );
+                response
+                    .get_mut()
+                    .policy_warnings
+                    .clone_from(&policy_warnings);
+                return Ok(response);
             }
 
             let next_version = latest.as_ref().map_or(1, |record| record.version + 1);
@@ -4867,13 +4900,15 @@ async fn handle_update_config_inner(
     spawn_pending_chunk_refresh(state, &workspace, &sandbox);
     emit_full_policy_update_success(sandbox_caller, next_version);
 
-    Ok(update_config_response(
+    let mut response = update_config_response(
         u32::try_from(next_version).unwrap_or(0),
         hash,
         0,
         false,
         response_annotations,
-    ))
+    );
+    response.get_mut().policy_warnings = policy_warnings;
+    Ok(response)
 }
 
 // ---------------------------------------------------------------------------
@@ -8173,6 +8208,14 @@ fn validate_and_canonicalize_stored_policy(
     policy: ProtoSandboxPolicy,
     source: &'static str,
 ) -> Result<ProtoSandboxPolicy, Status> {
+    // A gateway built without Cedar serves no stored Cedar policy, including
+    // one a Cedar-enabled build of the gateway accepted.
+    require_cedar_policy_support(&policy).map_err(|error| {
+        Status::failed_precondition(format!(
+            "stored policy source '{source}' is a Cedar policy: {}",
+            error.message()
+        ))
+    })?;
     openshell_policy::validate_and_canonicalize_sandbox_policy(policy).map_err(|error| {
         Status::failed_precondition(format!(
             "stored policy source '{source}' is invalid: {error}"
@@ -12741,6 +12784,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "cedar")]
     #[tokio::test]
     async fn cedar_config_requires_supervisor_support_on_every_fetch() {
         let state = test_server_state().await;
@@ -12813,6 +12857,7 @@ mod tests {
         assert!(legacy_yaml.policy.unwrap().cedar_policy_source.is_empty());
     }
 
+    #[cfg(feature = "cedar")]
     #[tokio::test]
     async fn sandbox_config_delivers_provider_rules_separately_for_a_cedar_policy() {
         let state = test_server_state().await;
@@ -14300,6 +14345,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "cedar")]
     #[tokio::test]
     async fn provider_environment_delivers_bound_credentials_to_a_cedar_sandbox() {
         use openshell_core::proto::GetSandboxProviderEnvironmentRequest;
@@ -22997,6 +23043,188 @@ mod tests {
 
         let settings = load_global_settings(state.store.as_ref()).await.unwrap();
         assert!(!settings.settings.contains_key(POLICY_SETTING_KEY));
+    }
+
+    /// A gateway built without Cedar serves no stored Cedar policy, and names
+    /// the stored policy it refused.
+    #[cfg(not(feature = "cedar"))]
+    #[test]
+    fn stored_cedar_policies_are_not_served_without_cedar_support() {
+        let status = validate_and_canonicalize_stored_policy(
+            crate::grpc::test_support::cedar_policy(),
+            STORED_POLICY_SOURCE_SPEC,
+        )
+        .expect_err("Cedar is unsupported");
+        assert_eq!(status.code(), Code::FailedPrecondition, "{status:?}");
+        assert!(
+            status.message().contains(STORED_POLICY_SOURCE_SPEC)
+                && status.message().contains("development build"),
+            "{status:?}"
+        );
+    }
+
+    /// A sandbox a Cedar-enabled gateway created fails closed on its own, so
+    /// it must not stop a gateway built without Cedar from starting or from
+    /// re-enabling provider composition, nor hide other sandboxes' errors.
+    #[cfg(not(feature = "cedar"))]
+    #[tokio::test]
+    async fn provider_composition_checks_skip_a_cedar_sandbox_without_cedar_support() {
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_provider("work-github", "github"))
+            .await
+            .unwrap();
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-cedar-provider",
+                "cedar-provider",
+                crate::grpc::test_support::cedar_policy(),
+                vec!["work-github".to_string()],
+            ))
+            .await
+            .unwrap();
+
+        validate_provider_composition_startup_preflight(&state)
+            .await
+            .expect("a stored Cedar sandbox must not block startup");
+        for request in [
+            UpdateConfigRequest {
+                global: true,
+                policy: Some(test_policy_with_rule("global", "global.example.com")),
+                ..Default::default()
+            },
+            UpdateConfigRequest {
+                global: true,
+                setting_key: POLICY_SETTING_KEY.to_string(),
+                delete_setting: true,
+                ..Default::default()
+            },
+        ] {
+            handle_update_config(&state, with_user(Request::new(request)))
+                .await
+                .expect("a stored Cedar sandbox must not block global policy changes");
+        }
+
+        // Sorts after `cedar-provider`, so the Cedar sandbox is skipped first.
+        install_ambiguous_provider_binding(&state, "z-beside-cedar").await;
+        let error = validate_provider_composition_startup_preflight(&state)
+            .await
+            .expect_err("other sandboxes are still validated");
+        assert!(
+            error.message().contains("sandbox-z-beside-cedar"),
+            "{error:?}"
+        );
+    }
+
+    #[cfg(not(feature = "cedar"))]
+    #[tokio::test]
+    async fn sandbox_policy_update_rejects_cedar_without_cedar_support() {
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-yaml",
+                "yaml",
+                test_policy_with_rule("base", "api.example.com"),
+                vec![],
+            ))
+            .await
+            .unwrap();
+
+        let error = handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                sandbox: "yaml".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                policy: Some(crate::grpc::test_support::cedar_policy()),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect_err("Cedar is unsupported");
+        assert_eq!(error.code(), Code::FailedPrecondition, "{error:?}");
+        assert!(error.message().contains("without Cedar"), "{error:?}");
+    }
+
+    /// A user reading the config gets the reason; the sandbox's own supervisor
+    /// gets an unadmitted configuration with no policy, and fails closed.
+    #[cfg(not(feature = "cedar"))]
+    #[tokio::test]
+    async fn sandbox_config_is_not_served_for_a_stored_cedar_policy_without_cedar_support() {
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-cedar",
+                "cedar",
+                crate::grpc::test_support::cedar_policy(),
+                vec![],
+            ))
+            .await
+            .unwrap();
+        let request = || {
+            Request::new(GetSandboxConfigRequest {
+                name: "cedar".to_string(),
+                supports_cedar_policy: true,
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+            })
+        };
+
+        let error = handle_get_sandbox_config(&state, with_user(request()))
+            .await
+            .expect_err("Cedar is unsupported");
+        assert_eq!(error.code(), Code::FailedPrecondition, "{error:?}");
+        assert!(
+            error.message().contains(STORED_POLICY_SOURCE_SPEC)
+                && error.message().contains("without Cedar"),
+            "{error:?}"
+        );
+        let config = handle_get_sandbox_config(&state, with_sandbox(request(), "sb-cedar"))
+            .await
+            .expect("the supervisor receives an unadmitted configuration")
+            .into_inner();
+        assert!(!config.configuration_admitted, "{config:?}");
+        assert!(config.policy.is_none(), "{config:?}");
+    }
+
+    /// Load-time warnings reach the client on a policy update, including an
+    /// identical update that changes nothing.
+    #[cfg(feature = "cedar")]
+    #[tokio::test]
+    async fn sandbox_policy_update_returns_cedar_load_time_warnings() {
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-cedar-warnings",
+                "cedar-warnings",
+                crate::grpc::test_support::cedar_policy(),
+                vec![],
+            ))
+            .await
+            .unwrap();
+        let update = || {
+            with_user(Request::new(UpdateConfigRequest {
+                sandbox: "cedar-warnings".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                policy: Some(crate::grpc::test_support::cedar_policy_with_warning()),
+                ..Default::default()
+            }))
+        };
+
+        let first = handle_update_config(&state, update())
+            .await
+            .expect("policy is valid")
+            .into_inner();
+        assert_eq!(first.policy_warnings.len(), 1, "{first:?}");
+        let repeat = handle_update_config(&state, update())
+            .await
+            .expect("an identical update is a no-op")
+            .into_inner();
+        assert_eq!(repeat.version, first.version, "the repeat must be a no-op");
+        assert_eq!(repeat.policy_warnings, first.policy_warnings);
     }
 
     #[test]

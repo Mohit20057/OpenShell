@@ -227,6 +227,7 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(SandboxResponse {
             sandbox: Some(sandbox),
             service_urls,
+            ..Default::default()
         }))
     }
 
@@ -267,6 +268,7 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(SandboxResponse {
             sandbox: Some(sandbox),
             service_urls: HashMap::new(),
+            ..Default::default()
         }))
     }
 

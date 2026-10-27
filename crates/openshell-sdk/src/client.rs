@@ -147,7 +147,7 @@ impl OpenShellClient {
                 .await?;
             if !info.supports_cedar_policy {
                 return Err(SdkError::from_status(tonic::Status::failed_precondition(
-                    "gateway does not advertise Cedar policy support; upgrade the gateway before sending Cedar policies",
+                    "gateway does not advertise Cedar policy support; Cedar policies require a development build of the gateway and supervisor",
                 )));
             }
         }

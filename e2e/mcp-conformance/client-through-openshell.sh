@@ -97,6 +97,10 @@ POLICY_SET_COMMAND=(
 if [ "${POLICY_WAIT}" = "1" ]; then
   POLICY_SET_COMMAND+=(--wait --timeout "${POLICY_WAIT_TIMEOUT}")
 fi
+if [ "${POLICY_FORMAT}" = "cedar" ]; then
+  # Fail fast, with a rebuild hint, when the gateway was built without Cedar.
+  POLICY_SET_COMMAND=(e2e_run_cedar_cli "${POLICY_SET_COMMAND[@]}")
+fi
 "${POLICY_SET_COMMAND[@]}"
 
 # Exec request validation rejects newline/control characters in command

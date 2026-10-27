@@ -81,7 +81,7 @@ func requireCedarPolicySupport(ctx context.Context, client pb.OpenShellClient, p
 		return converter.FromGRPCError(err)
 	}
 	if !info.GetSupportsCedarPolicy() {
-		return &StatusError{Code: ErrorUnimplemented, Message: "gateway does not advertise Cedar policy support; upgrade the gateway before sending Cedar policies"}
+		return &StatusError{Code: ErrorUnimplemented, Message: "gateway does not advertise Cedar policy support; Cedar policies require a development build of the gateway and supervisor"}
 	}
 	return nil
 }

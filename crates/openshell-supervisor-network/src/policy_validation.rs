@@ -102,6 +102,7 @@ pub(crate) fn redacted_policy_violation_category(violation: &PolicyViolation) ->
             "cedar_policy_source combined with network_policies"
         }
         PolicyViolation::InvalidCedarPolicy { .. } => "invalid Cedar policy",
+        PolicyViolation::CedarUnsupported => "Cedar policy support is not enabled in this build",
         PolicyViolation::EndpointSettingsRequireCedar => "endpoint settings require Cedar",
         PolicyViolation::InvalidEndpointSetting { .. } => "invalid endpoint setting",
     }

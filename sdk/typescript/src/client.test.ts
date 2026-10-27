@@ -950,7 +950,13 @@ describe('create', () => {
       updateConfig: (req) => {
         if (req.settingKey) observed.updateSetting = req;
         else observed.updatePolicy = req;
-        return { version: 5, policyHash: 'hash', settingsRevision: 10n, deleted: false };
+        return {
+          version: 5,
+          policyHash: 'hash',
+          settingsRevision: 10n,
+          deleted: false,
+          policyWarnings: [{ message: 'path is audit-only' }],
+        };
       },
       getSandboxConfig: () => ({
         policy: { version: 1, networkPolicies: {} },
@@ -999,7 +1005,8 @@ describe('create', () => {
     const detached = await sandbox.detachProvider('lookup', 'github', { workspace: 'staging' });
     await sandbox.listProviders('lookup', { workspace: 'staging' }).nextPage();
     await sandbox.getConfig('config', { workspace: 'staging' });
-    await sandbox.setPolicy('lookup', { version: 1, networkPolicies: {} }, { workspace: 'staging' });
+    const updated = await sandbox.setPolicy('lookup', { version: 1, networkPolicies: {} }, { workspace: 'staging' });
+    expect(updated.policyWarnings).toEqual(['path is audit-only']);
     await sandbox.setSetting(
       'lookup',
       'feature.enabled',

@@ -96,6 +96,8 @@ proposal you approve.
 `policy.template.cedar` is the same starting policy in Cedar. The demo itself
 needs YAML: approved proposals are merged into the sandbox policy, and the
 gateway rejects proposals for a Cedar sandbox.
+Cedar needs a development build of the gateway and supervisor: Release Dev,
+or `OPENSHELL_BUILD_CEDAR=1` for local e2e builds.
 
 ## What gets approved (trust model)
 

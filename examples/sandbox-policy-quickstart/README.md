@@ -119,6 +119,8 @@ the sandbox already has.
 `POLICY_FORMAT=cedar bash examples/sandbox-policy-quickstart/demo.sh` to follow
 the walkthrough with it; step 4 then runs `openshell policy set` with the whole
 Cedar policy, because Cedar policies are replaced rather than merged.
+Cedar needs a development build of the gateway and supervisor: Release Dev,
+or `OPENSHELL_BUILD_CEDAR=1` for local e2e builds.
 
 ### 5. Connect and verify: GET works
 

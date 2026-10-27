@@ -38,6 +38,9 @@ the script progresses through each gate.
 | `ctf.py` | Python script with 7 network gates |
 | `README.md` | This walkthrough |
 
+Cedar needs a development build of the gateway and supervisor: Release Dev,
+or `OPENSHELL_BUILD_CEDAR=1` for local e2e builds.
+
 ## Gates
 
 | # | Name | Target | Notes |

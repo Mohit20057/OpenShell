@@ -14,7 +14,7 @@ license = "Apache-2.0"
 openshell-crypto = { path = "../../crates/openshell-crypto" }
 jsonwebtoken = "10"
 openshell-core = { path = "../../crates/openshell-core", default-features = false }
-openshell-policy = { path = "../../crates/openshell-policy", default-features = false }
+openshell-policy = { path = "../../crates/openshell-policy" }
 openshell-providers = { path = "../../crates/openshell-providers" }
 prost = "0.14"
 prost-reflect = { version = "0.16.5", features = ["serde"] }

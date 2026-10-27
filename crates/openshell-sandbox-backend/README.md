@@ -53,8 +53,18 @@ Opening fails with `Unsupported` when the backend lacks the capability. A
 resume accepts `RESTORED`, or `COLD_START_FALLBACK` only when fallback is
 allowed; a fresh launch accepts only `FRESH`. A replay that reports a different
 handle or outcome is denied. `BoundBoundary::launch_outcome` reports the
-validated outcome. Attach accepts a snapshot that already lists restored
-processes, and StartAgent proceeds as for a fresh launch.
+selected launch path. It does not prove restoration has completed. A backend
+may retain only the snapshot through policy discovery, Attach, and Confirm,
+then perform its restore-and-run operation when StartAgent arrives. No workload
+instruction may execute before StartAgent has installed the admitted controls.
+Attach may therefore report no process yet, or an already restored frozen process.
+StartAgent returns the restored main process rather than launching a duplicate.
+
+A restore failure discovered at StartAgent fails that call. The backend must
+not silently switch the selected path from restoration to a cold start; a
+permitted cold-start fallback must be selected when opening the boundary.
+The supervisor reports a successful resumed launch only after StartAgent succeeds.
+`RunningBoundary::launch_outcome` then reports the completed launch path.
 
 `SandboxProtocol.Exchange` and `.Mediate` begin with the handle from
 `OpenBoundary`. The server authenticates the stream's bearer, checks the handle

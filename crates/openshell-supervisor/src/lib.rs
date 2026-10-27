@@ -463,7 +463,7 @@ async fn suspend_on_request(
     true
 }
 
-/// Report how a resumed launch reopened its boundary.
+/// Report the completed launch path after `StartAgent` succeeds.
 fn report_boundary_resumed(
     outcome: openshell_sandbox_backend::BoundaryLaunchOutcome,
     backend_name: &str,
@@ -1300,11 +1300,6 @@ pub async fn run_sandbox_instance(
         .instrument(tracing::info_span!(parent: &startup, "supervisor.boundary.attach"))
         .await?;
     info!(backend = %admitted_backend_name, "Isolation boundary attached");
-    if let Some(outcome) = bound.launch_outcome()
-        && outcome != openshell_sandbox_backend::BoundaryLaunchOutcome::Fresh
-    {
-        report_boundary_resumed(outcome, &admitted_backend_name);
-    }
     let remote_boundary = (bound, admitted_backend_name, ca_file_paths);
 
     // The denial channel is owned by the orchestrator: the proxy (in the
@@ -1617,6 +1612,13 @@ pub async fn run_sandbox_instance(
             .instrument(tracing::info_span!(parent: &startup, "supervisor.boundary.start_agent"))
             .await
             .map_err(|error| start_agent_error(error.to_string()))?;
+        // Opening can only prepare a restore. Report success after StartAgent
+        // has completed restoration, so a late failure is never logged as resumed.
+        if let Some(outcome) = running.launch_outcome()
+            && outcome != openshell_sandbox_backend::BoundaryLaunchOutcome::Fresh
+        {
+            report_boundary_resumed(outcome, &backend_name);
+        }
         workload_started_tx.send_replace(true);
         info!(backend = %backend_name, "Isolation boundary agent started");
         let agent = running.agent();

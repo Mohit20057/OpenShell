@@ -121,6 +121,9 @@ struct Observed {
     releases: AtomicUsize,
     suspendable: AtomicBool,
     restore: AtomicBool,
+    defer_restore: AtomicBool,
+    restore_fails: AtomicBool,
+    restores: AtomicUsize,
     suspends: Arc<AtomicUsize>,
     boundary_terminations: AtomicUsize,
 }
@@ -299,8 +302,10 @@ impl PreparedBackend for TestLaunch {
                         if observed.active.swap(true, Ordering::SeqCst) {
                             return Err(BackendError::Denied("already attached".into()));
                         }
-                        // A restored boundary already retains its frozen main process.
-                        let processes = if observed.restore.load(Ordering::SeqCst) {
+                        // A deferred restore has no live process to expose yet.
+                        let processes = if observed.restore.load(Ordering::SeqCst)
+                            && !observed.defer_restore.load(Ordering::SeqCst)
+                        {
                             vec![ProcessSnapshotWire {
                                 process_id: "main".into(),
                                 kind: ProcessKindWire::Main,
@@ -358,6 +363,15 @@ impl PreparedBackend for TestLaunch {
                         }
                         observed.record("start");
                         observed.starts.fetch_add(1, Ordering::SeqCst);
+                        if observed.defer_restore.load(Ordering::SeqCst) {
+                            assert!(observed.events().contains(&"confirm"));
+                            observed.restores.fetch_add(1, Ordering::SeqCst);
+                            if observed.restore_fails.load(Ordering::SeqCst) {
+                                return Err(BackendError::Process(
+                                    "deferred restore failed".into(),
+                                ));
+                            }
+                        }
                         Response::Started {
                             process_id: "main".into(),
                             provider_env_revision,
@@ -588,6 +602,63 @@ async fn restored_boundary_attaches_with_retained_processes_and_starts_agent() {
         ["decode", "build", "attach", "confirm", "start"]
     );
     assert_eq!(setup.observed.starts.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn deferred_restore_runs_only_at_start_agent_and_propagates_failure() {
+    for failure in ["none", "confirmation", "restore"] {
+        let setup = TestSetup::new();
+        setup.observed.suspendable.store(true, Ordering::SeqCst);
+        setup.observed.restore.store(true, Ordering::SeqCst);
+        setup.observed.defer_restore.store(true, Ordering::SeqCst);
+        setup
+            .observed
+            .deny_confirmation
+            .store(failure == "confirmation", Ordering::SeqCst);
+        setup
+            .observed
+            .restore_fails
+            .store(failure == "restore", Ordering::SeqCst);
+        let (bound, _) = setup
+            .select()
+            .attach(setup.services(), policy(), agent())
+            .await
+            .unwrap();
+        // RESTORED selects the launch path even though no restore has run yet.
+        assert_eq!(
+            bound.launch_outcome(),
+            Some(openshell_sandbox_backend::BoundaryLaunchOutcome::Restored)
+        );
+        assert_eq!(setup.observed.restores.load(Ordering::SeqCst), 0);
+        let confirmed = bound.confirm().await;
+        assert_eq!(setup.observed.restores.load(Ordering::SeqCst), 0);
+        if failure == "confirmation" {
+            assert!(confirmed.is_err());
+            assert_eq!(setup.observed.starts.load(Ordering::SeqCst), 0);
+            continue;
+        }
+        let started = confirmed.unwrap().into_boundary().start_agent().await;
+        assert_eq!(setup.observed.restores.load(Ordering::SeqCst), 1);
+        if failure == "restore" {
+            let Err(error) = started else {
+                panic!("a failed restore must fail StartAgent")
+            };
+            assert!(
+                error.to_string().contains("deferred restore failed"),
+                "{error}"
+            );
+        } else {
+            let running = started.unwrap();
+            assert_eq!(
+                running.launch_outcome(),
+                Some(openshell_sandbox_backend::BoundaryLaunchOutcome::Restored)
+            );
+        }
+        assert_eq!(
+            setup.observed.events(),
+            ["decode", "build", "attach", "confirm", "start"]
+        );
+    }
 }
 
 #[tokio::test]

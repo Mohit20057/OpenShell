@@ -103,9 +103,11 @@ On failure it resumes waiting on the workload. Both outcomes emit OCSF events
 without reference bytes.
 
 Resume is provisioned by the driver and backend. The supervisor's ordinary
-`OpenBoundary` call can attach to a restored boundary, and records the backend's
-reported outcome before normal admission and `StartAgent`. No retention state
-or policy is carried in the shared supervisor bootstrap metadata.
+`OpenBoundary` call can prepare a restored boundary. The opening response selects
+its launch path; actual restoration may wait until `StartAgent`, after policy
+admission. A late restore failure fails startup. A successful resumed launch is
+reported only after `StartAgent` succeeds. No retention state or policy is carried
+in the shared supervisor bootstrap metadata.
 
 ## Console logging
 

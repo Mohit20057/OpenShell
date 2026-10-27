@@ -243,7 +243,7 @@ impl std::fmt::Debug for ResumeLaunch {
     }
 }
 
-/// How the backend reported the boundary it opened for this launch.
+/// The selected launch path; restoration may still await `StartAgent`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BoundaryLaunchOutcome {
     Fresh,
@@ -605,7 +605,8 @@ impl BoundBoundary {
         self.host_gateway_ip
     }
 
-    /// The validated outcome of the boundary opening used for attachment.
+    /// The selected launch path. Restoration may still be deferred until
+    /// `StartAgent`; this value alone does not prove the workload was restored.
     pub fn launch_outcome(&self) -> Option<BoundaryLaunchOutcome> {
         self.client.launch_outcome.get().copied()
     }
@@ -734,6 +735,11 @@ pub struct RunningBoundary {
 }
 
 impl RunningBoundary {
+    /// The launch path completed by the successful `StartAgent` call.
+    pub fn launch_outcome(&self) -> Option<BoundaryLaunchOutcome> {
+        self.process.client.launch_outcome.get().copied()
+    }
+
     pub fn agent(&self) -> Arc<BoundaryProcess> {
         self.process.clone()
     }

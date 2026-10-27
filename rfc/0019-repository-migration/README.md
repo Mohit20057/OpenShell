@@ -34,9 +34,7 @@ The `openshell` core owns the runtime, CLI, Rust SDK, and shared interfaces that
 hold the system together. Go, Python, and TypeScript each get an SDK repository.
 Packages and Homebrew own installation and distribution; Windows, desktop, and
 Kubernetes repositories own their platform integrations. Each provider gets a
-repository for its integration and tests. A shared software factory repository
-provides automation and agent workflows for working across the OpenShell
-organization's repositories.
+repository for its integration and tests.
 
 The proposed repository structure is:
 
@@ -49,11 +47,10 @@ OpenShell repositories
 ├── openshell-packages              install.sh, RPM, DEB, snap
 ├── openshell-homebrew              Homebrew tap and formula
 ├── openshell-windows               MSI installer and MXC driver
-├── openshell-desktop               macOS App Sandbox, Podman, Docker
+├── openshell-desktop               Desktop drivers: macOS App Sandbox, Podman, Docker, VM
 ├── openshell-kubernetes            Helm chart, Kubernetes driver, operator
 ├── openshell-providers-<provider>  One repository per provider integration
-├── openshell-awesome               Curated OpenShell resources and examples
-└── openshell-software-factory      Shared action templates, skills, and agents
+└── openshell-awesome               Curated OpenShell resources and examples
 ```
 
 This gives maintainers a focused area to own while keeping the shared contracts
@@ -120,17 +117,6 @@ so separate repositories do not depend on manual copying to stay in sync.
 - Helm chart and its publication.
 - Kubernetes compute driver, with support for gVisor, Kata, Firecracker, and runc.
 - Kubernetes operator.
-
-### Software factory: `openshell-software-factory`
-
-- Shared GitHub Actions templates for repository automation.
-- Skills for development and maintenance across OpenShell repositories.
-- Agent definitions for coordinating work across repositories.
-
-This repository owns the shared tooling for working across the OpenShell
-organization's repositories, including changes that span multiple repositories.
-Component repositories use these common workflows alongside their own
-component-specific tests and release processes.
 
 ### Provider repositories and ownership
 

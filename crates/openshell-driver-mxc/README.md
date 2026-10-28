@@ -1,5 +1,11 @@
 # openshell-driver-mxc
 
+Native Windows implementation and releases stay on the
+[`windows` branch](https://github.com/NVIDIA/OpenShell/tree/windows).
+Start with the [Windows guide](https://github.com/NVIDIA/OpenShell/blob/windows/WINDOWS.md)
+for checkout and build instructions, including when this README is linked
+from documentation on `main`.
+
 The Windows-only MXC compute driver runs each workload in a Microsoft MXC
 ProcessContainer while preserving OpenShell's standard RFC 0012 runtime split:
 
@@ -133,11 +139,11 @@ Supply the workload command and working directory per sandbox:
 ```powershell
 $config = '{"mxc":{"command":["C:\\Windows\\System32\\cmd.exe","/d","/c","echo hello"],"cwd":"C:\\work"}}'
 openshell sandbox create --name mxc-demo --policy policy.yaml `
-  --driver-config-json $config --no-tty
+  --driver-config-json $config --detach
 ```
 
-The command and working directory are required. The working directory contains
-the generation-scoped bootstrap staging directory. When no generic canonical
+The command and absolute working directory are required. The working directory
+contains the generation-scoped bootstrap staging directory. When no generic canonical
 command is supplied, the driver passes `mxc.command` to the supervisor rather
 than starting a scratch workload. An explicit generic canonical command retains
 precedence. Environment belongs in `--env` or `--env-from`, not gateway configuration.

@@ -546,3 +546,32 @@ async fn overflow_reports_failure_without_output_window_credit() {
     .await
     .expect("overflow waited for output credit before reporting failure");
 }
+
+#[tokio::test]
+async fn dropped_ssh_session_terminates_in_flight_exec() {
+    tokio::time::timeout(DEADLINE, async {
+        let (session, control) = exec_session();
+        let client = test_client(
+            None,
+            rpc_test::exec(Arc::new(TestExec(Mutex::new([session].into())))),
+            russh::client::Config::default(),
+        )
+        .await;
+        let _channel = start_exec(&client).await;
+
+        assert!(!*control.process.terminated.borrow());
+
+        // Simulate abrupt connection drop by dropping the client handle.
+        drop(client);
+
+        control
+            .process
+            .terminated
+            .subscribe()
+            .wait_for(|done| *done)
+            .await
+            .unwrap();
+    })
+    .await
+    .expect("dropping SSH connection must terminate active exec process");
+}

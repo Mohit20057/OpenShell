@@ -430,18 +430,29 @@ struct SshHandler {
 
 impl Drop for SshHandler {
     fn drop(&mut self) {
-        let Some(main_session) = self.main_session.as_ref() else {
-            return;
-        };
+        if let Some(main_session) = self.main_session.as_ref() {
+            for state in self.channels.values_mut() {
+                if state.main_attached {
+                    main_session.end_terminal_attachment();
+                    if let Some(owner) = state.main_input_owner.take() {
+                        main_session.release_input(owner);
+                    }
+                    if let Some(task) = state.main_output_task.take() {
+                        task.abort();
+                    }
+                }
+            }
+        }
         for state in self.channels.values_mut() {
-            if state.main_attached {
-                main_session.end_terminal_attachment();
-            }
-            if let Some(owner) = state.main_input_owner.take() {
-                main_session.release_input(owner);
-            }
-            if let Some(task) = state.main_output_task.take() {
-                task.abort();
+            state.input_task.take();
+            if !state.main_attached
+                && let Some(process) = state.process.take()
+            {
+                tokio::spawn(async move {
+                    if let Err(error) = process.terminate().await {
+                        warn!(%error, "failed to terminate abandoned exec on ssh disconnect");
+                    }
+                });
             }
         }
     }

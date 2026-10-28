@@ -113,6 +113,8 @@ def test_needed_jobs_skip_only_when_their_dependents_skip() -> None:
     # so a needed job may only carry the same condition as each dependent.
     jobs = publish_jobs()
     for name, job in jobs.items():
+        if job.get("if") == "always()":
+            continue
         needs = job.get("needs", [])
         for need in [needs] if isinstance(needs, str) else needs:
             condition = jobs[need].get("if")
@@ -121,3 +123,12 @@ def test_needed_jobs_skip_only_when_their_dependents_skip() -> None:
                     f"{name} needs {need}, which can be skipped by {condition!r}; "
                     "decide inside its steps instead"
                 )
+
+
+def test_publication_check_needs_every_publish_job() -> None:
+    # The check fails the run when an expected publisher was skipped, so it
+    # must see every other job in the graph.
+    jobs = publish_jobs()
+    check = jobs["check-publication"]
+    assert check["if"] == "always()"
+    assert set(check["needs"]) == set(jobs) - {"check-publication"}

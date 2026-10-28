@@ -589,3 +589,49 @@ jobs:
       publish: true
     secrets:
       FERN_TOKEN: ${{ secrets.FERN_TOKEN }}
+
+  # GitHub treats skipped jobs as passing, so a publisher that never ran would
+  # leave the run green. Fail when any publisher expected for this release kind
+  # did not succeed, so callers' failure notifications fire.
+  check-publication:
+    name: Check Publication
+    needs:
+      - assemble
+      - tag-ghcr-release
+      - release-helm
+      - release
+      - publish-snap
+      - publish-prerelease-snap
+      - publish-sdk-typescript
+      - tag-sdk-go
+      - trigger-wheel-publish
+      - publish-fern-docs
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Require every expected publisher to succeed
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+          IS_PRERELEASE: ${{ inputs.is-prerelease }}
+          MAKE_LATEST: ${{ inputs.make-latest }}
+        run: |
+          set -euo pipefail
+          expected=(assemble tag-ghcr-release release-helm release)
+          if [[ "${IS_PRERELEASE}" == "true" ]]; then
+            expected+=(publish-prerelease-snap)
+          else
+            expected+=(publish-sdk-typescript tag-sdk-go trigger-wheel-publish publish-fern-docs)
+            if [[ "${MAKE_LATEST}" == "true" ]]; then
+              expected+=(publish-snap)
+            fi
+          fi
+          failed=0
+          for job in "${expected[@]}"; do
+            result=$(jq -r --arg job "${job}" '.[$job].result' <<<"${NEEDS}")
+            if [[ "${result}" != "success" ]]; then
+              echo "::error::${job} did not publish (result: ${result})"
+              failed=1
+            fi
+          done
+          exit "${failed}"

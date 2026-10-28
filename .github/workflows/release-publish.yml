@@ -257,10 +257,15 @@ jobs:
           for component in gateway sandbox supervisor; do
             image="ghcr.io/nvidia/openshell/${component}:${VERSION}"
             # Never replace a published stable image; a rerun keeps the original.
-            if nix shell --inputs-from . nixpkgs#skopeo -c \
+            # Only a missing manifest means unpublished; any other lookup error
+            # fails rather than risk overwriting.
+            if lookup_error=$(nix shell --inputs-from . nixpkgs#skopeo -c \
               skopeo inspect --raw --authfile "${HOME}/.docker/config.json" \
-              "docker://${image}" >/dev/null 2>&1; then
+              "docker://${image}" 2>&1 >/dev/null); then
               echo "${image} is already published; keeping it."
+            elif [[ "${lookup_error}" != *"manifest unknown"* ]]; then
+              echo "::error::Could not check whether ${image} is published: ${lookup_error}"
+              exit 1
             else
               # Archives are build artifacts from this run, not externally signed images.
               nix shell --inputs-from . nixpkgs#skopeo -c \

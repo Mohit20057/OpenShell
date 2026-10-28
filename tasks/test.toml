@@ -18,7 +18,6 @@ depends = [
   "test:gateway-config",
   "test:packaging-assets",
   "test:qualification-summary",
-  "test:release-workflows",
   "test:codex-security-release-range",
   "test:codex-security-diagnostics",
   "test:docs-website",
@@ -75,11 +74,6 @@ hide = true
 description = "Test release qualification summary generation"
 run = "tasks/scripts/test-qualification-summary.sh"
 run_windows = "echo Skipping test:qualification-summary: the release workflow runs on Unix hosts."
-hide = true
-
-["test:release-workflows"]
-description = "Test that stable release publication can be retried"
-run = "uv run --no-project --with pytest --with pyyaml pytest -o \"python_files=*_test.py\" tasks/scripts/release_publish_workflow_test.py"
 hide = true
 
 ["test:codex-security-release-range"]

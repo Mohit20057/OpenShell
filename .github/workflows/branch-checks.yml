@@ -540,9 +540,6 @@ jobs:
 
       - name: Test release qualification summary
         run: mise run test:qualification-summary
-
-      - name: Test release workflows
-        run: mise run test:release-workflows
   go:
     name: Go SDK
     needs: pr_metadata

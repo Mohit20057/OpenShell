@@ -76,8 +76,13 @@ runs:
         found=0
         for chart in helm-chart openshell-workspace; do
           OCI_CHART="oci://ghcr.io/nvidia/openshell/${chart}"
-          if helm show chart "${OCI_CHART}" --version "${CHART_VERSION}" >/dev/null 2>&1; then
+          # Only "not found" means unpublished; any other lookup error fails
+          # rather than risk overwriting.
+          if lookup_error=$(helm show chart "${OCI_CHART}" --version "${CHART_VERSION}" 2>&1 >/dev/null); then
             found=$((found + 1))
+          elif [[ "${lookup_error}" != *"ghcr.io/nvidia/openshell/${chart}:${CHART_VERSION}: not found"* ]]; then
+            echo "::error::Could not check whether ${chart}:${CHART_VERSION} is published: ${lookup_error}"
+            exit 1
           fi
         done
         if [ "${found}" -eq 2 ]; then

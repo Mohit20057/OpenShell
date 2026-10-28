@@ -52,7 +52,7 @@ OpenShell repositories
 ├── desktop               Desktop drivers: macOS App Sandbox, Podman, Docker, VM
 ├── console               OpenShell frontend
 ├── providers-<provider>  One repository per provider integration
-└── awesome               Curated OpenShell resources and examples
+└── awesome-list          Curated OpenShell resources and examples
 ```
 
 This gives maintainers a focused area to own while keeping the shared contracts
